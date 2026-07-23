@@ -296,7 +296,12 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 		DBs:            dbs,
 	}
 
-	if err := th.PrimeStateFromJSON(t.Context(), primeDBPath, !bypass); err != nil {
+	// In notification mode the block store (chain) is closed above, so commit
+	// checks via the gateway's SQLite can't work — priming must not wait on it.
+	// The caller waits out-of-band (e.g. a short sleep before replay). In
+	// block-sync mode the chain is open, so waiting is honored (unless bypass).
+	waitForPrimeCommit := !bypass && !useNotifications
+	if err := th.PrimeStateFromJSON(t.Context(), primeDBPath, waitForPrimeCommit); err != nil {
 		return nil, nil, err
 	}
 

@@ -282,7 +282,7 @@ func runReplayTest(
 		gwConfig,
 	)
 	// th, err = integration.NewFabricTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount, "Gateway.SubmitterCount": ordererSubmitterCount, "Network.Namespace": *namespace}, factory, gwcore.NewTxQueueV2())
-	assert.NoError(t, err)
+	require.NoError(t, err) // harness setup must succeed before we deref th below
 
 	// wait for the priming tx to be committed: we can no longer
 	// rely on commit checks because we have disabled the block store
