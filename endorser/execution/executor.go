@@ -23,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 	fxcommon "github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
@@ -68,12 +69,34 @@ func NewEVMEngine(namespace string, kvs KVSSnapshotter, evmConfig EVMConfig, mon
 // State is always read from the latest block: endorsement must simulate against current state
 // so that the resulting read-write set passes MVCC validation at commit time.
 // Reverts produce a valid endorsement (Status 201 + revert event) instead of an error.
+//
+// Execute is the N==1 case of ExecuteBatch: it opens its own snapshot and builds its
+// own state exactly as ExecuteBatch's single-tx path does, then shares runOn's
+// revert/logs/success classification with it so the two can never drift apart.
 func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction) (endorsement.ExecutionResult, error) {
-	ex, err := e.newExecutor(nil)
+	reader, err := e.kvs.NewSnapshot(0)
 	if err != nil {
 		return endorsement.ExecutionResult{}, err
 	}
-	defer ex.Close()
+	defer reader.Close()
+
+	state, err := e.newState(reader)
+	if err != nil {
+		return endorsement.ExecutionResult{}, err
+	}
+
+	return e.runOn(state, tx)
+}
+
+// runOn executes tx against the given state (already constructed over a reader)
+// and returns the endorsement result. It contains the revert/logs/success
+// classification previously inlined in Execute, now shared by Execute and
+// ExecuteBatch so both paths classify a transaction identically.
+func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorsement.ExecutionResult, error) {
+	ex, err := NewExecutor(state, noopCloser{}, nil, e.evmConfig)
+	if err != nil {
+		return endorsement.ExecutionResult{}, err
+	}
 
 	ret, err := ex.Send(tx)
 	if err != nil {
@@ -86,7 +109,7 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction) (endorse
 			return endorsement.ExecutionResult{}, fmt.Errorf("marshal revert event: %w", mErr)
 		}
 		return endorsement.ExecutionResult{
-			RWS:     ex.state.Result(),
+			RWS:     state.Result(),
 			Event:   event,
 			Status:  201,
 			Message: err.Error(),
@@ -95,15 +118,23 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction) (endorse
 	}
 
 	var logs []byte
-	if l := ex.state.Logs(); len(l) > 0 {
+	if l := state.Logs(); len(l) > 0 {
 		logs, err = json.Marshal(l)
 		if err != nil {
 			return endorsement.ExecutionResult{}, fmt.Errorf("marshal logs: %w", err)
 		}
 	}
 
-	return endorsement.Success(ex.state.Result(), logs, ret), nil
+	return endorsement.Success(state.Result(), logs, ret), nil
 }
+
+// noopCloser is a reader stand-in for runOn's internal Executor: the real
+// ReadStore's lifecycle (open/close) is owned by the caller (Execute or
+// ExecuteBatch), not by the short-lived Executor runOn builds around state.
+type noopCloser struct{}
+
+func (noopCloser) Get(string, string) (*blocks.WriteRecord, error) { return nil, nil }
+func (noopCloser) Close() error                                    { return nil }
 
 // Call executes a read-only call (eth_call semantics) against the state at blockNumber
 // (0 / nil = latest). The EVM block context is not reconstructed for historical blocks —
