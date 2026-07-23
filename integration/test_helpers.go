@@ -130,10 +130,11 @@ func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmCon
 // that will be inserted into the notification handler chain right before the cleanup handler.
 func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, txQueue core.TxQueueInterface, useNotifications bool, extraHandler common.TxHandler) (*TestHarness, *network.Synchronizer, error) {
 	dbs := make([]storage.KVS, len(endorsers))
+	readStores := make([]execution.KVSSnapshotter, len(endorsers))
 	builders := make([]endorsement.Builder, len(endorsers))
 	ends := make([]eapi.Service, len(endorsers))
 	for i, e := range endorsers {
-		dbs[i], builders[i], ends[i] = e.KVS, e.Builder, e.Service
+		dbs[i], readStores[i], builders[i], ends[i] = e.KVS, e.ReadStore, e.Builder, e.Service
 	}
 
 	// Build gateway signer.
@@ -200,7 +201,9 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	if !bypass {
 		handlers := make([]blocks.BlockHandler, 0, len(dbs)+2)
 		for _, db := range dbs {
-			handlers = append(handlers, db)
+			if db != nil {
+				handlers = append(handlers, db)
+			}
 		}
 		// Add chain before gateway to ensure blocks are persisted before marking transactions complete
 		handlers = append(handlers, chain)
@@ -238,7 +241,9 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 			// Set up AllTxStreamer notification system
 			txHandlers := make([]common.TxHandler, 0, len(dbs)+2)
 			for _, db := range dbs {
-				txHandlers = append(txHandlers, db.(common.TxHandler))
+				if db != nil {
+					txHandlers = append(txHandlers, db.(common.TxHandler))
+				}
 			}
 			txHandlers = append(txHandlers, gw.TxQueue.(common.TxHandler))
 			if extraHandler != nil {
@@ -276,8 +281,9 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	gw.Start(t.Context())
 	t.Cleanup(func() { gw.Stop() })
 
-	// Create state primer (use first submitter)
-	primer, err := NewStatePrimer(gw, submitters[0], dbs[0], cfg.Network.Namespace, gwSigner, builders, cfg.Network.Channel, cfg.Network.NsVersion, cfg.Network.Protocol == "fabric-x")
+	// Create state primer (use first submitter). Reads go through readStores[0] (always
+	// non-nil) rather than dbs[0], which is nil in "query-service" mode.
+	primer, err := NewStatePrimer(gw, submitters[0], readStores[0], cfg.Network.Namespace, gwSigner, builders, cfg.Network.Channel, cfg.Network.NsVersion, cfg.Network.Protocol == "fabric-x")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -335,12 +341,15 @@ func applyConfigOverrides(cfg *config.Config, overrides map[string]any) error {
 }
 
 // EndorserComponents bundles the pieces produced when constructing a single test-harness
-// endorser: its KVS (for handler registration and priming), its endorsement builder (for
-// state priming), and the eapi.Service used for endorsement.
+// endorser: its ReadStore (what the engine reads through — always non-nil), its KVS (the
+// block-handler backing store; non-nil only in "memory" mode, nil in "query-service" mode
+// where state comes from the live query service), its endorsement builder (for state
+// priming), and the eapi.Service used for endorsement.
 type EndorserComponents struct {
-	KVS     storage.KVS
-	Builder endorsement.Builder
-	Service eapi.Service
+	ReadStore execution.KVSSnapshotter
+	KVS       storage.KVS
+	Builder   endorsement.Builder
+	Service   eapi.Service
 }
 
 // EndorserFactory is a function that creates an endorser along with its dependencies.
@@ -370,8 +379,8 @@ func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespac
 	if ecfg.Database.Database != "query-service" {
 		ecfg.Database.Database = "memory"
 	}
-	db, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
-	return EndorserComponents{KVS: db, Builder: builder, Service: end}
+	readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+	return EndorserComponents{ReadStore: readStore, KVS: backing, Builder: builder, Service: end}
 }
 
 // prepareHarnessConfig applies configOverrides to cfg, derives evmConfig.ChainConfig from
@@ -526,8 +535,11 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 
 // NewEndorser creates a sync-less endorser with its dependencies, for use under the
 // harness's single gateway-level synchronizer topology (see buildTestHarnessWithExtraHandler).
+// readStore is always non-nil: it's what the engine reads through. backing is non-nil only
+// in "memory" mode (the in-process RevertibleLightKVS to feed with committed blocks); in
+// "query-service" mode it's nil since state comes from the live query service.
 // Exported for use by custom endorser factories.
-func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (storage.KVS, endorsement.Builder, *ecore.Endorser) {
+func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (readStore execution.KVSSnapshotter, backing storage.KVS, builder endorsement.Builder, end *ecore.Endorser) {
 	t.Helper()
 
 	var signer sdk.Signer
@@ -541,16 +553,16 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 		}
 	}
 
-	end, _, back, builder, err := eapp.NewEndorserCore(cfg, channel, namespace, protocol, signer, evmConfig, false)
+	end, readStore, back, builder, err := eapp.NewEndorserCore(cfg, channel, namespace, protocol, signer, evmConfig, false)
 	if err != nil {
 		t.Fatalf("NewEndorserCore: %v", err)
 	}
-	if back == nil {
-		t.Fatalf("NewEndorserCore: expected an in-memory backing store (database=%q), got nil", cfg.Database.Database)
+	if back != nil {
+		t.Cleanup(func() { back.Close() })
+		backing = back
 	}
-	t.Cleanup(func() { back.Close() })
 
-	return back, builder, end
+	return readStore, backing, builder, end
 }
 
 // TestHarness provides access to gateways and endorsers for testing.

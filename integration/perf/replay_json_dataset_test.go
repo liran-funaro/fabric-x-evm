@@ -100,7 +100,7 @@ func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []fxcommon.Tx
 func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig) integration.EndorserFactory {
 	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) integration.EndorserComponents {
 		// Create the base endorser components
-		db, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+		readStore, backing, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
 
 		// Extract the base EVMEngine
 		baseEngine, ok := baseEndorser.Engine.(*execution.EVMEngine)
@@ -111,7 +111,7 @@ func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig
 		// Wrap the engine with balance priming support
 		wrappedEngine := testimpl.NewEVMEngineWrapper(
 			namespace,
-			db,
+			readStore,
 			evmConfig,
 			protocol == "fabric-x", // monotonicVersions
 			baseEngine,
@@ -121,7 +121,7 @@ func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig
 		// Replace the engine in the endorser
 		baseEndorser.Engine = wrappedEngine
 
-		return integration.EndorserComponents{KVS: db, Builder: builder, Service: baseEndorser}
+		return integration.EndorserComponents{ReadStore: readStore, KVS: backing, Builder: builder, Service: baseEndorser}
 	}
 }
 

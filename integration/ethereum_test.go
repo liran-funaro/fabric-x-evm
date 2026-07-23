@@ -455,14 +455,14 @@ type ethereumTestHarness struct {
 // blockCtx injects the test-specific EVM block context (fork rules, coinbase, difficulty, etc.).
 func wrappedEndorserFactory(blockCtx *vm.BlockContext) EndorserFactory {
 	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) EndorserComponents {
-		db, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+		readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
 
-		engine := execution.NewEVMEngine(namespace, db, evmConfig, protocol == "fabric-x")
-		engineWrapper := testimpl.NewEVMEngineWrapper(namespace, db, evmConfig, protocol == "fabric-x", engine)
+		engine := execution.NewEVMEngine(namespace, readStore, evmConfig, protocol == "fabric-x")
+		engineWrapper := testimpl.NewEVMEngineWrapper(namespace, readStore, evmConfig, protocol == "fabric-x", engine)
 		engineWrapper.SetBlockContext(blockCtx)
 
 		wrapper := testimpl.NewEndorserWrapper(end, engineWrapper)
-		return EndorserComponents{KVS: db, Builder: builder, Service: wrapper}
+		return EndorserComponents{ReadStore: readStore, KVS: backing, Builder: builder, Service: wrapper}
 	}
 }
 
