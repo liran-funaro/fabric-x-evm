@@ -68,14 +68,14 @@ func NewTestNode(ctx context.Context, tcfg TestNodeConfig) (*App, error) {
 	}
 
 	// HistorySize=128 gives evm_snapshot/evm_revert enough history to rewind through.
-	endorserDB := econfig.DB{Database: "memory", HistorySize: 128}
-	endorser, endorserKVS, _, err := eapp.NewEndorserCore(endorserDB, testNodeChannel, testNodeNamespace, protocol, signer, evmConfig, true)
+	ecfg := econfig.Endorser{Database: econfig.DB{Database: "memory", HistorySize: 128}}
+	endorser, _, back, _, err := eapp.NewEndorserCore(ecfg, testNodeChannel, testNodeNamespace, protocol, signer, evmConfig, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorser: %w", err)
 	}
 
-	// endorserKVS makes fabrictest's MVCC validation read the same DB the endorser reads.
-	nw, err := fabrictest.Start(ctx, testNodeNamespace, protocol, fabrictest.Config{}, endorserKVS)
+	// back makes fabrictest's MVCC validation read the same DB the endorser reads.
+	nw, err := fabrictest.Start(ctx, testNodeNamespace, protocol, fabrictest.Config{}, back)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start in-process network: %w", err)
 	}
@@ -99,7 +99,7 @@ func NewTestNode(ctx context.Context, tcfg TestNodeConfig) (*App, error) {
 		},
 	}
 
-	application, err := buildApp(ctx, cfg, signer, logger, []eapi.Service{endorser}, nil, endorserKVS, true, tcfg.TestAccountsPath, endorserKVS)
+	application, err := buildApp(ctx, cfg, signer, logger, []eapi.Service{endorser}, back, true, tcfg.TestAccountsPath, back)
 	if err != nil {
 		return nil, err
 	}

@@ -36,13 +36,12 @@ var appLogger = flogging.MustGetLogger("gateway.app")
 
 // App represents the gateway application with all its components.
 type App struct {
-	cfg           config.Config
-	endorserSyncs []*network.Synchronizer
-	gwSync        *network.Synchronizer
-	gateway       *core.Gateway
-	chain         *core.Chain
-	rpcServer     *rpc.Server
-	httpServer    *http.Server
+	cfg        config.Config
+	gwSync     *network.Synchronizer
+	gateway    *core.Gateway
+	chain      *core.Chain
+	rpcServer  *rpc.Server
+	httpServer *http.Server
 }
 
 // Gateway returns the inner gateway, e.g. for use in tests.
@@ -82,10 +81,9 @@ func NewTestNodeWithConfig(ctx context.Context, cfg config.Config, testAccountsP
 func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableTestRPC bool, testAccountsPath string) (*App, error) {
 	logger := sdk.NewStdLogger("gateway")
 
-	// Create endorsers and their synchronizers.
+	// Create endorsers.
 	endorsers := make([]eapi.Service, 0, len(cfg.Endorsers))
-	endorserSyncs := make([]*network.Synchronizer, 0, len(cfg.Endorsers))
-	var firstKVS estorage.KVS // Keep first endorser's KVS for test server
+	var firstBack *estorage.RevertibleLightKVS // Keep first endorser's backing store for test server
 	for i, ecfg := range cfg.Endorsers {
 		// Set history size: always 128 for test RPC (snapshot/revert), else default to 2 if not set
 		if enableTestRPC {
@@ -99,23 +97,30 @@ func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableT
 			return nil, fmt.Errorf("failed to create signer: %w", err)
 		}
 
-		end, sync, kvs, err := eapp.NewEndorser(ecfg, cfg.Network, eSigner, logger, enableTestRPC)
+		end, back, err := eapp.NewEndorser(ecfg, cfg.Network, eSigner, logger, enableTestRPC)
 		if err != nil {
 			return nil, fmt.Errorf("endorser %d (%s): %w", i, ecfg.Name, err)
 		}
 		endorsers = append(endorsers, end)
-		endorserSyncs = append(endorserSyncs, sync)
 		if i == 0 {
-			firstKVS = kvs
+			firstBack = back
 		}
 	}
 
-	return buildApp(ctx, cfg, gwSigner, logger, endorsers, endorserSyncs, firstKVS, enableTestRPC, testAccountsPath)
+	// In-memory mode (test RPC) has no query service to read live state from, so the
+	// gateway synchronizer must feed the endorser's backing store directly, the same way
+	// it feeds chain/gateway.
+	var extraHandlers []blocks.BlockHandler
+	if enableTestRPC && firstBack != nil {
+		extraHandlers = append(extraHandlers, firstBack)
+	}
+
+	return buildApp(ctx, cfg, gwSigner, logger, endorsers, firstBack, enableTestRPC, testAccountsPath, extraHandlers...)
 }
 
 // buildApp wires up the gateway from pre-built endorsers.
 // extraHandlers are prepended to the synchronizer handler list, ahead of chain/gateway.
-func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logger sdk.Logger, endorsers []eapi.Service, endorserSyncs []*network.Synchronizer, lightKVS estorage.KVS, enableTestRPC bool, testAccountsPath string, extraHandlers ...blocks.BlockHandler) (*App, error) {
+func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logger sdk.Logger, endorsers []eapi.Service, lightKVS *estorage.RevertibleLightKVS, enableTestRPC bool, testAccountsPath string, extraHandlers ...blocks.BlockHandler) (*App, error) {
 	orderers := make([]network.OrdererConf, len(cfg.Gateway.Orderers))
 	for i, o := range cfg.Gateway.Orderers {
 		orderers[i] = o.ToOrdererConf()
@@ -157,15 +162,14 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 			return nil, fmt.Errorf("failed to load test accounts: %w", err)
 		}
 
-		revertibleKVS, ok := lightKVS.(estorage.Revertible)
-		if !ok {
-			return nil, fmt.Errorf("test RPC enabled but lightKVS is not Revertible")
+		if lightKVS == nil {
+			return nil, fmt.Errorf("test RPC enabled but no endorser backing store available")
 		}
 
 		// Wrap the chain's store with SnapshotStore for snapshot/revert functionality
 		snapshotStore := storage.NewSnapshotStore(chain.Store)
 
-		rpcServer, err = testimpl.NewTestServer(gateway, testAccountMgr.Addresses, testAccountMgr.PrivateKeys, revertibleKVS, snapshotStore)
+		rpcServer, err = testimpl.NewTestServer(gateway, testAccountMgr.Addresses, testAccountMgr.PrivateKeys, lightKVS, snapshotStore)
 		if err != nil {
 			return nil, err
 		}
@@ -178,12 +182,11 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 	}
 
 	return &App{
-		cfg:           cfg,
-		endorserSyncs: endorserSyncs,
-		gwSync:        gwSync,
-		gateway:       gateway,
-		chain:         chain,
-		rpcServer:     rpcServer,
+		cfg:       cfg,
+		gwSync:    gwSync,
+		gateway:   gateway,
+		chain:     chain,
+		rpcServer: rpcServer,
 	}, nil
 }
 
@@ -194,19 +197,7 @@ func (a *App) Run(ctx context.Context) error {
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	// Start synchronizers
-	for _, sync := range a.endorserSyncs {
-		g.Go(func() error { return sync.Start(gctx) })
-	}
 	g.Go(func() error { return a.gwSync.Start(gctx) })
-
-	// Wait for initial sync before serving traffic
-	for i, sync := range a.endorserSyncs {
-		if err := WaitUntilSynced(gctx, sync, 10*time.Second); err != nil {
-			return err
-		}
-		appLogger.Debugf("endorser %d synced", i)
-	}
 
 	// Start gateway worker pool
 	appLogger.Debugf("starting gateway with %d workers", a.cfg.Gateway.WorkerCount)

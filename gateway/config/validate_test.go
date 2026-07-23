@@ -64,7 +64,7 @@ func validConfig(t *testing.T) config.Config {
 				Name:      "org1",
 				Identity:  identity,
 				Committer: client,
-				Database:  endorsercfg.DB{Database: "sqlite", ConnString: "file:e.db"},
+				Database:  endorsercfg.DB{Database: "memory", ConnString: "file:e.db"},
 			},
 		},
 	}

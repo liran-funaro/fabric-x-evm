@@ -361,8 +361,15 @@ func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConf
 	return endorsers
 }
 
-// defaultEndorserFactory creates regular endorsers without wrapping.
+// defaultEndorserFactory creates regular endorsers without wrapping. In-process harnesses
+// have no live query service to read from, so they must use the memory-backed client whose
+// backing store this package updates directly (see buildTestHarnessWithExtraHandler's handler
+// registration) — unless the config already selects query-service, e.g. for perf tests that
+// run against a real query service.
 func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) EndorserComponents {
+	if ecfg.Database.Database != "query-service" {
+		ecfg.Database.Database = "memory"
+	}
 	db, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
 	return EndorserComponents{KVS: db, Builder: builder, Service: end}
 }
@@ -534,13 +541,16 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 		}
 	}
 
-	end, db, builder, err := eapp.NewEndorserCore(cfg.Database, channel, namespace, protocol, signer, evmConfig, false)
+	end, _, back, builder, err := eapp.NewEndorserCore(cfg, channel, namespace, protocol, signer, evmConfig, false)
 	if err != nil {
 		t.Fatalf("NewEndorserCore: %v", err)
 	}
-	t.Cleanup(func() { db.Close() })
+	if back == nil {
+		t.Fatalf("NewEndorserCore: expected an in-memory backing store (database=%q), got nil", cfg.Database.Database)
+	}
+	t.Cleanup(func() { back.Close() })
 
-	return db, builder, end
+	return back, builder, end
 }
 
 // TestHarness provides access to gateways and endorsers for testing.
