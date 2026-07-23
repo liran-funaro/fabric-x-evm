@@ -72,6 +72,11 @@ func NewGRPCClient(conn *grpc.ClientConn, viewTimeout time.Duration) *GRPCClient
 }
 
 func (c *GRPCClient) BeginView(ctx context.Context) (string, error) {
+	if c.viewTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
+		defer cancel()
+	}
 	view, err := c.cl.BeginView(ctx, &committerpb.ViewParameters{
 		IsoLevel:            committerpb.IsoLevel_SERIALIZABLE,
 		TimeoutMilliseconds: uint64(c.viewTimeout.Milliseconds()),
@@ -83,6 +88,11 @@ func (c *GRPCClient) BeginView(ctx context.Context) (string, error) {
 }
 
 func (c *GRPCClient) GetRows(ctx context.Context, viewID, ns string, keys [][]byte) ([]Row, error) {
+	if c.viewTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
+		defer cancel()
+	}
 	q := &committerpb.Query{
 		View:       &committerpb.View{Id: viewID},
 		Namespaces: []*committerpb.QueryNamespace{{NsId: ns, Keys: keys}},
@@ -104,6 +114,11 @@ func (c *GRPCClient) GetRows(ctx context.Context, viewID, ns string, keys [][]by
 }
 
 func (c *GRPCClient) EndView(ctx context.Context, viewID string) error {
+	if c.viewTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
+		defer cancel()
+	}
 	_, err := c.cl.EndView(ctx, &committerpb.View{Id: viewID})
 	return err
 }

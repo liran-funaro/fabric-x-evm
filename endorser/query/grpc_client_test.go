@@ -81,3 +81,58 @@ func TestGRPCClientRoundTrip(t *testing.T) {
 		t.Fatalf("EndView: %v", err)
 	}
 }
+
+// blockingQS is a fake QueryServiceServer whose GetRows blocks until the
+// request context is cancelled, simulating an unresponsive query service.
+type blockingQS struct {
+	committerpb.UnimplementedQueryServiceServer
+}
+
+func (f *blockingQS) BeginView(context.Context, *committerpb.ViewParameters) (*committerpb.View, error) {
+	return &committerpb.View{Id: "v1"}, nil
+}
+func (f *blockingQS) EndView(context.Context, *committerpb.View) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+func (f *blockingQS) GetRows(ctx context.Context, _ *committerpb.Query) (*committerpb.Rows, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestGRPCClientGetRowsTimesOut verifies that GetRows applies a per-RPC
+// deadline derived from viewTimeout, so an unresponsive query service can't
+// block the caller indefinitely.
+func TestGRPCClientGetRowsTimesOut(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	committerpb.RegisterQueryServiceServer(srv, &blockingQS{})
+	go srv.Serve(lis)
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := query.NewGRPCClient(conn, 100*time.Millisecond)
+	defer c.Close()
+
+	done := make(chan struct{})
+	var rows []query.Row
+	var getErr error
+	go func() {
+		rows, getErr = c.GetRows(context.Background(), "v1", "evm", [][]byte{[]byte("k1")})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		if getErr == nil {
+			t.Fatalf("GetRows returned no error, rows = %+v; want deadline-exceeded error", rows)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetRows did not return within 5s; per-RPC deadline was not applied")
+	}
+}

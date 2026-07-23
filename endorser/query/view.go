@@ -35,10 +35,9 @@ func (s *Store) NewSnapshot(_ uint64) (execution.ReadStore, error) {
 		return nil, err
 	}
 	return &View{
-		client:    s.client,
-		viewID:    viewID,
-		namespace: s.namespace,
-		cache:     make(map[string]*blocks.WriteRecord),
+		client: s.client,
+		viewID: viewID,
+		cache:  make(map[string]*blocks.WriteRecord),
 	}, nil
 }
 
@@ -48,19 +47,26 @@ func (s *Store) Close() error { return s.client.Close() }
 // View is a ReadStore backed by one query-service view. Reads are cached in the
 // view so a key is fetched at most once and repeated reads are consistent.
 type View struct {
-	client    QueryClient
-	viewID    string
-	namespace string
+	client QueryClient
+	viewID string
 
 	mu    sync.Mutex
-	cache map[string]*blocks.WriteRecord // key -> record; nil value means "known absent"
+	cache map[string]*blocks.WriteRecord // (namespace, key) -> record; nil value means "known absent"
+}
+
+// cacheKey combines namespace and key so reads across namespaces (should the
+// same View ever be used for more than one) can't collide.
+func cacheKey(namespace, key string) string {
+	return namespace + "\x00" + key
 }
 
 // Get returns the record for (namespace, key), or (nil, nil) if the key has no
 // committed value. namespace must equal the store's namespace.
 func (v *View) Get(namespace, key string) (*blocks.WriteRecord, error) {
+	ck := cacheKey(namespace, key)
+
 	v.mu.Lock()
-	if rec, ok := v.cache[key]; ok {
+	if rec, ok := v.cache[ck]; ok {
 		v.mu.Unlock()
 		return rec, nil
 	}
@@ -85,7 +91,7 @@ func (v *View) Get(namespace, key string) (*blocks.WriteRecord, error) {
 	}
 
 	v.mu.Lock()
-	v.cache[key] = rec // caches nil for known-absent keys too
+	v.cache[ck] = rec // caches nil for known-absent keys too
 	v.mu.Unlock()
 	return rec, nil
 }

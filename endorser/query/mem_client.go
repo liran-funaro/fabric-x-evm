@@ -26,10 +26,6 @@ var _ QueryClient = (*MemClient)(nil)
 // NewMemClient wraps kvs as a QueryClient.
 func NewMemClient(kvs *storage.RevertibleLightKVS) *MemClient { return &MemClient{kvs: kvs} }
 
-// Backing exposes the underlying store so callers can register it as a block
-// handler and use its revert API (test RPC).
-func (c *MemClient) Backing() *storage.RevertibleLightKVS { return c.kvs }
-
 func (c *MemClient) BeginView(context.Context) (string, error) { return "mem", nil }
 
 func (c *MemClient) EndView(context.Context, string) error { return nil }
