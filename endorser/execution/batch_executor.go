@@ -61,6 +61,13 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		wg.Add(1)
 		go func(tx *types.Transaction) {
 			defer wg.Done()
+			// The StateDB accessors panic when the underlying store returns a
+			// read error (as opposed to the clean absent-key (nil, nil) case),
+			// and PrepareMessage reads the sender's nonce before anything else.
+			// A transient reader error in this best-effort warm pass must not
+			// crash the endorser: recover and leave the key un-warmed. The
+			// authoritative pass re-runs the tx and surfaces any real error.
+			defer func() { _ = recover() }()
 			if s, err := e.newState(reader); err == nil {
 				_, _ = e.runOn(s, tx) // warm only; ignore result/error.
 			}

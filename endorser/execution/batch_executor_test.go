@@ -164,6 +164,88 @@ func TestExecuteBatchSequentialDependency(t *testing.T) {
 	}
 }
 
+// TestExecuteBatchFreshKeyCreatedMidBatch exercises the overlayReader.Get branch
+// where a key has NO committed pre-batch value (under == nil) but is written by
+// an earlier tx in the batch and read by a later one. Only account A is seeded;
+// B is created by tx1 (A->B), then spent by tx2 (B->C). tx2 can only succeed if
+// it sees tx1's fresh write to B through the overlay. It also asserts tx2's read
+// of B's balance carries a nil MVCC version (recorded as "absent", matching B's
+// true pre-batch ledger state) — the correctness property of the fresh-key path.
+func TestExecuteBatchFreshKeyCreatedMidBatch(t *testing.T) {
+	backend, err := state.NewWriteDB(Channel, "file:batch_fresh_key?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA, addrA := newTestKey(t)
+	keyB, addrB := newTestKey(t)
+	_, addrC := newTestKey(t)
+
+	const (
+		initialA = 1_000
+		amount1  = 300 // tx1: A -> B (B has no pre-batch value; tx1 creates it)
+		amount2  = 100 // tx2: B -> C; only possible if B's fresh balance is visible
+	)
+	// Seed ONLY A. B is absent from committed state until tx1 writes it.
+	seedAccounts(t, backend, map[ethcommon.Address]int64{addrA: initialA})
+
+	kvs := &testVersionedDBSnapshotter{db: backend}
+	cfg := EVMConfig{ChainConfig: common.BuildChainConfig(4011)}
+	engine := NewEVMEngine(Namespace, kvs, cfg, false)
+
+	tx1 := newTransferTx(t, cfg.ChainConfig, keyA, addrB, big.NewInt(amount1), 0)
+	tx2 := newTransferTx(t, cfg.ChainConfig, keyB, addrC, big.NewInt(amount2), 0)
+
+	results, err := engine.ExecuteBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("ExecuteBatch failed: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if results[0].Status != 200 {
+		t.Fatalf("tx1: status = %d, message = %q, want 200 (OK)", results[0].Status, results[0].Message)
+	}
+	if results[1].Status != 200 {
+		t.Fatalf("tx2: status = %d, message = %q, want 200 (OK) — tx2 must see B's fresh balance from tx1", results[1].Status, results[1].Message)
+	}
+
+	balKey := accKey(addrB, "bal")
+
+	// tx2's write reflects B's freshly-created balance minus amount2.
+	var wrote bool
+	for _, w := range results[1].RWS.Writes {
+		if w.Key != balKey {
+			continue
+		}
+		wrote = true
+		got := bytesToUint256(w.Value)
+		want := uint256.NewInt(uint64(amount1 - amount2))
+		if got.Cmp(want) != 0 {
+			t.Errorf("B balance after tx2 = %s, want %s (amount1=%d - amount2=%d)", got, want, amount1, amount2)
+		}
+	}
+	if !wrote {
+		t.Fatalf("expected tx2's RWS to write B's balance key %q; writes = %+v", balKey, results[1].RWS.Writes)
+	}
+
+	// B had no committed pre-batch value, so tx2's read dependency on B's balance
+	// must be recorded with a nil version ("absent"), not a fabricated version.
+	var readFound bool
+	for _, r := range results[1].RWS.Reads {
+		if r.Key != balKey {
+			continue
+		}
+		readFound = true
+		if r.Version != nil {
+			t.Errorf("B balance read version = %+v, want nil (B was absent pre-batch)", r.Version)
+		}
+	}
+	if !readFound {
+		t.Fatalf("expected tx2's RWS to read B's balance key %q; reads = %+v", balKey, results[1].RWS.Reads)
+	}
+}
+
 // TestExecuteBatchSingleMatchesExecute asserts ExecuteBatch([tx]) returns the
 // same RWS as Execute(tx) for one transaction: the N==1 path must be
 // indistinguishable from today's Execute.
