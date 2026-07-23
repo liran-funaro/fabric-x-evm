@@ -49,8 +49,10 @@ func (c *MemClient) GetRows(_ context.Context, _ string, ns string, keys [][]byt
 		if err != nil {
 			return nil, err
 		}
-		if rec == nil {
-			continue // absent key: omit, matching the query service
+		if rec == nil || rec.IsDelete {
+			// Absent, or deleted (RevertToBlock can return a deleted record
+			// with a stale non-nil Value): omit, matching the query service.
+			continue
 		}
 		rows = append(rows, Row{Key: k, Value: rec.Value, Version: rec.Version})
 	}
