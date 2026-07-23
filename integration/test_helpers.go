@@ -827,26 +827,35 @@ func decodeRawTransactionT(t *testing.T, raw []byte) *types.Transaction {
 
 // TestLogger is a logger that logs to a testing.T.
 type TestLogger struct {
-	ID string
-	T  *testing.T
+	ID      string
+	T       *testing.T
+	Disable bool
 }
 
 func (tl TestLogger) Debugf(format string, v ...any) {
 	tl.T.Helper()
-	tl.T.Logf(tl.ID+" > [DEBUG] "+format, v...)
+	if !tl.Disable {
+		tl.T.Logf(tl.ID+" > [DEBUG] "+format, v...)
+	}
 }
 
 func (tl TestLogger) Infof(format string, v ...any) {
 	tl.T.Helper()
-	tl.T.Logf(tl.ID+" > [INFO] "+format, v...)
+	if !tl.Disable {
+		tl.T.Logf(tl.ID+" > [INFO] "+format, v...)
+	}
 }
 
 func (tl TestLogger) Warnf(format string, v ...any) {
 	tl.T.Helper()
-	tl.T.Logf(tl.ID+" > [WARN] "+format, v...)
+	if !tl.Disable {
+		tl.T.Logf(tl.ID+" > [WARN] "+format, v...)
+	}
 }
 
 func (tl TestLogger) Errorf(format string, v ...any) {
 	tl.T.Helper()
-	tl.T.Logf(tl.ID+" > [ERROR] "+format, v...)
+	if !tl.Disable {
+		tl.T.Logf(tl.ID+" > [ERROR] "+format, v...)
+	}
 }

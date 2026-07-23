@@ -26,6 +26,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
+	"github.com/hyperledger/fabric-x-common/api/ordererpb"
 	fxcommon "github.com/hyperledger/fabric-x-evm/common"
 	econf "github.com/hyperledger/fabric-x-evm/endorser/config"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
@@ -34,7 +35,12 @@ import (
 	gwtestimpl "github.com/hyperledger/fabric-x-evm/gateway/testimpl"
 	"github.com/hyperledger/fabric-x-evm/integration"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/text/language"
+	"golang.org/x/text/message"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/protobuf/proto"
+	"gopkg.in/yaml.v2"
 )
 
 var gatewayConfig = flag.String("gateway-config", "fabx.yaml", "gateway config file for the Fabric-X network")
@@ -44,9 +50,9 @@ var namespace = flag.String("namespace", "real", "namespace to commit transactio
 var dataset = flag.String("dataset", "testdata/USDC_dataset.json.gz", "dataset to use")
 var oldqueue = flag.Bool("oldqueue", false, "enable old queue")
 var workers = flag.Int("workers", 20, "number of gateway workers processing transactions")
-var submitters = flag.Int("submitters", 4, "number of goroutines submitting transactions to the gateway")
-var orderers = flag.Int("orderers", 8, "number of goroutines submitting transactions to the orderer (BatchSubmitter workers)")
-var outstanding = flag.Int("outstanding", 1000, "maximum number of outstanding transactions")
+var submitters = flag.Int("submitters", 10, "number of goroutines submitting transactions to the gateway")
+var orderers = flag.Int("orderers", 64, "number of goroutines submitting transactions to the orderer (BatchSubmitter workers)")
+var outstanding = flag.Int("outstanding", 10_000, "maximum number of outstanding transactions")
 
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.
@@ -198,7 +204,15 @@ func writeHeapProfile(filename string) {
 
 // runReplayTest executes the replay test with configurable worker counts and returns metrics.
 // Returns: (overallThroughput, failedTransactionCount, totalTransactionCount)
-func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCount int, ordererSubmitterCount int, numOutstandingTx int, cfg replayConfig, gwConfig string) (float64, int64, int64) {
+func runReplayTest(
+	t *testing.T,
+	processingWorkerCount int,
+	submittingWorkerCount int,
+	ordererSubmitterCount int,
+	numOutstandingTx int,
+	cfg replayConfig,
+	gwConfig string,
+) (float64, int64, int64) {
 	// Silence GRPC logging
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, os.Stderr, os.Stderr))
 
@@ -254,7 +268,7 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 	fmt.Printf("using namespace %s", *namespace)
 	th, err := integration.NewFabricXTestHarnessWithNotifications(
 		t,
-		integration.TestLogger{T: t},
+		integration.TestLogger{T: t, Disable: true}, // Disable test harness logging to avoid overwhelming output
 		evmConfig,
 		"testdata/USDC_contract.json",
 		map[string]any{
@@ -265,7 +279,8 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 		factory,
 		queue,
 		tracker,
-		gwConfig)
+		gwConfig,
+	)
 	// th, err = integration.NewFabricTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount, "Gateway.SubmitterCount": ordererSubmitterCount, "Network.Namespace": *namespace}, factory, gwcore.NewTxQueueV2())
 	assert.NoError(t, err)
 
@@ -344,22 +359,6 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 	// Atomic counters for thread-safe counting
 	var successCount, failCount, skippedCount int64
 
-	// Latency tracking: map transaction hash to submission time (T1)
-	latencyMu := sync.Mutex{}
-	submissionTimes := make(map[common.Hash]time.Time)
-
-	// Enable T2 timestamp tracking in txqueue (when dequeued for processing)
-	gwcore.ProcessingStartTimestamps = make(map[common.Hash]time.Time)
-	defer func() {
-		gwcore.ProcessingStartTimestamps = nil // Clean up after test
-	}()
-
-	// Enable T3 timestamp tracking in batch_submitter (when submitted to orderer)
-	gwcore.SubmissionTimestamps = make(map[common.Hash]time.Time)
-	defer func() {
-		gwcore.SubmissionTimestamps = nil // Clean up after test
-	}()
-
 	runtime.GC()
 
 	// Track throughput
@@ -381,15 +380,18 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 
 	// Worker pool configuration
 	numWorkers := submittingWorkerCount
-	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Hour)
+	defer cancel()
 
 	// Start worker goroutines - they continuously submit without waiting for completion
+	var wg sync.WaitGroup
 	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			for item := range workChan {
+				if ctx.Err() != nil {
+					return
+				}
 				i := item.index
 				transfer := item.transfer
 
@@ -401,24 +403,13 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 					panic(err)
 				}
 
-				// Record submission time
-				txHash := tx.Hash()
-				submissionTime := time.Now()
-				latencyMu.Lock()
-				submissionTimes[txHash] = submissionTime
-				latencyMu.Unlock()
-
 				// Send the transaction without waiting for completion
 				// Use the wrapped gateway directly to bypass nonce validation
-				err = wrappedGateway.SendTransaction(context.Background(), tx)
+				err = wrappedGateway.SendTransaction(ctx, tx)
 				if err != nil {
 					t.Logf("Transfer %d: SendTransaction error: %v", i, err)
 					atomic.AddInt64(&failCount, 1)
 					atomic.AddInt64(&outstandingTxCount, -1)
-					// Remove from tracking on failure
-					latencyMu.Lock()
-					delete(submissionTimes, txHash)
-					latencyMu.Unlock()
 					continue
 				}
 				// Transaction submitted successfully - it's now outstanding
@@ -427,19 +418,18 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 					metrics.RecordTransactionSent()
 				}
 			}
-		}()
+		})
 	}
 
 	// Progress logging goroutine
 	stopLogging := make(chan struct{})
 	var loggingWg sync.WaitGroup
-	loggingWg.Add(1)
-	go func() {
-		defer loggingWg.Done()
+	loggingWg.Go(func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
 
-		itrctr := 0
+		// Create a printer for the English locale (adds commas)
+		p := message.NewPrinter(language.English)
 
 		for {
 			select {
@@ -465,10 +455,17 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 					progressTarget = cfg.totalDispatches
 				}
 
-				t.Logf("Progress: %d/%d transfers processed (%d successful, %d failed, %d skipped, %d outstanding) | Throughput: %.2f tx/s (recent), %.2f tx/s (overall)",
+				msg := p.Sprintf("Progress: %d/%d transfers processed (%d successful, %d failed, %d skipped, %d outstanding) | Throughput: %.2f tx/s (recent), %.2f tx/s (overall)",
 					currentSuccess+currentFail+currentSkipped, progressTarget,
 					currentSuccess, currentFail, currentSkipped, currentOutstanding,
 					throughput, overallThroughput)
+				t.Log(msg)
+
+				// Update metrics
+				if metrics != nil {
+					metrics.SetOutstandingTransactions(currentOutstanding)
+					metrics.SetThroughput(overallThroughput)
+				}
 
 				// Update metrics
 				if metrics != nil {
@@ -479,29 +476,20 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 				// Update for next interval
 				lastLogTime.Store(now)
 				lastLogCount = currentTotal
-
-				_ = itrctr
-				// if itrctr%50 == 0 {
-				// 	runtime.GC()
-				// 	logMem("blah")
-				// 	writeHeapProfile(fmt.Sprintf("heap_%d.prof", itrctr))
-				// }
-				// itrctr++
-
+			case <-ctx.Done():
+				return
 			case <-stopLogging:
 				return
 			}
 		}
-	}()
+	})
 
 	// Feed work to the workers (refill goroutine)
-	var refillWg sync.WaitGroup
-	refillWg.Add(1)
 	var dispatched int64
 	cursor := 0
 
-	go func() {
-		defer refillWg.Done()
+	var refillWg sync.WaitGroup
+	refillWg.Go(func() {
 		defer close(workChan)
 
 		// Pre-fill the channel with numOutstandingTx transactions
@@ -517,42 +505,6 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 		// Process completions and refill
 		for notif := range completionCh {
 			atomic.AddInt64(&outstandingTxCount, -1)
-
-			// T4: notification received time
-			t4 := time.Now()
-
-			// Get T1 (test submission time)
-			latencyMu.Lock()
-			t1, existsT1 := submissionTimes[notif.EthTxHash]
-			if existsT1 {
-				delete(submissionTimes, notif.EthTxHash)
-			}
-			latencyMu.Unlock()
-
-			// Get T2 (dequeue/processing start time)
-			gwcore.ProcessingStartTimestampsMu.Lock()
-			t2, existsT2 := gwcore.ProcessingStartTimestamps[notif.EthTxHash]
-			if existsT2 {
-				delete(gwcore.ProcessingStartTimestamps, notif.EthTxHash)
-			}
-			gwcore.ProcessingStartTimestampsMu.Unlock()
-
-			// Get T3 (batch submitter time)
-			gwcore.SubmissionTimestampsMu.Lock()
-			t3, existsT3 := gwcore.SubmissionTimestamps[notif.EthTxHash]
-			if existsT3 {
-				delete(gwcore.SubmissionTimestamps, notif.EthTxHash)
-			}
-			gwcore.SubmissionTimestampsMu.Unlock()
-
-			// Calculate and record latencies if we have all timestamps
-			if metrics != nil && existsT1 && existsT2 && existsT3 {
-				totalLatency := t4.Sub(t1)      // T4 - T1: total end-to-end latency
-				queueLatency := t2.Sub(t1)      // T2 - T1: queueing time
-				processingLatency := t3.Sub(t2) // T3 - T2: processing time by the app
-				backendLatency := t4.Sub(t3)    // T4 - T3: processing time by the backend
-				metrics.RecordLatencies(totalLatency, queueLatency, processingLatency, backendLatency)
-			}
 
 			// Update success/fail counts
 			if notif.Status == committerpb.Status_COMMITTED {
@@ -605,10 +557,11 @@ func runReplayTest(t *testing.T, processingWorkerCount int, submittingWorkerCoun
 				}
 			}
 		}
-	}()
+	})
 
 	// Wait for all workers to finish processing
 	wg.Wait()
+	cancel()
 
 	// Stop the tracker before closing the channel — the notification streaming
 	// goroutine (started by the test harness) outlives this function and would
@@ -648,15 +601,20 @@ func TestReplayJSONDataset(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
-	// flogging.ActivateSpec("gateway.core.txqueue_v2=debug")
 
-	// Use flag values for worker configuration
+	// Run the test with single worker configuration
 	processingWorkerCount := *workers    // Number of gateway workers processing transactions
 	submittingWorkerCount := *submitters // Number of goroutines submitting transactions TO the gateway
 	ordererSubmitterCount := *orderers   // Number of goroutines submitting transactions TO the orderer (BatchSubmitter workers)
 	numOutstandingTx := *outstanding     // Maximum number of outstanding transactions
 
-	_, _, _ = runReplayTest(t, processingWorkerCount, submittingWorkerCount, ordererSubmitterCount, numOutstandingTx, replayConfig{windowSize: 1000000}, *gatewayConfig)
+	_, _, _ = runReplayTest(
+		t, processingWorkerCount, submittingWorkerCount, ordererSubmitterCount, numOutstandingTx, replayConfig{
+			windowSize: 1_000_000,
+			wrapAround: true,
+			wrapCount:  1_000_000,
+		}, *gatewayConfig,
+	)
 }
 
 type performanceResult struct {
@@ -745,4 +703,17 @@ func TestReplayJSONDatasetPerformance(t *testing.T) {
 	}
 
 	t.Logf("Performance results written to %s", csvPath)
+}
+
+func TestShared(t *testing.T) {
+	sharedConfigBytes, err := os.ReadFile("../../testdata/crypto/shared_config.binpb")
+	require.NoError(t, err)
+
+	// Unmarshal the protobuf
+	sharedConfig := &ordererpb.SharedConfig{}
+	err = proto.Unmarshal(sharedConfigBytes, sharedConfig)
+	require.NoError(t, err)
+	s, err := yaml.Marshal(sharedConfig)
+	require.NoError(t, err)
+	fmt.Printf("%s\n", s)
 }

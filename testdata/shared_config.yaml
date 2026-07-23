@@ -137,7 +137,7 @@ Batching:
     SecondStrikeThreshold: 10s
     AutoRemoveTimeout: 10s
   BatchSize:
-    MaxMessageCount: 10000
+    MaxMessageCount: 2_000
     AbsoluteMaxBytes: 10485760
     PreferredMaxBytes: 2097152
   RequestMaxBytes: 1048576
