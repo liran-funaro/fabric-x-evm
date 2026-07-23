@@ -25,7 +25,7 @@ var (
 	ErrKeyNotFound = errors.New("key not found")
 )
 
-// KVS is implemented by both LightKVS and VersionedDBWrapper.
+// KVS is implemented by LightKVS (and RevertibleLightKVS).
 // It combines snapshot reads, block handling, and lifecycle management.
 type KVS interface {
 	execution.KVSSnapshotter

@@ -10,7 +10,6 @@ which is licensed under the GNU Lesser General Public License v3.0.
 package integration
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,9 +39,6 @@ import (
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
 	"github.com/holiman/uint256"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
-	"github.com/hyperledger/fabric-x-evm/endorser/storage"
-	"github.com/hyperledger/fabric-x-sdk/blocks"
-	fabricstate "github.com/hyperledger/fabric-x-sdk/state"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -601,88 +597,6 @@ func makePreState(db ethdb.Database, accounts types.GenesisAlloc, snapshotter bo
 	// Return plain ethStateDB (not wrapped in DualStateDB)
 	// The Run method already handles both DualStateDB and plain StateDB
 	return StateTestState{loggedStateDB, trieDB, snaps}
-}
-
-//lint:ignore U1000 kept for future tests / debugging
-func makePreStateWithDualState(db ethdb.Database, accounts types.GenesisAlloc, snapshotter bool, scheme string) StateTestState {
-	// Use the same approach as go-ethereum's MakePreState
-	tconf := &triedb.Config{Preimages: true}
-	if scheme == rawdb.HashScheme {
-		tconf.HashDB = &hashdb.Config{}
-	} else {
-		tconf.PathDB = &pathdb.Config{}
-	}
-	trieDB := triedb.NewDatabase(db, tconf)
-	sdb := state.NewDatabase(trieDB, nil)
-	ethStateDB, _ := state.New(types.EmptyRootHash, sdb)
-
-	// Create a mock StateDB for DualStateDB
-	fabricDB, _ := fabricstate.NewWriteDB("testchannel", ":memory:")
-	fabricDBWrapper := storage.NewVersionedDBWrapper(fabricDB)
-	fabricDBSnapshot, _ := fabricDBWrapper.NewSnapshot(1)
-	defer fabricDBSnapshot.Close()
-	fabricStateDB, _ := execution.NewStateDB(context.TODO(), fabricDBSnapshot, "testns", 0, false)
-
-	// Use DualStateDB instead of plain StateDB for debugging
-	statedb := execution.NewDualStateDB(ethStateDB, fabricStateDB)
-
-	// Populate accounts
-	for addr, a := range accounts {
-		statedb.CreateAccount(addr)
-		statedb.AddBalance(addr, uint256.MustFromBig(a.Balance), tracing.BalanceChangeUnspecified)
-		statedb.SetCode(addr, a.Code, tracing.CodeChangeUnspecified)
-		statedb.SetNonce(addr, a.Nonce, tracing.NonceChangeUnspecified)
-		for k, v := range a.Storage {
-			statedb.SetState(addr, k, v)
-		}
-	}
-
-	// Commit and re-open to start with a clean state
-	root, _ := statedb.EthStateDB().Commit(0, false, false)
-
-	// Commit the fabric state to the database
-	rws := fabricStateDB.Result()
-	err := fabricDB.UpdateWorldState(context.TODO(), blocks.Block{Number: 0, Transactions: []blocks.Transaction{
-		{
-			ID:     "setup",
-			Number: 0,
-			Valid:  true,
-			NsRWS: []blocks.NsReadWriteSet{
-				{
-					Namespace: "testns",
-					RWS:       rws,
-				},
-			},
-		},
-	}})
-	if err != nil {
-		panic(err)
-	}
-
-	// If snapshot is requested, initialize the snapshotter and use it in state
-	var snaps *snapshot.Tree
-	if snapshotter {
-		snapconfig := snapshot.Config{
-			CacheSize:  1,
-			Recovery:   false,
-			NoBuild:    false,
-			AsyncBuild: false,
-		}
-		snaps, _ = snapshot.New(snapconfig, db, trieDB, root)
-	}
-	// Pass nil for the default code db; snaps unused in the current signature.
-	_ = snaps
-	sdb = state.NewDatabase(trieDB, nil)
-	ethStateDB, _ = state.New(root, sdb)
-
-	// Create new StateDB for the reopened state - now reading from block 1
-	// since we just committed block 0
-	fabricDBSnapshot2, _ := fabricDBWrapper.NewSnapshot(1)
-	defer fabricDBSnapshot2.Close()
-	fabricStateDB, _ = execution.NewStateDB(context.TODO(), fabricDBSnapshot2, "testns", 1, false)
-	statedb = execution.NewDualStateDB(ethStateDB, fabricStateDB)
-
-	return StateTestState{statedb, trieDB, snaps}
 }
 
 func vmTestBlockHash(n uint64) common.Hash {

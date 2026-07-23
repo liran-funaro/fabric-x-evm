@@ -14,9 +14,9 @@ import (
 )
 
 // testVersionedDBSnapshotter adapts a *state.VersionedDB to KVSSnapshotter for tests
-// in this package. It intentionally duplicates storage.VersionedDBWrapper's small
-// adapter logic rather than importing the storage package, which itself depends on
-// execution — tests exercise the ports this package defines, not a concrete backend.
+// in this package. It keeps a small snapshot-over-VersionedDB adapter local rather
+// than importing the storage package, which itself depends on execution — tests
+// exercise the ports this package defines, not a concrete backend.
 type testVersionedDBSnapshotter struct {
 	db *state.VersionedDB
 }

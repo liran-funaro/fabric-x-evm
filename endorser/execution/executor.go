@@ -37,7 +37,8 @@ type EVMConfig struct {
 }
 
 // KVSSnapshotter is the port execution uses to obtain a versioned read snapshot
-// of the world state. storage.LightKVS and storage.VersionedDBWrapper implement it.
+// of the world state. query.Store (the Fabric-X query-service reader) implements it
+// in production; storage.LightKVS implements it for tests.
 type KVSSnapshotter interface {
 	NewSnapshot(blockNumber uint64) (ReadStore, error)
 }

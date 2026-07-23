@@ -104,6 +104,11 @@ var cases = []testCase{
 // Gateway (receive) -> Endorser (endorse) -> Gateway (submit) -> Orderer (order) -> Peer (commit) -> Endorser (update state)
 // Gateway (receive) -> Endorser (endorse) -> Gateway (update state)
 func TestLocal(t *testing.T) {
+	t.Skip("plain-Fabric (protocol \"fabric\") state reads are no longer supported: the endorser " +
+		"now reads through the Fabric-X query service, whose wire format carries only the fabric-x " +
+		"monotonic version, not Fabric's (BlockNum, TxNum). See TestLocalX for the fabric-x path and " +
+		"docs/superpowers/specs/2026-07-23-drop-internal-state-db-design.md.")
+
 	// silence GRPC logging
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, os.Stderr, os.Stderr))
 
