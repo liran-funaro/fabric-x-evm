@@ -45,7 +45,8 @@ func validEndorser(t *testing.T) config.Endorser {
 		Committer: common.ClientConfig{
 			Endpoint: &common.Endpoint{Host: "127.0.0.1", Port: 4001},
 		},
-		Database: config.DB{Database: "sqlite", ConnString: "file:endorser.db"},
+		Database:     config.DB{Database: "query-service"},
+		QueryService: common.ClientConfig{Endpoint: &common.Endpoint{Host: "127.0.0.1", Port: 7001}},
 	}
 }
 
@@ -56,9 +57,6 @@ func TestEndorserValidate(t *testing.T) {
 		wantErr string
 	}{
 		{"valid", nil, ""},
-		{"valid with database path", func(e *config.Endorser) {
-			e.Database = config.DB{Database: "/some/path"}
-		}, ""},
 		{"missing name", func(e *config.Endorser) { e.Name = "" }, "name"},
 		{"missing msp-id", func(e *config.Endorser) { e.Identity.MspID = "" }, "msp-id"},
 		{"missing msp-dir", func(e *config.Endorser) { e.Identity.MSPDir = "" }, "msp-dir"},
@@ -69,6 +67,9 @@ func TestEndorserValidate(t *testing.T) {
 			e.Database.Database = ""
 			e.Database.ConnString = ""
 		}, "database"},
+		{"memory db ok", func(e *config.Endorser) { e.Database.Database = "memory" }, ""},
+		{"unknown db type", func(e *config.Endorser) { e.Database.Database = "postgres" }, "database.database"},
+		{"query-service needs endpoint", func(e *config.Endorser) { e.QueryService.Endpoint = nil }, "query-service"},
 	}
 
 	for _, tt := range tests {
