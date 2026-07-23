@@ -8,7 +8,7 @@
   - [Key Design Decisions](#key-design-decisions)
     - [Full Ethereum Ecosystem Compatibility](#full-ethereum-ecosystem-compatibility)
     - [MVCC Validation for Transaction Consistency](#mvcc-validation-for-transaction-consistency)
-    - [Dual Synchronization Architecture](#dual-synchronization-architecture)
+    - [State reads and synchronization](#state-reads-and-synchronization)
     - [Gas as Metering, Not Payment](#gas-as-metering-not-payment)
     - [Fabric Ordering Service Instead of PoW/PoS](#fabric-ordering-service-instead-of-powpos)
   - [Core Components](#core-components)
@@ -56,14 +56,23 @@ Fabric's Multi-Version Concurrency Control (MVCC) ensures transaction consistenc
 
 This approach enables high concurrency: transactions touching disjoint state can execute in parallel and commit successfully. Only transactions with overlapping read-write dependencies face potential conflicts, which can be mitigated through retry logic or dependency tracking.
 
-### Dual Synchronization Architecture
+### State reads and synchronization
 
-The system maintains two independent synchronizers to serve different purposes:
+Endorsers keep **no local world state**. Instead of following committed blocks into a local
+database, an endorser reads the keys it needs on demand from the Fabric-X **query service** under a
+pinned, consistent (SERIALIZABLE) view. This removes the sync-lag/staleness of a locally-mirrored
+state DB — reads always see the authoritative latest committed state — and eliminates the
+per-endorser state synchronizer entirely.
 
-- **Endorser Synchronizers**: Keep endorsers' VersionedDB current with committed ledger state, ensuring accurate simulation and read-write set generation for new transactions
-- **Gateway Synchronizer**: Indexes committed blocks into SQLite for efficient historical queries via Ethereum RPC endpoints
+The system therefore runs a single synchronizer:
 
-This separation allows endorsers to focus on execution accuracy while the gateway optimizes for query performance.
+- **Gateway Synchronizer**: Indexes committed blocks into SQLite for efficient historical queries
+  via Ethereum RPC endpoints. (Endorsers no longer run a synchronizer; they read via the query
+  service.)
+
+> **Protocol support**: because the query service is Fabric-X infrastructure (and its read wire
+> format carries only the Fabric-X per-key monotonic version), this design targets **Fabric-X
+> only**. The plain-`fabric` protocol is not supported.
 
 ### Gas as Metering, Not Payment
 
@@ -106,11 +115,12 @@ The Endorser (located at `endorser/`) simulates EVM transaction execution and pr
 
 - **API** (`endorser/api/`): The published `Service` contract a Gateway calls (`ProcessEVMTransaction`, `ProcessCall`, `ProcessStateQuery`). Today `core.Endorser` implements it in-process; a future gRPC client/server pair implements it over the wire without changing the contract.
 - **Core** (`endorser/core/`): The `Endorser` type — turns a proposal into a signed `ProposalResponse`, classifying execution outcomes (OK, revert, client error, server error) into Fabric response statuses.
-- **Execution** (`endorser/execution/`): `EVMEngine`/`Executor` (EVM instantiation and execution) and `StateDB`/`DualStateDB` (the SnapshotDB that captures read-write sets). Depends only on the `ReadStore`/`KVSSnapshotter` ports it defines — never on `core`, `api`, or `storage` — so it can run standalone (see below).
-- **Storage** (`endorser/storage/`): `LightKVS` (in-memory) and `VersionedDBWrapper` (SQLite) — versioned key-value backends implementing `execution`'s read ports and handling committed-block updates.
+- **Execution** (`endorser/execution/`): `EVMEngine`/`Executor` (EVM instantiation and execution) and `StateDB`/`DualStateDB` (the SnapshotDB that captures read-write sets), plus `BatchExecutor` (the two-phase warm/authoritative engine for ordered batches). Depends only on the `ReadStore`/`KVSSnapshotter` ports it defines — never on `core`, `api`, or `query` — so it can run standalone (see below).
+- **Query** (`endorser/query/`): the state read path. A `QueryClient` (`BeginView`/`GetRows`/`EndView`) with a gRPC implementation over the Fabric-X query service (production) and an in-memory implementation (tests); a `View` implements `execution.ReadStore` and a `Store` implements `execution.KVSSnapshotter`, so the engine reads through it unchanged.
+- **Storage** (`endorser/storage/`): `LightKVS`/`RevertibleLightKVS` (in-memory versioned KV) — used to back the in-memory query client and the Hardhat snapshot/revert test RPCs.
 - **Config** (`endorser/config/`): Per-endorser configuration and validation.
-- **App** (`endorser/app/`): Composition root wiring config → storage → execution → core → synchronizer for a single endorser; reused by both the embedded (gateway+endorser) and standalone launch modes.
-- **Synchronizer**: Continuously fetches committed blocks from Fabric peers to keep `storage` up to date for accurate simulation.
+- **App** (`endorser/app/`): Composition root wiring config → query store → execution → core for a single endorser; reused by both the embedded (gateway+endorser) and standalone launch modes.
+- **No state synchronizer**: the endorser does not follow committed blocks. It reads current committed state on demand from the query service under a pinned view.
 
 **Key Responsibilities**:
 - Execute EVM transactions against versioned state snapshots
@@ -242,18 +252,18 @@ where `<address>` is the hex-encoded Ethereum address and `<slot>` is the hex-en
 
 ### Synchronization Architecture
 
-The system maintains two independent synchronizers that serve complementary roles in keeping the network consistent:
+The endorser read path and the gateway index play complementary roles in keeping the network consistent:
 
-**1. Endorser Synchronizer(s)**
+**1. Endorser reads (query service, no synchronizer)**
 
-Each endorser runs its own synchronizer to maintain an up-to-date view of the ledger state:
+Endorsers hold no local state and run no synchronizer. For each endorsement they:
 
-- **Block Fetching**: Receives newly committed blocks via an open gRPC stream from Fabric peers (or committer sidecars)
-- **State Updates**: Applies committed write sets to the local VersionedDB, advancing the version numbers for modified keys
-- **Simulation Accuracy**: Ensures that when endorsers simulate new transactions, they read from the latest committed state, producing accurate read-write sets
-- **Version Tracking**: Maintains version metadata for all keys, enabling precise MVCC validation during commit
+- **Open a view**: `BeginView` pins a consistent (SERIALIZABLE) snapshot of the latest committed state on the query service
+- **Read on demand**: `GetRows` fetches only the keys the transaction touches, each with its per-key MVCC version, into an in-view cache (a key is fetched at most once)
+- **Simulation accuracy**: reads always reflect the authoritative latest committed state (the query service reads the committer database directly), so read-write sets carry current versions and pass MVCC validation — with no sync-lag window
+- **Release**: `EndView` closes the view when the endorsement completes
 
-Without synchronization, endorsers would simulate against stale state, producing read-write sets with outdated version numbers that would fail MVCC validation.
+Because there is no locally-mirrored state to fall behind, the staleness that a synced VersionedDB would introduce is eliminated.
 
 **2. Gateway Synchronizer**
 

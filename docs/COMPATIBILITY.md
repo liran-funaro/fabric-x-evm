@@ -253,11 +253,18 @@ no per-call block-info plumbing. For **transaction execution** the EVM `NUMBER` 
 context number is never set) and `TIMESTAMP` is `1_000_000`, even though the state is read from the
 latest committed block. So `block.number` inside an executed transaction always reads `0`.
 
-**`eth_call` with a block number**: the state DB is correctly snapshotted at the requested height,
-and the EVM `NUMBER` opcode is set to that block-number argument (`0` for `latest`). `TIMESTAMP`,
-however, is always `1_000_000` regardless of the requested block. Contracts that read
-`block.timestamp` inside a view function therefore see a fixed, non-historical value (and
-`block.number` reads `0` for the common `latest` call).
+**`eth_call` with a block number**: the EVM `NUMBER` opcode is set to that block-number argument
+(`0` for `latest`), but **state is always read from the latest committed block, not the requested
+height** (see "Historical-height state reads" below). `TIMESTAMP` is always `1_000_000` regardless
+of the requested block. Contracts that read `block.timestamp` inside a view function therefore see
+a fixed, non-historical value (and `block.number` reads `0` for the common `latest` call).
+
+**Historical-height state reads resolve to latest.** The endorser reads committed state from the
+Fabric-X query service, which serves only the latest committed snapshot. Any state read that names
+a past block — `eth_getBalance`, `eth_getStorageAt`, `eth_getCode`, `eth_getTransactionCount`, and
+`eth_call` at a historical height — is answered against the current committed state rather than the
+state as of that block. Block-tag resolution (above) is unchanged; only the *state* read is
+latest-only. Ethereum-style archive/historical state queries are not supported.
 
 ---
 
