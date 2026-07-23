@@ -30,6 +30,11 @@ testdata/*
 testdata/fablo/fablo-target
 testdata/fablo/triedb
 
+.idea
+data/
+cpu.out
+block.out
+perf.test
 
 # Performance testing generated files
 integration/contracts/USDC_fiattokenv2_2.gen.go

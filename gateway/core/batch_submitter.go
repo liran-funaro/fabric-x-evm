@@ -115,21 +115,19 @@ func (bs *BatchSubmitter) Close() error {
 func (bs *BatchSubmitter) run(ctx context.Context) {
 	defer close(bs.doneChan)
 
-	var wg sync.WaitGroup
-
 	// Start worker goroutines
-	for i := 0; i < bs.numWorkers; i++ {
-		wg.Add(1)
-		go bs.worker(ctx, i, &wg)
+	var wg sync.WaitGroup
+	for i := range bs.numWorkers {
+		wg.Go(func() {
+			bs.worker(ctx, i)
+		})
 	}
 
 	// Wait for all workers to complete
 	wg.Wait()
 }
 
-func (bs *BatchSubmitter) worker(ctx context.Context, workerID int, wg *sync.WaitGroup) {
-	defer wg.Done()
-
+func (bs *BatchSubmitter) worker(ctx context.Context, workerID int) {
 	batchLogger.Debugf("Worker %d started", workerID)
 	defer batchLogger.Debugf("Worker %d stopped", workerID)
 

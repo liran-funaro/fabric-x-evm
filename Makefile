@@ -81,6 +81,7 @@ init-x:
 	@$(DOCKER) run --rm \
 		--user "$(UID):$(GID)" \
 		-v "$(PWD)/testdata:/config" \
+		-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 		$(TOOLS_IMAGE) \
 		cryptogen generate --config=/config/crypto-config.yaml --output=/config/crypto
 	@# Routers and assemblers accept client certs from any peer org — concatenate all peer TLS CAs.
@@ -91,6 +92,7 @@ init-x:
 		--user "$(UID):$(GID)" \
 		-v "$(PWD)/testdata:/config" \
 		-v "$(PWD)/testdata/crypto:/crypto" \
+		-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 		--entrypoint /usr/local/bin/armageddon \
 		$(ORDERER_IMAGE) \
 		createSharedConfigProto \
@@ -99,6 +101,7 @@ init-x:
 	@$(DOCKER) run --rm \
 		--user "$(UID):$(GID)" \
 		-v "$(PWD)/testdata:/config" \
+		-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 		$(TOOLS_IMAGE) \
 		configtxgen --channelID mychannel --profile OrgsChannel \
 		--outputBlock /config/crypto/config-block.pb.bin \
@@ -126,6 +129,7 @@ start-x:
 			--user "$(UID):$(GID)" \
 			--env "FX_NS=$(NS)" \
 			--env "FX_POLICY=$(POLICY)" \
+			-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 			-v "$(PWD)/testdata/fxconfig.yaml:/config/fxconfig.yaml:ro,Z" \
 			-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/peers/fxconfig.org1.example.com/tls:/tls:ro,Z" \
 			-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/users/channel_admin@org1.example.com/msp:/msp:ro,Z" \
@@ -189,6 +193,7 @@ start-full:
 		--user "$(UID):$(GID)" \
 		--env "FX_NS=$(NS1)" \
 		--env "FX_POLICY=$(POLICY)" \
+		-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 		-v "$(PWD)/testdata/fxconfig.yaml:/config/fxconfig.yaml:ro,Z" \
 		-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/peers/fxconfig.org1.example.com/tls:/tls:ro,Z" \
 		-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/users/channel_admin@org1.example.com/msp:/msp:ro,Z" \
@@ -201,6 +206,7 @@ start-full:
 		--user "$(UID):$(GID)" \
 		--env "FX_NS=$(NS2)" \
 		--env "FX_POLICY=$(POLICY)" \
+		-e FABRIC_LOGGING_SPEC="info:grpc=error" \
 		-v "$(PWD)/testdata/fxconfig.yaml:/config/fxconfig.yaml:ro,Z" \
 		-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/peers/fxconfig.org1.example.com/tls:/tls:ro,Z" \
 		-v "$(PWD)/testdata/crypto/peerOrganizations/org1.example.com/users/channel_admin@org1.example.com/msp:/msp:ro,Z" \

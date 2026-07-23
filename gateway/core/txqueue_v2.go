@@ -136,19 +136,19 @@ func (q *TxQueueV2) Enqueue(tx *types.Transaction) {
 	txHash := tx.Hash()
 	participants := participantsForTx(tx)
 
-	// Pre-allocate slices outside the lock
-	blocks := make([]*txEntry, 0)
-	isBlockedBy := make([]*txEntry, 0)
-
 	// Create new entry with pre-computed values
+	// Pre-allocate slices outside the lock
 	entry := &txEntry{
 		tx:           tx,
 		txHash:       txHash,
 		participants: participants,
-		blocks:       blocks,
-		isBlockedBy:  isBlockedBy,
+		blocks:       make([]*txEntry, 0, 32),
+		isBlockedBy:  make([]*txEntry, 0, 32),
 		state:        stateReady, // Optimistically assume ready
 	}
+
+	conflictingTxs := make(map[*txEntry]bool, 128)
+	waitingTxsToBlock := make([]*txEntry, 0, 128)
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -160,9 +160,6 @@ func (q *TxQueueV2) Enqueue(tx *types.Transaction) {
 
 	// Find conflicts with in-flight transactions (ready or pending only)
 	// For waiting transactions that share participants, make them wait for us instead
-	conflictingTxs := make(map[*txEntry]bool)
-	waitingTxsToBlock := make([]*txEntry, 0)
-
 	for _, participant := range entry.participants {
 		if txList, exists := q.participantMap[participant]; exists {
 			for _, conflictTx := range txList {
@@ -212,7 +209,7 @@ func (q *TxQueueV2) Enqueue(tx *types.Transaction) {
 			entry.blocks = append(entry.blocks, waitingTx)
 		}
 
-		q.cond.Signal() // Wake up one waiting worker
+		q.cond.Broadcast() // Wake up one waiting worker
 		loggerV2.Debugf("[QUEUE] Enqueue: tx %s READY (blocking %d waiting txs), ready=%d waiting=%d pending=%d",
 			txHash.Hex()[:10], len(waitingTxsToBlock), q.readyList.Len(), q.waitingList.Len(), len(q.pendingMap))
 	}
@@ -414,10 +411,7 @@ func (q *TxQueueV2) Handle(ctx context.Context, block *domain.Block) error {
 	}
 
 	// Signal workers based on how many transactions were promoted
-	if totalPromoted == 1 {
-		// Only one transaction promoted - wake up one worker
-		q.cond.Signal()
-	} else if totalPromoted > 1 {
+	if totalPromoted > 0 {
 		// Multiple transactions promoted - wake up all workers
 		q.cond.Broadcast()
 	}
@@ -425,8 +419,6 @@ func (q *TxQueueV2) Handle(ctx context.Context, block *domain.Block) error {
 	return nil
 }
 
-// Stats returns statistics about processed transactions.
-// Returns (total transactions processed, invalid transactions).
 // HandleTx processes transaction notifications and marks transactions as complete.
 // This method implements the TxHandler interface for use with the notification system.
 func (q *TxQueueV2) HandleTx(ctx context.Context, notifs []cmn.TxNotification) error {
@@ -459,7 +451,7 @@ func (q *TxQueueV2) HandleTx(ctx context.Context, notifs []cmn.TxNotification) e
 	// Signal workers based on how many transactions were promoted
 	if totalPromoted == 1 {
 		// Only one transaction promoted - wake up one worker
-		q.cond.Signal()
+		q.cond.Broadcast()
 	} else if totalPromoted > 1 {
 		// Multiple transactions promoted - wake up all workers
 		q.cond.Broadcast()
@@ -468,6 +460,8 @@ func (q *TxQueueV2) HandleTx(ctx context.Context, notifs []cmn.TxNotification) e
 	return nil
 }
 
+// Stats returns statistics about processed transactions.
+// Returns (total transactions processed, invalid transactions).
 func (q *TxQueueV2) Stats() (int, int, int, int) {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
