@@ -129,6 +129,18 @@ func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorse
 	return endorsement.Success(state.Result(), logs, ret), nil
 }
 
+// ExecuteMergedBatch runs the batch two-phase (via ExecuteBatch) and folds the
+// per-tx results into one merged ExecutionResult (status 200) plus per-tx event
+// blobs, so the caller can sign a single endorsement over the whole batch.
+func (e *EVMEngine) ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, [][]byte, error) {
+	results, err := e.ExecuteBatch(ctx, txs)
+	if err != nil {
+		return endorsement.ExecutionResult{}, nil, err
+	}
+	rws, events := MergeResults(results)
+	return endorsement.ExecutionResult{RWS: rws, Status: 200}, events, nil
+}
+
 // noopCloser is a reader stand-in for runOn's internal Executor: the real
 // ReadStore's lifecycle (open/close) is owned by the caller (Execute or
 // ExecuteBatch), not by the short-lived Executor runOn builds around state.

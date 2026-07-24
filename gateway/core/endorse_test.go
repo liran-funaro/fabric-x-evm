@@ -38,6 +38,9 @@ type stubEndorser struct {
 func (s *stubEndorser) Execute(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error) {
 	return s.execResp, s.execErr
 }
+func (s *stubEndorser) ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error) {
+	return s.execResp, s.execErr
+}
 func (s *stubEndorser) Call(ctx context.Context, msg *ethereum.CallMsg, _ *big.Int) ([]byte, error) {
 	return s.callPayload, s.callErr
 }

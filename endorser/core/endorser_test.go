@@ -9,6 +9,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"math/big"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
+	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
@@ -76,10 +78,17 @@ type stubEngine struct {
 	storage     []byte
 	code        []byte
 	nonce       uint64
+
+	mergedRes    endorsement.ExecutionResult
+	mergedEvents [][]byte
+	mergedErr    error
 }
 
 func (s *stubEngine) Execute(context.Context, *types.Transaction) (endorsement.ExecutionResult, error) {
 	return endorsement.ExecutionResult{}, s.execErr
+}
+func (s *stubEngine) ExecuteMergedBatch(context.Context, []*types.Transaction) (endorsement.ExecutionResult, [][]byte, error) {
+	return s.mergedRes, s.mergedEvents, s.mergedErr
 }
 func (s *stubEngine) Call(ethereum.CallMsg, *big.Int) ([]byte, error) {
 	return s.callPayload, s.callErr
@@ -98,13 +107,20 @@ func (s *stubEngine) NonceAt(context.Context, ethcommon.Address, *big.Int) (uint
 }
 
 // stubBuilder is an endorsement.Builder returning a fixed response, so we can
-// drive Execute's success and endorse-failure paths.
+// drive Execute's success and endorse-failure paths. It also captures the
+// invocation/result it was called with, so tests can assert on what the
+// endorser was about to sign.
 type stubBuilder struct {
 	resp *peer.ProposalResponse
 	err  error
+
+	gotInv endorsement.Invocation
+	gotRes endorsement.ExecutionResult
 }
 
-func (b *stubBuilder) Endorse(endorsement.Invocation, endorsement.ExecutionResult) (*peer.ProposalResponse, error) {
+func (b *stubBuilder) Endorse(inv endorsement.Invocation, res endorsement.ExecutionResult) (*peer.ProposalResponse, error) {
+	b.gotInv = inv
+	b.gotRes = res
 	return b.resp, b.err
 }
 
@@ -223,6 +239,65 @@ func TestExecute_EndorseFailureIs500(t *testing.T) {
 	}
 	if resp.Response.Status != common.StatusServerError {
 		t.Errorf("status = %d, want %d", resp.Response.Status, common.StatusServerError)
+	}
+}
+
+// ExecuteBatch endorses the engine's merged batch result in one signed
+// response, and carries the per-tx events (not the response payload) so a
+// later stage can recover per-tx receipts from the committed block.
+func TestExecuteBatchMergedEndorsement(t *testing.T) {
+	tx1Res := endorsement.ExecutionResult{
+		RWS:   blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k1", Value: []byte("v1")}}},
+		Event: []byte("event-1"),
+	}
+	tx2Res := endorsement.ExecutionResult{
+		RWS:   blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k2", Value: []byte("v2")}}},
+		Event: []byte("event-2"),
+	}
+	mergedRWS, mergedEvents := execution.MergeResults([]endorsement.ExecutionResult{tx1Res, tx2Res})
+
+	want := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
+	builder := &stubBuilder{resp: want}
+	eng := &stubEngine{
+		mergedRes:    endorsement.ExecutionResult{RWS: mergedRWS, Status: 200},
+		mergedEvents: mergedEvents,
+	}
+	f := &Endorser{Engine: eng, builder: builder}
+
+	tx1 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0)})
+	tx2 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 1})
+
+	resp, err := f.ExecuteBatch(context.Background(), endorsement.Invocation{}, []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("ExecuteBatch must encode the failure in the response, got Go error: %v", err)
+	}
+	if resp != want {
+		t.Errorf("resp = %v, want %v", resp, want)
+	}
+	if resp.Response.Status != common.StatusOK {
+		t.Errorf("status = %d, want %d", resp.Response.Status, common.StatusOK)
+	}
+
+	// The builder must have been handed the merged write-set, not a per-tx one.
+	if len(builder.gotRes.RWS.Writes) != 2 {
+		t.Fatalf("merged write-set has %d writes, want 2 (%+v)", len(builder.gotRes.RWS.Writes), builder.gotRes.RWS.Writes)
+	}
+
+	// Per-tx events ride in ExecutionResult.Event (not Payload) as a JSON array
+	// of per-tx event blobs, so a later stage can recover them from the
+	// committed block's blocks.Transaction.Events.
+	var perTxEvents [][]byte
+	if err := json.Unmarshal(builder.gotRes.Event, &perTxEvents); err != nil {
+		t.Fatalf("res.Event must decode as a per-tx events array: %v", err)
+	}
+	if len(perTxEvents) != 2 {
+		t.Fatalf("perTxEvents has %d elements, want 2", len(perTxEvents))
+	}
+	if string(perTxEvents[0]) != "event-1" || string(perTxEvents[1]) != "event-2" {
+		t.Errorf("perTxEvents = %q, want [event-1 event-2]", perTxEvents)
+	}
+	if len(builder.gotRes.Payload) != 0 {
+		t.Errorf("Payload = %q, want empty (events must ride in Event, not Payload)", builder.gotRes.Payload)
 	}
 }
 

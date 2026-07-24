@@ -39,6 +39,13 @@ type Service interface {
 	// depends on the fabricx.TxPackager change tracked for the client PR.
 	Execute(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error)
 
+	// ExecuteBatch endorses a merged batch of Ethereum transactions as a single
+	// signed response: it two-phase-executes the batch and folds the per-tx
+	// results into one read/write-set, so CFT quorum needs only one signature
+	// for the whole batch. Per-tx outcomes ride in the merged ExecutionResult's
+	// Event field, recoverable later from the committed block.
+	ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error)
+
 	// Call runs a read-only eth_call. On an EVM revert or a failed execution it
 	// returns a *common.CallError; the revert payload is returned alongside it.
 	Call(ctx context.Context, msg *ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
