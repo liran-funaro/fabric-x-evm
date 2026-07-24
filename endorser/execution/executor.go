@@ -129,16 +129,32 @@ func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorse
 	return endorsement.Success(state.Result(), logs, ret), nil
 }
 
+// PerTxOutcome carries one sub-tx's outcome within a merged batch endorsement:
+// its execution status (200 success, 201 revert, ...) and its event blob (nil
+// if it emitted none). A downstream stage decodes a []PerTxOutcome from the
+// merged ExecutionResult.Event to build one receipt per sub-tx — the status
+// travels explicitly here rather than being inferred from the event's shape,
+// because a batch can freely mix successful and reverted sub-txs.
+type PerTxOutcome struct {
+	Status int32  `json:"status"`
+	Event  []byte `json:"event"`
+}
+
 // ExecuteMergedBatch runs the batch two-phase (via ExecuteBatch) and folds the
-// per-tx results into one merged ExecutionResult (status 200) plus per-tx event
-// blobs, so the caller can sign a single endorsement over the whole batch.
-func (e *EVMEngine) ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, [][]byte, error) {
+// per-tx results into one merged ExecutionResult (status 200) plus one
+// PerTxOutcome per sub-tx, so the caller can sign a single endorsement over
+// the whole batch while still recovering each sub-tx's status and event.
+func (e *EVMEngine) ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, []PerTxOutcome, error) {
 	results, err := e.ExecuteBatch(ctx, txs)
 	if err != nil {
 		return endorsement.ExecutionResult{}, nil, err
 	}
 	rws, events := MergeResults(results)
-	return endorsement.ExecutionResult{RWS: rws, Status: 200}, events, nil
+	outcomes := make([]PerTxOutcome, len(results))
+	for i := range results {
+		outcomes[i] = PerTxOutcome{Status: results[i].Status, Event: events[i]}
+	}
+	return endorsement.ExecutionResult{RWS: rws, Status: 200, Message: "OK"}, outcomes, nil
 }
 
 // noopCloser is a reader stand-in for runOn's internal Executor: the real

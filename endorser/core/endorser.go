@@ -33,7 +33,7 @@ type Endorser struct {
 // This allows both *EVMEngine and *testimpl.EVMEngineWrapper to be used.
 type EVMEngineInterface interface {
 	Execute(ctx context.Context, tx *types.Transaction) (endorsement.ExecutionResult, error)
-	ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, [][]byte, error)
+	ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, []execution.PerTxOutcome, error)
 	Call(msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
 	BalanceAt(ctx context.Context, account ethcommon.Address, blockNumber *big.Int) (*big.Int, error)
 	StorageAt(ctx context.Context, account ethcommon.Address, key ethcommon.Hash, blockNumber *big.Int) ([]byte, error)
@@ -75,24 +75,25 @@ func (f *Endorser) Execute(ctx context.Context, inv endorsement.Invocation, ethT
 // ExecuteBatch endorses a merged batch of EVM transactions: it two-phase-executes
 // them via the engine, folds the per-tx results into one read/write-set, and
 // signs a single ProposalResponse over that merged set (CFT: one signature
-// meets the policy). The per-tx event blobs ride in the merged result's Event
-// field (not the response Payload), because a later stage recovers per-tx
-// events from the committed block's blocks.Transaction.Events, which is fed
-// from the endorsement's ExecutionResult.Event — the response Payload does not
-// survive to the committed block.
+// meets the policy). The per-tx outcomes (status + event, one per sub-tx) ride
+// in the merged result's Event field (not the response Payload), because a
+// later stage recovers per-tx receipts from the committed block's
+// blocks.Transaction.Events, which is fed from the endorsement's
+// ExecutionResult.Event — the response Payload does not survive to the
+// committed block.
 func (f *Endorser) ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error) {
-	res, events, err := f.Engine.ExecuteMergedBatch(ctx, txs)
+	res, outcomes, err := f.Engine.ExecuteMergedBatch(ctx, txs)
 	if err != nil {
 		return response(nil, err), nil
 	}
 
-	// Per-tx events (one blob per tx, nil = no event) ride in the merged
+	// Per-tx outcomes (status + event, nil event = no event) ride in the merged
 	// result's Event field so they survive into the committed block.
-	eventsPayload, err := json.Marshal(events)
+	outcomesPayload, err := json.Marshal(outcomes)
 	if err != nil {
-		return response(nil, fmt.Errorf("marshal batch events: %w", err)), nil
+		return response(nil, fmt.Errorf("marshal batch outcomes: %w", err)), nil
 	}
-	res.Event = eventsPayload
+	res.Event = outcomesPayload
 
 	// Build and sign the endorsement. A signing failure is a server fault, so it
 	// rides in the response (500) like every other outcome, not as a Go error.

@@ -79,16 +79,16 @@ type stubEngine struct {
 	code        []byte
 	nonce       uint64
 
-	mergedRes    endorsement.ExecutionResult
-	mergedEvents [][]byte
-	mergedErr    error
+	mergedRes      endorsement.ExecutionResult
+	mergedOutcomes []execution.PerTxOutcome
+	mergedErr      error
 }
 
 func (s *stubEngine) Execute(context.Context, *types.Transaction) (endorsement.ExecutionResult, error) {
 	return endorsement.ExecutionResult{}, s.execErr
 }
-func (s *stubEngine) ExecuteMergedBatch(context.Context, []*types.Transaction) (endorsement.ExecutionResult, [][]byte, error) {
-	return s.mergedRes, s.mergedEvents, s.mergedErr
+func (s *stubEngine) ExecuteMergedBatch(context.Context, []*types.Transaction) (endorsement.ExecutionResult, []execution.PerTxOutcome, error) {
+	return s.mergedRes, s.mergedOutcomes, s.mergedErr
 }
 func (s *stubEngine) Call(ethereum.CallMsg, *big.Int) ([]byte, error) {
 	return s.callPayload, s.callErr
@@ -243,24 +243,32 @@ func TestExecute_EndorseFailureIs500(t *testing.T) {
 }
 
 // ExecuteBatch endorses the engine's merged batch result in one signed
-// response, and carries the per-tx events (not the response payload) so a
-// later stage can recover per-tx receipts from the committed block.
+// response, and carries the per-tx outcomes (status + event, not the response
+// payload) so a later stage can recover per-tx receipts from the committed
+// block. The batch mixes a successful (200) and a reverted (201) sub-tx, since
+// the downstream receipt parser must not infer status from the event shape.
 func TestExecuteBatchMergedEndorsement(t *testing.T) {
 	tx1Res := endorsement.ExecutionResult{
-		RWS:   blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k1", Value: []byte("v1")}}},
-		Event: []byte("event-1"),
+		RWS:    blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k1", Value: []byte("v1")}}},
+		Event:  []byte("event-1"),
+		Status: 200,
 	}
 	tx2Res := endorsement.ExecutionResult{
-		RWS:   blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k2", Value: []byte("v2")}}},
-		Event: []byte("event-2"),
+		RWS:    blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k2", Value: []byte("v2")}}},
+		Event:  []byte("event-2-revert"),
+		Status: 201,
 	}
 	mergedRWS, mergedEvents := execution.MergeResults([]endorsement.ExecutionResult{tx1Res, tx2Res})
+	mergedOutcomes := []execution.PerTxOutcome{
+		{Status: tx1Res.Status, Event: mergedEvents[0]},
+		{Status: tx2Res.Status, Event: mergedEvents[1]},
+	}
 
 	want := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
 	builder := &stubBuilder{resp: want}
 	eng := &stubEngine{
-		mergedRes:    endorsement.ExecutionResult{RWS: mergedRWS, Status: 200},
-		mergedEvents: mergedEvents,
+		mergedRes:      endorsement.ExecutionResult{RWS: mergedRWS, Status: 200, Message: "OK"},
+		mergedOutcomes: mergedOutcomes,
 	}
 	f := &Endorser{Engine: eng, builder: builder}
 
@@ -283,21 +291,25 @@ func TestExecuteBatchMergedEndorsement(t *testing.T) {
 		t.Fatalf("merged write-set has %d writes, want 2 (%+v)", len(builder.gotRes.RWS.Writes), builder.gotRes.RWS.Writes)
 	}
 
-	// Per-tx events ride in ExecutionResult.Event (not Payload) as a JSON array
-	// of per-tx event blobs, so a later stage can recover them from the
-	// committed block's blocks.Transaction.Events.
-	var perTxEvents [][]byte
-	if err := json.Unmarshal(builder.gotRes.Event, &perTxEvents); err != nil {
-		t.Fatalf("res.Event must decode as a per-tx events array: %v", err)
+	// Per-tx outcomes ride in ExecutionResult.Event (not Payload) as a JSON
+	// array of {status, event}, one per sub-tx, so a later stage can recover
+	// per-tx receipts (including status) from the committed block's
+	// blocks.Transaction.Events without guessing status from the event shape.
+	var perTxOutcomes []execution.PerTxOutcome
+	if err := json.Unmarshal(builder.gotRes.Event, &perTxOutcomes); err != nil {
+		t.Fatalf("res.Event must decode as a per-tx outcomes array: %v", err)
 	}
-	if len(perTxEvents) != 2 {
-		t.Fatalf("perTxEvents has %d elements, want 2", len(perTxEvents))
+	if len(perTxOutcomes) != 2 {
+		t.Fatalf("perTxOutcomes has %d elements, want 2", len(perTxOutcomes))
 	}
-	if string(perTxEvents[0]) != "event-1" || string(perTxEvents[1]) != "event-2" {
-		t.Errorf("perTxEvents = %q, want [event-1 event-2]", perTxEvents)
+	if perTxOutcomes[0].Status != 200 || string(perTxOutcomes[0].Event) != "event-1" {
+		t.Errorf("perTxOutcomes[0] = %+v, want {200 event-1}", perTxOutcomes[0])
+	}
+	if perTxOutcomes[1].Status != 201 || string(perTxOutcomes[1].Event) != "event-2-revert" {
+		t.Errorf("perTxOutcomes[1] = %+v, want {201 event-2-revert}", perTxOutcomes[1])
 	}
 	if len(builder.gotRes.Payload) != 0 {
-		t.Errorf("Payload = %q, want empty (events must ride in Event, not Payload)", builder.gotRes.Payload)
+		t.Errorf("Payload = %q, want empty (outcomes must ride in Event, not Payload)", builder.gotRes.Payload)
 	}
 }
 
