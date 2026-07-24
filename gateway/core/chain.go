@@ -10,13 +10,17 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"google.golang.org/protobuf/proto"
 
 	fc "github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	"github.com/hyperledger/fabric-x-evm/gateway/storage"
 	"github.com/hyperledger/fabric-x-evm/gateway/storage/trie"
@@ -143,25 +147,128 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 	for _, tx := range b.Transactions {
 		// TODO: filter on namespace?
 
-		// retrieve the Ethereum transaction from the chaincode invocation
-		if len(tx.InputArgs) < 2 || !bytes.Equal(tx.InputArgs[0], []byte{byte(fc.ProposalTypeEVMTx)}) {
-			// skip non-eth tx
+		if len(tx.InputArgs) < 2 {
+			// no embedded eth tx
 			continue
 		}
-		status := uint8(0)
-		if tx.Valid && !fc.IsRevertEvent(tx.Events) {
-			status = 1
-		}
 
-		etx, err := convertTransaction(tx.InputArgs[1], b.Hash, b.Number, tx.Number, tx.ID, status, tx.Status, tx.Events, &logIndex)
-		if err != nil {
-			panic(err) // we surface this for now instead of swallowing it
-		}
+		switch {
+		case bytes.Equal(tx.InputArgs[0], []byte{byte(fc.ProposalTypeEVMTx)}):
+			// Legacy single-tx envelope: InputArgs = [{type}, ethTxBytes].
+			status := uint8(0)
+			if tx.Valid && !fc.IsRevertEvent(tx.Events) {
+				status = 1
+			}
 
-		ebl.Transactions = append(ebl.Transactions, etx)
+			etx, err := convertTransaction(tx.InputArgs[1], b.Hash, b.Number, tx.Number, tx.ID, status, tx.Status, tx.Events, &logIndex)
+			if err != nil {
+				panic(err) // we surface this for now instead of swallowing it
+			}
+
+			ebl.Transactions = append(ebl.Transactions, etx)
+
+		case bytes.Equal(tx.InputArgs[0], []byte{byte(fc.ProposalTypeEVMBatch)}):
+			// Merged-batch envelope: InputArgs = [{type}, ethTx1, ethTx2, ...],
+			// one entry in the outcomes slice (decoded from tx.Events) per
+			// sub-tx, index = sub-index. See endorser/core.Endorser.ExecuteBatch
+			// and endorser/execution.PerTxOutcome.
+			outcomes, err := decodeBatchOutcomes(tx.Events)
+			if err != nil {
+				panic(err)
+			}
+
+			for sub, ethTxBytes := range tx.InputArgs[1:] {
+				var outcome execution.PerTxOutcome
+				if sub < len(outcomes) {
+					outcome = outcomes[sub]
+				}
+
+				status := uint8(0)
+				if tx.Valid && outcome.Status == fc.StatusOK {
+					status = 1
+				}
+
+				// Sub-tx events never round-trip through convertTransaction's
+				// wrapped-event log path: a successful sub-tx's Event is raw
+				// json([]execution.Log), not a ChaincodeEvent, so logs are
+				// decoded separately below (and skipped entirely on revert).
+				etx, err := convertTransaction(ethTxBytes, b.Hash, b.Number, tx.Number, tx.ID, status, tx.Status, nil, &logIndex)
+				if err != nil {
+					panic(err)
+				}
+				etx.SubIndex = int64(sub)
+
+				if status == 1 {
+					etx.Logs = decodeBatchLogs(outcome.Event, b.Number, b.Hash, etx.TxHash, tx.Number, &logIndex)
+				}
+
+				ebl.Transactions = append(ebl.Transactions, etx)
+			}
+
+		default:
+			continue // non-eth tx
+		}
 	}
 
 	return ebl
+}
+
+// decodeBatchOutcomes unwraps a merged-batch Fabric tx's Events to recover the
+// per-sub-tx outcomes the endorser packed into the merged ExecutionResult.Event
+// (see endorser/core.Endorser.ExecuteBatch). Like the legacy single-tx path, the
+// SDK Endorse builder wraps that Event in one outer ChaincodeEvent (EventName
+// "log") before it lands as the committed tx.Events.
+func decodeBatchOutcomes(events []byte) ([]execution.PerTxOutcome, error) {
+	if len(events) == 0 {
+		return nil, nil
+	}
+
+	var outer peer.ChaincodeEvent
+	if err := proto.Unmarshal(events, &outer); err != nil {
+		return nil, fmt.Errorf("unwrap batch event: %w", err)
+	}
+	if len(outer.Payload) == 0 {
+		return nil, nil
+	}
+
+	var outcomes []execution.PerTxOutcome
+	if err := json.Unmarshal(outer.Payload, &outcomes); err != nil {
+		return nil, fmt.Errorf("decode batch outcomes: %w", err)
+	}
+	return outcomes, nil
+}
+
+// decodeBatchLogs decodes a successful sub-tx's raw eth-logs event
+// (json.Marshal([]execution.Log), unwrapped -- see EVMEngine.runOn) into
+// domain.Log entries, assigning a block-global, monotonically increasing
+// LogIndex shared across every sub-tx in the block.
+func decodeBatchLogs(event []byte, blockNumber uint64, blockHash, txHash []byte, txIndex int64, logIndex *int64) []domain.Log {
+	if len(event) == 0 {
+		return nil
+	}
+
+	var rawLogs []execution.Log
+	if err := json.Unmarshal(event, &rawLogs); err != nil {
+		// Malformed per-tx log payload: surface nothing rather than panic the
+		// whole block ingestion over one sub-tx's event.
+		return nil
+	}
+
+	logs := make([]domain.Log, 0, len(rawLogs))
+	for _, l := range rawLogs {
+		logs = append(logs, domain.Log{
+			BlockNumber: blockNumber,
+			BlockHash:   blockHash,
+			TxHash:      txHash,
+			TxIndex:     txIndex,
+			LogIndex:    *logIndex,
+			Address:     l.Address,
+			Topics:      l.Topics,
+			Data:        l.Data,
+		})
+		*logIndex++
+	}
+	return logs
 }
 
 // convertTransaction converts an Ethereum transaction to a domain.Transaction.

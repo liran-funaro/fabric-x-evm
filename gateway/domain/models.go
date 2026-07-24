@@ -20,10 +20,15 @@ type Block struct {
 }
 
 type Transaction struct {
-	TxHash          []byte
-	BlockHash       []byte
-	BlockNumber     uint64
-	TxIndex         int64
+	TxHash      []byte
+	BlockHash   []byte
+	BlockNumber uint64
+	TxIndex     int64
+	// SubIndex is the position of this transaction within its Fabric tx.
+	// It is 0 for a legacy single-tx (ProposalTypeEVMTx) Fabric tx, and 0..N-1
+	// for the N EVM txs carried by one merged-batch (ProposalTypeEVMBatch)
+	// Fabric tx.
+	SubIndex        int64
 	RawTx           []byte
 	FromAddress     []byte
 	ToAddress       []byte

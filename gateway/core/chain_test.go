@@ -8,16 +8,20 @@ package core
 
 import (
 	"crypto/ecdsa"
+	"encoding/json"
 	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	co "github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // --- helpers ---
@@ -119,6 +123,88 @@ func TestConvertToDomain_SkipsInvalidEthBytes(t *testing.T) {
 	got := ConvertToDomain(b)
 
 	assert.Len(t, got.Transactions, 0)
+}
+
+// TestConvertToDomainBatch verifies that a merged ProposalTypeEVMBatch Fabric tx
+// (Task 1's envelope: InputArgs = [{type}, ethTx1, ethTx2, ...]) is unpacked into
+// one domain.Transaction per sub-tx, sharing the Fabric TxIndex and carrying a
+// distinct SubIndex, per-sub-tx receipt status (from execution.PerTxOutcome.Status:
+// 200 -> 1, 201 -> 0), and — for the successful sub-tx only — its eth logs.
+func TestConvertToDomainBatch(t *testing.T) {
+	key1, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	key2, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	ethb1 := marshaledEthTx(t, key1, common.HexToAddress("0x1111111111111111111111111111111111111111"), big.NewInt(100))
+	ethb2 := marshaledEthTx(t, key2, common.HexToAddress("0x2222222222222222222222222222222222222222"), big.NewInt(200))
+
+	// sub-tx 0: success, emitting one log. The endorser marshals successful
+	// sub-tx logs as raw json([]execution.Log) -- NOT wrapped in a ChaincodeEvent
+	// (see EVMEngine.runOn).
+	successLogs, err := json.Marshal([]execution.Log{{
+		Address: common.HexToAddress("0x3333333333333333333333333333333333333333").Bytes(),
+		Topics:  [][]byte{common.HexToHash("0xaaaa").Bytes()},
+		Data:    []byte("log-data"),
+	}})
+	require.NoError(t, err)
+
+	// sub-tx 1: EVM revert. Its event content is irrelevant to the parser --
+	// only PerTxOutcome.Status drives whether logs are decoded -- so any bytes
+	// stand in for the endorser's common.MarshalRevert(...) payload.
+	outcomes := []execution.PerTxOutcome{
+		{Status: 200, Event: successLogs},
+		{Status: 201, Event: []byte("revert-marker")},
+	}
+	outcomesPayload, err := json.Marshal(outcomes)
+	require.NoError(t, err)
+
+	// The SDK Endorse builder wraps ExecutionResult.Event in one outer
+	// ChaincodeEvent (EventName "log") before it lands as the committed
+	// blocks.Transaction.Events -- see common.IsRevertEvent's doc comment.
+	eventsBytes, err := proto.Marshal(&peer.ChaincodeEvent{
+		Payload:   outcomesPayload,
+		EventName: "log",
+	})
+	require.NoError(t, err)
+
+	b := blocks.Block{
+		Number:     99,
+		Hash:       []byte("batch-block-hash"),
+		ParentHash: []byte("batch-parent-hash"),
+		Timestamp:  54321,
+		Transactions: []blocks.Transaction{{
+			ID:        "tx-batch-1",
+			Number:    3,
+			Valid:     true,
+			Status:    0,
+			InputArgs: [][]byte{{byte(co.ProposalTypeEVMBatch)}, ethb1, ethb2},
+			Events:    eventsBytes,
+		}},
+	}
+
+	got := ConvertToDomain(b)
+
+	require.Len(t, got.Transactions, 2)
+
+	sub0 := got.Transactions[0]
+	assert.Equal(t, int64(3), sub0.TxIndex)
+	assert.Equal(t, int64(0), sub0.SubIndex)
+	assert.Equal(t, uint8(1), sub0.Status)
+	require.Len(t, sub0.Logs, 1)
+	assert.Equal(t, common.HexToAddress("0x3333333333333333333333333333333333333333").Bytes(), sub0.Logs[0].Address)
+	assert.Equal(t, []byte("log-data"), sub0.Logs[0].Data)
+	assert.Equal(t, uint64(99), sub0.Logs[0].BlockNumber)
+
+	sub1 := got.Transactions[1]
+	assert.Equal(t, int64(3), sub1.TxIndex)
+	assert.Equal(t, int64(1), sub1.SubIndex)
+	assert.Equal(t, uint8(0), sub1.Status)
+	assert.Empty(t, sub1.Logs)
+
+	// TxIndex matches the Fabric tx.Number for both sub-txs; the two sub-txs
+	// decode two distinct eth transactions.
+	assert.NotEqual(t, sub0.TxHash, sub1.TxHash)
 }
 
 func TestConvertToDomain_EmptyBlock(t *testing.T) {
