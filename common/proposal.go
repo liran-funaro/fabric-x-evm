@@ -9,9 +9,14 @@ package common
 type ProposalType byte
 
 const (
-	ProposalTypeEVMTx ProposalType = 0xfb
+	// ProposalTypeEVMTx must remain 0xfb: it is the wire-level envelope type byte
+	// already relied on elsewhere (gateway/core, integration tests).
+	ProposalTypeEVMTx ProposalType = 0xfb + iota
 	ProposalTypeCall
 	ProposalTypeState
+	// ProposalTypeEVMBatch marks a Fabric tx that carries a merged batch of EVM
+	// transactions (Args[0]=type, Args[1..N]=the EVM txs), committed atomically.
+	ProposalTypeEVMBatch
 )
 
 const (
