@@ -33,12 +33,14 @@ type stubEndorser struct {
 	code        []byte
 	execResp    *peer.ProposalResponse
 	execErr     error
+	gotInv      endorsement.Invocation
 }
 
 func (s *stubEndorser) Execute(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error) {
 	return s.execResp, s.execErr
 }
 func (s *stubEndorser) ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error) {
+	s.gotInv = inv
 	return s.execResp, s.execErr
 }
 func (s *stubEndorser) Call(ctx context.Context, msg *ethereum.CallMsg, _ *big.Int) ([]byte, error) {
@@ -249,5 +251,51 @@ func TestExecuteTransaction_RejectedStatusErrors(t *testing.T) {
 
 	if _, err := c.ExecuteTransaction(context.Background(), tx); err == nil {
 		t.Fatal("expected error for rejected status")
+	}
+}
+
+// ExecuteBatch builds one invocation carrying the whole batch (type byte plus
+// every tx's marshaled bytes, in order) and returns a single-response
+// Endorsement for it.
+func TestExecuteBatchBuildsMergedInvocation(t *testing.T) {
+	pResp := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
+	stub := &stubEndorser{execResp: pResp}
+	c := signingClient(stub)
+
+	tx1 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 1})
+	tx2 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 2})
+	txBytes1, err := tx1.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal tx1: %v", err)
+	}
+	txBytes2, err := tx2.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal tx2: %v", err)
+	}
+
+	end, err := c.ExecuteBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(end.Responses) != 1 || end.Responses[0] != pResp {
+		t.Errorf("Responses = %v, want [%v]", end.Responses, pResp)
+	}
+	if end.Proposal == nil {
+		t.Error("Proposal = nil, want non-nil")
+	}
+
+	args := stub.gotInv.Args
+	if len(args) != 3 {
+		t.Fatalf("len(Args) = %d, want 3", len(args))
+	}
+	if args[0][0] != byte(common.ProposalTypeEVMBatch) {
+		t.Errorf("Args[0] = %v, want [%d]", args[0], byte(common.ProposalTypeEVMBatch))
+	}
+	if !bytes.Equal(args[1], txBytes1) {
+		t.Errorf("Args[1] = %x, want %x", args[1], txBytes1)
+	}
+	if !bytes.Equal(args[2], txBytes2) {
+		t.Errorf("Args[2] = %x, want %x", args[2], txBytes2)
 	}
 }

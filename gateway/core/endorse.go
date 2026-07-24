@@ -118,6 +118,71 @@ func (e EndorsementClient) ExecuteTransaction(ctx context.Context, tx *types.Tra
 	}, nil
 }
 
+// ExecuteBatch endorses a batch of EVM transactions as one merged Fabric tx.
+// The invocation carries the batch: Args[0]=ProposalTypeEVMBatch, Args[1..N]=the
+// marshaled EVM txs, in batch order.
+func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, error) {
+	args := make([][]byte, 0, len(txs)+1)
+	args = append(args, []byte{byte(common.ProposalTypeEVMBatch)})
+	for _, tx := range txs {
+		b, err := tx.MarshalBinary()
+		if err != nil {
+			return sdk.Endorsement{}, err
+		}
+		args = append(args, b)
+	}
+	inv, err := e.createInvocation(args)
+	if err != nil {
+		return sdk.Endorsement{}, err
+	}
+
+	// Derive a cancellable context so goroutines can stop early on error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	res := make([]*peer.ProposalResponse, len(e.endorsers))
+	errs := make([]error, len(e.endorsers)) // indexed — deterministic error order
+	var wg sync.WaitGroup
+	for i, end := range e.endorsers {
+		run := func(index int, endorser api.Service) {
+			pResp, err := endorser.ExecuteBatch(ctx, inv, txs)
+			if err != nil {
+				errs[index] = fmt.Errorf("call endorser: %w", err)
+				cancel()
+				return
+			}
+			if pResp.Response.Status != common.StatusOK {
+				errs[index] = fmt.Errorf("process EVM batch: %s", pResp.Response.Message)
+				cancel()
+				return
+			}
+			res[index] = pResp
+		}
+		if len(e.endorsers) > 1 {
+			wg.Add(1)
+			go func(index int, endorser api.Service) {
+				defer wg.Done()
+				run(index, endorser)
+			}(i, end)
+		} else {
+			run(i, end)
+		}
+	}
+	wg.Wait()
+
+	// Return first error in slice order — stable and deterministic
+	for _, err := range errs {
+		if err != nil {
+			return sdk.Endorsement{}, err
+		}
+	}
+
+	return sdk.Endorsement{
+		Proposal:  inv.Proposal,
+		Responses: res,
+	}, nil
+}
+
 // CallContract queries a smart contract and returns the value.
 // An EVM revert from the endorser is surfaced as *domain.RevertError so the API
 // layer can map it to JSON-RPC -32000.
