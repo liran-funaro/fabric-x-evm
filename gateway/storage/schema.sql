@@ -29,7 +29,11 @@ CREATE TABLE
             OR length (contract_address) = 20
         ),
         status INTEGER NOT NULL CHECK (status IN (0, 1)), -- failed, success
-        fabric_tx_id TEXT NOT NULL UNIQUE,
+        -- fabric_tx_id is intentionally NOT UNIQUE: a merged-batch Fabric tx
+        -- (ProposalTypeEVMBatch) carries N EVM txs under ONE Fabric tx id, so
+        -- this column is legitimately 1:N against rows here. Per-row identity
+        -- is guaranteed by tx_hash (PRIMARY KEY) instead.
+        fabric_tx_id TEXT NOT NULL,
         fabric_tx_status INTEGER NOT NULL,
         FOREIGN KEY (block_number) REFERENCES blocks (block_number)
     );
@@ -39,6 +43,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_block_pos ON transactions (block_number
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_block_hpos ON transactions (block_hash, tx_index);
 
 CREATE INDEX IF NOT EXISTS idx_txs_hash ON transactions (tx_hash);
+
+CREATE INDEX IF NOT EXISTS idx_txs_fabric_tx_id ON transactions (fabric_tx_id);
 
 -- Logs
 -- denormalized for performance (relational queries are rare)

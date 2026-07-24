@@ -144,6 +144,12 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 	}
 
 	logIndex := int64(0) // logIndex is the index of the log in the block
+	txIndex := int64(0)  // txIndex is a flat, block-global EVM tx index (eth transactionIndex):
+	// it increments once per emitted domain.Transaction, across both the
+	// single-tx path and every batch sub-tx, so it stays contiguous and unique
+	// within the block even though several domain txs can share one Fabric
+	// tx.Number. SubIndex (below) separately tracks position within the
+	// Fabric tx itself.
 	for _, tx := range b.Transactions {
 		// TODO: filter on namespace?
 
@@ -160,10 +166,11 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 				status = 1
 			}
 
-			etx, err := convertTransaction(tx.InputArgs[1], b.Hash, b.Number, tx.Number, tx.ID, status, tx.Status, tx.Events, &logIndex)
+			etx, err := convertTransaction(tx.InputArgs[1], b.Hash, b.Number, txIndex, tx.ID, status, tx.Status, tx.Events, &logIndex)
 			if err != nil {
 				panic(err) // we surface this for now instead of swallowing it
 			}
+			txIndex++
 
 			ebl.Transactions = append(ebl.Transactions, etx)
 
@@ -192,14 +199,15 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 				// wrapped-event log path: a successful sub-tx's Event is raw
 				// json([]execution.Log), not a ChaincodeEvent, so logs are
 				// decoded separately below (and skipped entirely on revert).
-				etx, err := convertTransaction(ethTxBytes, b.Hash, b.Number, tx.Number, tx.ID, status, tx.Status, nil, &logIndex)
+				etx, err := convertTransaction(ethTxBytes, b.Hash, b.Number, txIndex, tx.ID, status, tx.Status, nil, &logIndex)
 				if err != nil {
 					panic(err)
 				}
 				etx.SubIndex = int64(sub)
+				txIndex++
 
 				if status == 1 {
-					etx.Logs = decodeBatchLogs(outcome.Event, b.Number, b.Hash, etx.TxHash, tx.Number, &logIndex)
+					etx.Logs = decodeBatchLogs(outcome.Event, b.Number, b.Hash, etx.TxHash, etx.TxIndex, &logIndex)
 				}
 
 				ebl.Transactions = append(ebl.Transactions, etx)

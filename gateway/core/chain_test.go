@@ -125,17 +125,25 @@ func TestConvertToDomain_SkipsInvalidEthBytes(t *testing.T) {
 	assert.Len(t, got.Transactions, 0)
 }
 
-// TestConvertToDomainBatch verifies that a merged ProposalTypeEVMBatch Fabric tx
-// (Task 1's envelope: InputArgs = [{type}, ethTx1, ethTx2, ...]) is unpacked into
-// one domain.Transaction per sub-tx, sharing the Fabric TxIndex and carrying a
-// distinct SubIndex, per-sub-tx receipt status (from execution.PerTxOutcome.Status:
-// 200 -> 1, 201 -> 0), and — for the successful sub-tx only — its eth logs.
+// TestConvertToDomainBatch verifies that a block containing a legacy single-tx
+// EVM Fabric tx FOLLOWED BY a merged ProposalTypeEVMBatch Fabric tx (Task 1's
+// envelope: InputArgs = [{type}, ethTx1, ethTx2, ...]) is unpacked into one
+// domain.Transaction per EVM tx (1 + 2 = 3 total), with a flat, block-global,
+// contiguous, unique TxIndex (0,1,2) — NOT the shared Fabric tx.Number, which
+// two sub-txs of the same batch would otherwise collide on (violating both eth
+// transactionIndex semantics and the storage layer's UNIQUE(block_number,
+// tx_index) index) — alongside a per-Fabric-tx SubIndex (0,0,1), per-sub-tx
+// receipt status (from execution.PerTxOutcome.Status: 200 -> 1, 201 -> 0), and
+// — for the successful batch sub-tx only — its eth logs.
 func TestConvertToDomainBatch(t *testing.T) {
+	leadKey, err := crypto.GenerateKey()
+	require.NoError(t, err)
 	key1, err := crypto.GenerateKey()
 	require.NoError(t, err)
 	key2, err := crypto.GenerateKey()
 	require.NoError(t, err)
 
+	leadEthb := marshaledEthTx(t, leadKey, common.HexToAddress("0x0000000000000000000000000000000000000009"), big.NewInt(9))
 	ethb1 := marshaledEthTx(t, key1, common.HexToAddress("0x1111111111111111111111111111111111111111"), big.NewInt(100))
 	ethb2 := marshaledEthTx(t, key2, common.HexToAddress("0x2222222222222222222222222222222222222222"), big.NewInt(200))
 
@@ -173,37 +181,60 @@ func TestConvertToDomainBatch(t *testing.T) {
 		Hash:       []byte("batch-block-hash"),
 		ParentHash: []byte("batch-parent-hash"),
 		Timestamp:  54321,
-		Transactions: []blocks.Transaction{{
-			ID:        "tx-batch-1",
-			Number:    3,
-			Valid:     true,
-			Status:    0,
-			InputArgs: [][]byte{{byte(co.ProposalTypeEVMBatch)}, ethb1, ethb2},
-			Events:    eventsBytes,
-		}},
+		Transactions: []blocks.Transaction{
+			{
+				ID:        "tx-single-0",
+				Number:    0,
+				Valid:     true,
+				Status:    0,
+				InputArgs: [][]byte{{byte(co.ProposalTypeEVMTx)}, leadEthb},
+			},
+			{
+				ID:        "tx-batch-1",
+				Number:    1,
+				Valid:     true,
+				Status:    0,
+				InputArgs: [][]byte{{byte(co.ProposalTypeEVMBatch)}, ethb1, ethb2},
+				Events:    eventsBytes,
+			},
+		},
 	}
 
 	got := ConvertToDomain(b)
 
-	require.Len(t, got.Transactions, 2)
+	require.Len(t, got.Transactions, 3)
 
-	sub0 := got.Transactions[0]
-	assert.Equal(t, int64(3), sub0.TxIndex)
+	lead := got.Transactions[0]
+	assert.Equal(t, int64(0), lead.TxIndex)
+	assert.Equal(t, int64(0), lead.SubIndex)
+
+	sub0 := got.Transactions[1]
+	assert.Equal(t, int64(1), sub0.TxIndex)
 	assert.Equal(t, int64(0), sub0.SubIndex)
 	assert.Equal(t, uint8(1), sub0.Status)
 	require.Len(t, sub0.Logs, 1)
 	assert.Equal(t, common.HexToAddress("0x3333333333333333333333333333333333333333").Bytes(), sub0.Logs[0].Address)
 	assert.Equal(t, []byte("log-data"), sub0.Logs[0].Data)
 	assert.Equal(t, uint64(99), sub0.Logs[0].BlockNumber)
+	assert.Equal(t, int64(1), sub0.Logs[0].TxIndex) // log's TxIndex tracks the flat index, not tx.Number
 
-	sub1 := got.Transactions[1]
-	assert.Equal(t, int64(3), sub1.TxIndex)
+	sub1 := got.Transactions[2]
+	assert.Equal(t, int64(2), sub1.TxIndex)
 	assert.Equal(t, int64(1), sub1.SubIndex)
 	assert.Equal(t, uint8(0), sub1.Status)
 	assert.Empty(t, sub1.Logs)
 
-	// TxIndex matches the Fabric tx.Number for both sub-txs; the two sub-txs
-	// decode two distinct eth transactions.
+	// TxIndex is contiguous and unique across all 3 domain txs -- in
+	// particular the two batch sub-txs (which share Fabric tx.Number == 1) do
+	// NOT collide.
+	seen := map[int64]bool{}
+	for _, etx := range got.Transactions {
+		assert.False(t, seen[etx.TxIndex], "duplicate TxIndex %d", etx.TxIndex)
+		seen[etx.TxIndex] = true
+	}
+	assert.Equal(t, []int64{0, 1, 2}, []int64{lead.TxIndex, sub0.TxIndex, sub1.TxIndex})
+
+	// The two batch sub-txs decode two distinct eth transactions.
 	assert.NotEqual(t, sub0.TxHash, sub1.TxHash)
 }
 

@@ -789,6 +789,92 @@ func TestInsertBlock_WithTransactionsAndLogs(t *testing.T) {
 	}
 }
 
+// TestInsertBlock_MergedBatchSubTxs proves that a block produced from a
+// merged-batch Fabric tx (gateway/core.ConvertToDomain's ProposalTypeEVMBatch
+// path) can actually be persisted: its sub-txs share one Fabric tx.Number and
+// one FabricTxID, but ConvertToDomain now assigns each sub-tx a distinct,
+// flat, block-global TxIndex (not the shared Fabric tx.Number). Before that
+// fix, InsertBlock rolled back the whole block on the 2nd sub-tx because
+// (block_number, tx_index) and (block_hash, tx_index) are UNIQUE indexes; a
+// second, previously-latent bug also required fabric_tx_id to stop being
+// UNIQUE, since a batch legitimately maps one Fabric tx id to N eth-tx rows.
+func TestInsertBlock_MergedBatchSubTxs(t *testing.T) {
+	store := setupTestDB(t)
+
+	blockHash := makeHash(0x30)
+	txHash0 := makeHash(0x40)
+	txHash1 := makeHash(0x41)
+	const sharedFabricTxID = "fabric-batch-tx-1"
+
+	block := domain.Block{
+		BlockNumber: 55,
+		BlockHash:   blockHash,
+		ParentHash:  makeHash(0x2F),
+		StateRoot:   makeHash(0x01),
+		Timestamp:   999,
+		Transactions: []domain.Transaction{
+			{
+				TxHash:         txHash0,
+				BlockHash:      blockHash,
+				BlockNumber:    55,
+				TxIndex:        0, // flat block-global index, sub-tx 0
+				SubIndex:       0,
+				RawTx:          []byte{0x01},
+				FromAddress:    makeAddress(0x11),
+				ToAddress:      makeAddress(0x22),
+				Status:         1,
+				FabricTxID:     sharedFabricTxID, // both sub-txs share one Fabric tx
+				FabricTxStatus: 0,
+			},
+			{
+				TxHash:         txHash1,
+				BlockHash:      blockHash,
+				BlockNumber:    55,
+				TxIndex:        1, // flat block-global index, sub-tx 1 -- distinct from sub-tx 0
+				SubIndex:       1,
+				RawTx:          []byte{0x02},
+				FromAddress:    makeAddress(0x11),
+				ToAddress:      makeAddress(0x33),
+				Status:         0,
+				FabricTxID:     sharedFabricTxID,
+				FabricTxStatus: 0,
+			},
+		},
+	}
+
+	if err := store.InsertBlock(t.Context(), block); err != nil {
+		t.Fatalf("InsertBlock error: %v", err)
+	}
+
+	tx0, err := store.GetTransactionByBlockNumberAndIndex(t.Context(), 55, 0)
+	if err != nil {
+		t.Fatalf("GetTransactionByBlockNumberAndIndex(0) error: %v", err)
+	}
+	if tx0 == nil {
+		t.Fatal("expected sub-tx 0, got nil")
+	}
+	if tx0.FabricTxID != sharedFabricTxID {
+		t.Errorf("sub-tx 0: expected fabric tx id %q, got %q", sharedFabricTxID, tx0.FabricTxID)
+	}
+	if string(tx0.TxHash) != string(txHash0) {
+		t.Errorf("sub-tx 0: tx hash mismatch")
+	}
+
+	tx1, err := store.GetTransactionByBlockNumberAndIndex(t.Context(), 55, 1)
+	if err != nil {
+		t.Fatalf("GetTransactionByBlockNumberAndIndex(1) error: %v", err)
+	}
+	if tx1 == nil {
+		t.Fatal("expected sub-tx 1, got nil")
+	}
+	if tx1.FabricTxID != sharedFabricTxID {
+		t.Errorf("sub-tx 1: expected fabric tx id %q, got %q", sharedFabricTxID, tx1.FabricTxID)
+	}
+	if string(tx1.TxHash) != string(txHash1) {
+		t.Errorf("sub-tx 1: tx hash mismatch")
+	}
+}
+
 // GetLogsByTxHash test
 
 func TestGetLogsByTxHash(t *testing.T) {
