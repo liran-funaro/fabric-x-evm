@@ -49,19 +49,23 @@ var enableMetrics = flag.Bool("enable-metrics", false, "enable Prometheus metric
 var namespace = flag.String("namespace", "real", "namespace to commit transactions to")
 var dataset = flag.String("dataset", "testdata/USDC_dataset.json.gz", "dataset to use")
 
-// TODO(stage-2.1 perf): the gateway is now a single drain-all executor with no per-tx
-// worker pool, so -workers/processingWorkerCount no longer configures anything real.
-// Drop it (and -outstanding below) once the perf harness is refactored to report
-// throughput as EVM tx/s instead of gateway-worker-scaled tx/s.
-var workers = flag.Int("workers", 20, "number of gateway workers processing transactions")
+// submitters sets how many goroutines call the gateway's SendTransaction concurrently.
+// The gateway itself is now a single drain-all executor (no per-tx worker pool), so
+// there is no "-workers" knob anymore: the executor drains the whole pending pool into
+// one merged batch per cycle regardless of how fast txs arrive. There is likewise no
+// "-outstanding" flow-control cap: that semaphore predated this redesign and existed to
+// mitigate exactly the state-conflict/ordering problem the drain-all merged batch now
+// removes, so the harness fires every tx and lets the pending pool absorb the backlog.
 var submitters = flag.Int("submitters", 10, "number of goroutines submitting transactions to the gateway")
 var orderers = flag.Int("orderers", 64, "number of goroutines submitting transactions to the orderer (BatchSubmitter workers)")
 
-// TODO(stage-2.1 perf): drop -outstanding, report EVM tx/s. The outstanding-tx
-// flow-control semaphore below predates the drain-all merged-batch executor and no
-// longer reflects how backpressure works; it's kept functional-but-vestigial here
-// pending the dedicated perf-testing refactor phase.
-var outstanding = flag.Int("outstanding", 10_000, "maximum number of outstanding transactions")
+// maxBatchSize bounds how many pending EVM txs the drain-all executor folds into one
+// merged committer tx per cycle (see gwcore.Gateway.SetMaxBatchSize). The harness fires
+// every tx at once with no completion cap, so without a bound the first drain cycle would
+// swallow the whole backlog into one oversized Fabric tx; a positive bound pipelines the
+// burst across right-sized batches. Sweep this to find the throughput/latency sweet spot.
+// 0 keeps the pure unbounded drain-all behavior (only sane when arrival is paced upstream).
+var maxBatchSize = flag.Int("max-batch-size", 1024, "max EVM txs per merged committer tx (0 = unbounded drain-all)")
 
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.
@@ -211,14 +215,17 @@ func writeHeapProfile(filename string) {
 	}
 }
 
-// runReplayTest executes the replay test with configurable worker counts and returns metrics.
-// Returns: (overallThroughput, failedTransactionCount, totalTransactionCount)
+// runReplayTest fires every transfer in the (optionally wrapped) window at the
+// gateway as fast as submittingWorkerCount goroutines can, with no outstanding-tx
+// cap, then measures how fast the drain-all executor commits them. Throughput is
+// reported in EVM tx/s (individual transfers), NOT committer tx/s: one committer
+// (Fabric) tx now merges many EVM txs, so each committed-batch notification is
+// credited with its committed sub-tx count (see gwcore.CountCommittedSubTxs).
+// Returns: (evmThroughput, failedEVMTxCount, totalEVMTxCount).
 func runReplayTest(
 	t *testing.T,
-	processingWorkerCount int,
 	submittingWorkerCount int,
 	ordererSubmitterCount int,
-	numOutstandingTx int,
 	cfg replayConfig,
 	gwConfig string,
 ) (float64, int64, int64) {
@@ -254,8 +261,11 @@ func runReplayTest(
 	// Setup test harness with USDC contract and balance priming enabled
 	factory := balancePrimingEndorserFactory(balancePriming)
 
-	// Create completion channel for transaction notifications
-	completionCh := make(chan fxcommon.TxNotification, numOutstandingTx*2)
+	// Create completion channel for committed-batch notifications. One
+	// notification arrives per committer (Fabric) tx, i.e. per merged batch --
+	// far fewer than the number of EVM txs -- so a modest buffer absorbs bursts
+	// without the tracker ever blocking the notification-streaming goroutine.
+	completionCh := make(chan fxcommon.TxNotification, 8192)
 
 	// Create completion tracker for async transaction monitoring
 	tracker := NewTxCompletionTracker(completionCh)
@@ -279,6 +289,12 @@ func runReplayTest(
 		gwConfig,
 	)
 	require.NoError(t, err) // harness setup must succeed before we deref th below
+
+	// Bound the merged-batch size. The harness fires every tx with no
+	// outstanding-completion cap, so the first drain cycle would otherwise fold
+	// the whole backlog into a single oversized Fabric tx; a positive bound
+	// pipelines the burst across right-sized batches (sweep -max-batch-size).
+	th.Gateways[0].SetMaxBatchSize(*maxBatchSize)
 
 	// wait for the priming tx to be committed: we can no longer
 	// rely on commit checks because we have disabled the block store
@@ -346,70 +362,69 @@ func runReplayTest(
 		cfg.totalDispatches = int64(len(window)) * cfg.wrapCount
 	}
 
-	// Validate numOutstandingTx
-	if numOutstandingTx > len(window) {
-		panic(fmt.Sprintf("numOutstandingTx (%d) cannot be larger than window size (%d)", numOutstandingTx, len(window)))
+	// totalToSubmit is the number of EVM txs the harness will fire: the whole
+	// window once, or the window repeated wrapCount times (wrap-around replay).
+	totalToSubmit := int64(len(window))
+	if cfg.wrapAround {
+		totalToSubmit = cfg.totalDispatches
 	}
 
-	// Replay transactions with parallel workers
-	// Atomic counters for thread-safe counting
-	var successCount, failCount, skippedCount int64
+	// Counters (all atomic; read from the logging/completion goroutines):
+	//   submitted        -- EVM txs successfully handed to the gateway
+	//   submitFailed     -- EVM txs SendTransaction rejected outright (should be ~0)
+	//   committedEVM     -- EVM txs that actually committed (summed across batches)
+	//   committedBatches -- committer (Fabric) txs that committed (== merged batches)
+	//   rolledBackBatches-- committer txs that came back non-COMMITTED; their EVM
+	//                       txs stay pending and are re-batched, so they are NOT
+	//                       counted as committed until they land in a later batch.
+	var submitted, submitFailed, committedEVM, committedBatches, rolledBackBatches int64
+
+	// Drain notifications buffered before the measurement window (e.g. the
+	// balance-priming tx that committed during the sleep above) so they do not
+	// skew the committed-EVM count.
+	for len(completionCh) > 0 {
+		<-completionCh
+	}
 
 	runtime.GC()
-
-	// Track throughput
-	startTime := time.Now()
-	var lastLogTime atomic.Value
-	lastLogTime.Store(startTime)
-	var lastLogCount int64
-
-	// Create a channel for work items
-	type workItem struct {
-		index    int64
-		transfer TokenTransfer
-	}
-	// Buffer size = numOutstandingTx + numWorkers to avoid blocking
-	workChan := make(chan workItem, numOutstandingTx+submittingWorkerCount)
-
-	// Metrics for outstanding transactions
-	var outstandingTxCount int64
-
-	// Worker pool configuration
-	numWorkers := submittingWorkerCount
 
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Hour)
 	defer cancel()
 
-	// Start worker goroutines - they continuously submit without waiting for completion
+	startTime := time.Now()
+
+	// Work channel: a bounded buffer that lets the feeder run ahead of the
+	// submitters without materializing every tx at once. There is deliberately
+	// no outstanding-completion cap -- the feeder pushes all totalToSubmit items
+	// and the gateway's pending pool absorbs whatever the executor hasn't yet
+	// drained (see the -outstanding removal note on the flags above).
+	type workItem struct {
+		index    int64
+		transfer TokenTransfer
+	}
+	workChan := make(chan workItem, 4096)
+
+	// Submitters: fire every tx, never waiting for a completion.
 	var wg sync.WaitGroup
-	for range numWorkers {
+	for range submittingWorkerCount {
 		wg.Go(func() {
 			for item := range workChan {
 				if ctx.Err() != nil {
 					return
 				}
-				i := item.index
-				transfer := item.transfer
-
-				// Unmarshal the transaction from bytes
 				tx := new(types.Transaction)
-				err := tx.UnmarshalBinary(transfer.Transaction)
-				if err != nil {
-					t.Logf("Transfer %d: Failed to unmarshal transaction: %v", i, err)
+				if err := tx.UnmarshalBinary(item.transfer.Transaction); err != nil {
+					t.Logf("Transfer %d: failed to unmarshal transaction: %v", item.index, err)
 					panic(err)
 				}
-
-				// Send the transaction without waiting for completion
-				// Use the wrapped gateway directly to bypass nonce validation
-				err = wrappedGateway.SendTransaction(ctx, tx)
-				if err != nil {
-					t.Logf("Transfer %d: SendTransaction error: %v", i, err)
-					atomic.AddInt64(&failCount, 1)
-					atomic.AddInt64(&outstandingTxCount, -1)
+				// Use the wrapped gateway to bypass nonce validation (wrap-around
+				// replay resubmits the same signed txs).
+				if err := wrappedGateway.SendTransaction(ctx, tx); err != nil {
+					t.Logf("Transfer %d: SendTransaction error: %v", item.index, err)
+					atomic.AddInt64(&submitFailed, 1)
 					continue
 				}
-				// Transaction submitted successfully - it's now outstanding
-				// The completion will be tracked by the refill goroutine
+				atomic.AddInt64(&submitted, 1)
 				if metrics != nil {
 					metrics.RecordTransactionSent()
 				}
@@ -417,61 +432,110 @@ func runReplayTest(
 		})
 	}
 
-	// Progress logging goroutine
+	// Feeder: push all totalToSubmit items (wrapping over the window as needed),
+	// then close workChan. No refill-on-completion.
+	var feederWg sync.WaitGroup
+	feederWg.Go(func() {
+		defer close(workChan)
+		cursor := 0
+		for i := int64(0); i < totalToSubmit; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			case workChan <- workItem{index: i, transfer: window[cursor]}:
+			}
+			cursor++
+			if cursor >= len(window) {
+				cursor = 0 // only reached when totalToSubmit > len(window) (wrap-around)
+			}
+		}
+	})
+
+	// doneCh is closed once every fired tx has been accounted for (committed, or
+	// failed to even submit). Guarded by sync.Once so both the completion
+	// goroutine and the stall path can request it safely.
+	doneCh := make(chan struct{})
+	var doneOnce sync.Once
+	signalDone := func() { doneOnce.Do(func() { close(doneCh) }) }
+
+	// Completion goroutine: credit each committed batch with its committed
+	// sub-tx count so throughput is measured in EVM txs, not committer txs.
+	var completionWg sync.WaitGroup
+	completionWg.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case notif, ok := <-completionCh:
+				if !ok {
+					return
+				}
+				if notif.Status == committerpb.Status_COMMITTED {
+					n := gwcore.CountCommittedSubTxs(notif.Events)
+					newTotal := atomic.AddInt64(&committedEVM, int64(n))
+					atomic.AddInt64(&committedBatches, 1)
+					if metrics != nil {
+						for range n {
+							metrics.RecordTransactionCommitted()
+						}
+					}
+					// Done when every fired tx is accounted for: committed, or
+					// failed to submit (those never commit).
+					if newTotal+atomic.LoadInt64(&submitFailed) >= totalToSubmit {
+						signalDone()
+					}
+				} else {
+					// The whole committer tx (merged batch) was invalidated; its
+					// EVM txs roll back and are re-batched, so they are not
+					// counted here -- they will be credited when a later batch
+					// commits them.
+					atomic.AddInt64(&rolledBackBatches, 1)
+					if metrics != nil {
+						metrics.RecordTransactionAborted()
+					}
+				}
+			}
+		}
+	})
+
+	// Progress logging goroutine: reports EVM tx/s.
 	stopLogging := make(chan struct{})
 	var loggingWg sync.WaitGroup
 	loggingWg.Go(func() {
 		ticker := time.NewTicker(2 * time.Second)
 		defer ticker.Stop()
-
-		// Create a printer for the English locale (adds commas)
 		p := message.NewPrinter(language.English)
+		lastTime := startTime
+		var lastCommitted int64
 
 		for {
 			select {
 			case <-ticker.C:
 				now := time.Now()
-				lastTime := lastLogTime.Load().(time.Time)
 				elapsed := now.Sub(lastTime).Seconds()
+				committed := atomic.LoadInt64(&committedEVM)
+				sub := atomic.LoadInt64(&submitted)
+				batches := atomic.LoadInt64(&committedBatches)
+				rb := atomic.LoadInt64(&rolledBackBatches)
 
-				currentSuccess := atomic.LoadInt64(&successCount)
-				currentFail := atomic.LoadInt64(&failCount)
-				currentSkipped := atomic.LoadInt64(&skippedCount)
-				currentTotal := currentSuccess + currentFail
-				currentOutstanding := atomic.LoadInt64(&outstandingTxCount)
-
-				txProcessed := currentTotal - lastLogCount
-				throughput := float64(txProcessed) / elapsed
-
-				totalElapsed := now.Sub(startTime).Seconds()
-				overallThroughput := float64(currentTotal) / totalElapsed
-
-				progressTarget := int64(len(window))
-				if cfg.wrapAround {
-					progressTarget = cfg.totalDispatches
+				recent := float64(committed-lastCommitted) / elapsed
+				overall := float64(committed) / now.Sub(startTime).Seconds()
+				inFlight := sub - committed
+				avgBatch := 0.0
+				if batches > 0 {
+					avgBatch = float64(committed) / float64(batches)
 				}
 
-				msg := p.Sprintf("Progress: %d/%d transfers processed (%d successful, %d failed, %d skipped, %d outstanding) | Throughput: %.2f tx/s (recent), %.2f tx/s (overall)",
-					currentSuccess+currentFail+currentSkipped, progressTarget,
-					currentSuccess, currentFail, currentSkipped, currentOutstanding,
-					throughput, overallThroughput)
-				t.Log(msg)
+				t.Log(p.Sprintf("Progress: %d/%d EVM txs committed | submitted %d, in-flight %d | %d batches (avg %.1f EVM/batch), %d rolled back | %.0f EVM tx/s (recent), %.0f EVM tx/s (overall)",
+					committed, totalToSubmit, sub, inFlight, batches, avgBatch, rb, recent, overall))
 
-				// Update metrics
 				if metrics != nil {
-					metrics.SetOutstandingTransactions(currentOutstanding)
-					metrics.SetThroughput(overallThroughput)
+					metrics.SetOutstandingTransactions(inFlight)
+					metrics.SetThroughput(overall)
 				}
 
-				// Update metrics
-				if metrics != nil {
-					metrics.SetOutstandingTransactions(currentOutstanding)
-					metrics.SetThroughput(overallThroughput)
-				}
-
-				// Update for next interval
-				lastLogTime.Store(now)
-				lastLogCount = currentTotal
+				lastTime = now
+				lastCommitted = committed
 			case <-ctx.Done():
 				return
 			case <-stopLogging:
@@ -480,114 +544,75 @@ func runReplayTest(
 		}
 	})
 
-	// Feed work to the workers (refill goroutine)
-	var dispatched int64
-	cursor := 0
-
-	var refillWg sync.WaitGroup
-	refillWg.Go(func() {
-		defer close(workChan)
-
-		// Pre-fill the channel with numOutstandingTx transactions
-		t.Logf("Pre-filling work channel with %d transactions", numOutstandingTx)
-		for range numOutstandingTx {
-			workChan <- workItem{index: dispatched, transfer: window[cursor]}
-			atomic.AddInt64(&outstandingTxCount, 1)
-			dispatched++
-			cursor++
-		}
-		t.Logf("Pre-fill complete, %d transactions dispatched", dispatched)
-
-		// Process completions and refill
-		for notif := range completionCh {
-			atomic.AddInt64(&outstandingTxCount, -1)
-
-			// Update success/fail counts
-			if notif.Status == committerpb.Status_COMMITTED {
-				atomic.AddInt64(&successCount, 1)
-				if metrics != nil {
-					metrics.RecordTransactionCommitted()
-				}
-			} else {
-				atomic.AddInt64(&failCount, 1)
-				t.Logf("Transaction %s failed with status: %v", notif.EthTxHash.Hex(), notif.Status)
-				if metrics != nil {
-					metrics.RecordTransactionAborted()
-				}
-			}
-
-			// Check if we should dispatch more work
-			if cfg.wrapAround {
-				if dispatched >= cfg.totalDispatches {
-					// Check if all outstanding transactions are done
-					if atomic.LoadInt64(&outstandingTxCount) == 0 {
-						t.Logf("All transactions completed, closing work channel")
-						return
-					}
-					continue
-				}
-			} else {
-				if cursor >= len(window) {
-					// Check if all outstanding transactions are done
-					if atomic.LoadInt64(&outstandingTxCount) == 0 {
-						t.Logf("All transactions completed, closing work channel")
-						return
-					}
-					continue
-				}
-			}
-
-			// Add next transaction to the channel
-			workChan <- workItem{index: dispatched, transfer: window[cursor]}
-			atomic.AddInt64(&outstandingTxCount, 1)
-			dispatched++
-			cursor++
-
-			// Handle wrap-around
-			if cursor >= len(window) {
-				if cfg.wrapAround {
-					cursor = 0
-					// BalancePrimingWrapper.GetNonce() handles nonce validation bypass automatically,
-					// so no explicit nonce priming is needed between wrap-around passes.
-					t.Logf("Wrap-around: restarting from beginning (dispatched %d so far)", dispatched)
-				}
-			}
-		}
-	})
-
-	// Wait for all workers to finish processing
+	// Wait until all txs are fired (submission is local and fast under nonce
+	// bypass; the pending pool holds the backlog).
 	wg.Wait()
+	t.Logf("Submission complete: %d submitted, %d failed to submit (of %d)",
+		atomic.LoadInt64(&submitted), atomic.LoadInt64(&submitFailed), totalToSubmit)
+
+	// If every fired tx already failed to submit, there is nothing to wait for.
+	if atomic.LoadInt64(&submitFailed) >= totalToSubmit {
+		signalDone()
+	}
+
+	// Wait for all fired txs to commit, or for progress to stall (some tx never
+	// commits -- e.g. a permanent exclusion), or for the overall context to end.
+	const stallTimeout = 60 * time.Second
+	waitTicker := time.NewTicker(time.Second)
+	lastCommitted := atomic.LoadInt64(&committedEVM)
+	lastProgress := time.Now()
+wait:
+	for {
+		select {
+		case <-doneCh:
+			break wait
+		case <-ctx.Done():
+			t.Logf("Context ended before all txs committed")
+			break wait
+		case <-waitTicker.C:
+			cur := atomic.LoadInt64(&committedEVM)
+			if cur > lastCommitted {
+				lastCommitted = cur
+				lastProgress = time.Now()
+			} else if time.Since(lastProgress) > stallTimeout {
+				t.Logf("Stalled: no commit progress for %s (%d/%d EVM txs committed); giving up",
+					stallTimeout, cur, totalToSubmit)
+				break wait
+			}
+		}
+	}
+	waitTicker.Stop()
+	finishTime := time.Now()
+
+	// Teardown. cancel() unblocks the feeder/submitters if we broke out early.
 	cancel()
-
-	// Stop the tracker before closing the channel — the notification streaming
-	// goroutine (started by the test harness) outlives this function and would
-	// otherwise panic by sending on a closed channel.
+	// Stop the tracker before closing completionCh -- the notification-streaming
+	// goroutine (owned by the harness) outlives this function and would panic
+	// sending on a closed channel.
 	tracker.Stop()
-
-	// Close completion channel to signal refill goroutine
 	close(completionCh)
-
-	// Wait for refill goroutine to finish
-	refillWg.Wait()
-
-	// Stop the logging goroutine
+	completionWg.Wait()
+	feederWg.Wait()
 	close(stopLogging)
 	loggingWg.Wait()
 
-	// Final counts
-	finalSuccess := atomic.LoadInt64(&successCount)
-	finalFail := atomic.LoadInt64(&failCount)
-	finalSkipped := atomic.LoadInt64(&skippedCount)
+	finalCommitted := atomic.LoadInt64(&committedEVM)
+	finalSubmitFailed := atomic.LoadInt64(&submitFailed)
+	finalBatches := atomic.LoadInt64(&committedBatches)
+	finalRolledBack := atomic.LoadInt64(&rolledBackBatches)
 
-	t.Logf("Replay complete: %d successful, %d failed, %d skipped out of %d total transfers",
-		finalSuccess, finalFail, finalSkipped, dispatched)
+	elapsed := finishTime.Sub(startTime).Seconds()
+	evmThroughput := float64(finalCommitted) / elapsed
+	avgBatch := 0.0
+	if finalBatches > 0 {
+		avgBatch = float64(finalCommitted) / float64(finalBatches)
+	}
 
-	// Calculate overall throughput
-	totalElapsed := time.Since(startTime).Seconds()
-	overallThroughput := float64(finalSuccess+finalFail) / totalElapsed
+	t.Logf("Replay complete: %d/%d EVM txs committed in %.1fs across %d committer txs (avg %.1f EVM/batch); %d rolled-back batches, %d submit failures | %.0f EVM tx/s",
+		finalCommitted, totalToSubmit, elapsed, finalBatches, avgBatch, finalRolledBack, finalSubmitFailed, evmThroughput)
 
-	// Return metrics (throughput, failed count, total dispatched transfers)
-	return overallThroughput, finalFail, dispatched
+	// Return (EVM tx/s, EVM txs that never committed, total EVM txs targeted).
+	return evmThroughput, totalToSubmit - finalCommitted, totalToSubmit
 }
 
 // TestReplayJSONDataset loads the USDC_dataset.json.gz file with pre-generated transactions
@@ -598,70 +623,74 @@ func TestReplayJSONDataset(t *testing.T) {
 		t.Skip("skipping in short mode")
 	}
 
-	// Run the test with single worker configuration
-	processingWorkerCount := *workers    // Number of gateway workers processing transactions
-	submittingWorkerCount := *submitters // Number of goroutines submitting transactions TO the gateway
-	ordererSubmitterCount := *orderers   // Number of goroutines submitting transactions TO the orderer (BatchSubmitter workers)
-	numOutstandingTx := *outstanding     // Maximum number of outstanding transactions
+	submittingWorkerCount := *submitters // goroutines calling the gateway's SendTransaction
+	ordererSubmitterCount := *orderers   // BatchSubmitter workers submitting to the orderer
 
-	_, _, _ = runReplayTest(
-		t, processingWorkerCount, submittingWorkerCount, ordererSubmitterCount, numOutstandingTx, replayConfig{
-			windowSize: 1_000_000,
-			wrapAround: true,
-			wrapCount:  1_000_000,
-		}, *gatewayConfig,
+	// Fire a bounded single pass by default. The old infinite wrap (windowSize
+	// and wrapCount 1_000_000) relied on the -outstanding cap to keep only ~10k
+	// txs in flight; with fire-all + no cap that would balloon the pending pool,
+	// so we submit a fixed window once and measure steady-state EVM tx/s. Scale
+	// via PERF_REPLAY_WINDOW_SIZE (0 = whole dataset) and PERF_REPLAY_WRAP_COUNT.
+	cfg := loadReplayConfigFromEnv(t)
+	if os.Getenv("PERF_REPLAY_WINDOW_SIZE") == "" {
+		cfg.windowSize = 50_000
+	}
+
+	throughput, uncommitted, total := runReplayTest(
+		t, submittingWorkerCount, ordererSubmitterCount, cfg, *gatewayConfig,
 	)
+	t.Logf("TestReplayJSONDataset: %.0f EVM tx/s (%d/%d committed, batch cap %d)",
+		throughput, total-uncommitted, total, *maxBatchSize)
 }
 
 type performanceResult struct {
-	processingWorkers  int
 	submittingWorkers  int
-	throughput         float64
-	failedTransactions int64
-	totalTransactions  int64
+	ordererSubmitters  int
+	throughput         float64 // EVM tx/s
+	failedTransactions int64   // EVM txs that never committed
+	totalTransactions  int64   // EVM txs targeted
 	failureRate        float64
 }
 
-// TestReplayJSONDatasetPerformance runs the replay test with varying worker counts
-// to measure performance characteristics across different configurations.
+// TestReplayJSONDatasetPerformance sweeps the two knobs that still matter under
+// the drain-all executor -- the number of goroutines submitting to the gateway
+// and the number of BatchSubmitter workers submitting to the orderer -- and
+// records EVM tx/s for each. The old per-tx gateway-worker dimension is gone:
+// the executor drains the whole pending pool into one merged batch per cycle
+// regardless of arrival concurrency.
 func TestReplayJSONDatasetPerformance(t *testing.T) {
 	// Skip in short mode
 	if testing.Short() {
 		t.Skip("skipping in short mode")
 	}
 
-	// Define the range of worker counts to test
-	processingWorkerCounts := []int{1, 4, 8}
 	submittingWorkerCounts := []int{4, 8, 16, 24}
-	ordererSubmitterCounts := []int{16} // Default orderer submitter count
+	ordererSubmitterCounts := []int{16} // BatchSubmitter workers
 
 	// Store results
 	var results []performanceResult
 
-	t.Logf("Starting performance test with varying worker counts...")
+	t.Logf("Starting performance sweep (EVM tx/s) over submitter / orderer-submitter counts...")
 
-	// Run tests with different worker configurations
-	for _, processingWorkers := range processingWorkerCounts {
-		for _, submittingWorkers := range submittingWorkerCounts {
-			for _, ordererSubmitters := range ordererSubmitterCounts {
-				t.Logf("\n=== Testing with processingWorkers=%d, submittingWorkers=%d, ordererSubmitters=%d ===",
-					processingWorkers, submittingWorkers, ordererSubmitters)
+	for _, submittingWorkers := range submittingWorkerCounts {
+		for _, ordererSubmitters := range ordererSubmitterCounts {
+			t.Logf("\n=== Testing with submittingWorkers=%d, ordererSubmitters=%d ===",
+				submittingWorkers, ordererSubmitters)
 
-				throughput, failedTxs, totalTxs := runReplayTest(t, processingWorkers, submittingWorkers, ordererSubmitters, 100, loadReplayConfigFromEnv(t), *gatewayConfig)
-				failureRate := float64(failedTxs) / float64(totalTxs)
+			throughput, failedTxs, totalTxs := runReplayTest(t, submittingWorkers, ordererSubmitters, loadReplayConfigFromEnv(t), *gatewayConfig)
+			failureRate := float64(failedTxs) / float64(totalTxs)
 
-				results = append(results, performanceResult{
-					processingWorkers:  processingWorkers,
-					submittingWorkers:  submittingWorkers,
-					throughput:         throughput,
-					failedTransactions: failedTxs,
-					totalTransactions:  totalTxs,
-					failureRate:        failureRate,
-				})
+			results = append(results, performanceResult{
+				submittingWorkers:  submittingWorkers,
+				ordererSubmitters:  ordererSubmitters,
+				throughput:         throughput,
+				failedTransactions: failedTxs,
+				totalTransactions:  totalTxs,
+				failureRate:        failureRate,
+			})
 
-				t.Logf("Result: Throughput=%.2f tx/s, Failed=%d/%d (%.2f%%)",
-					throughput, failedTxs, totalTxs, failureRate*100)
-			}
+			t.Logf("Result: Throughput=%.2f EVM tx/s, Uncommitted=%d/%d (%.2f%%)",
+				throughput, failedTxs, totalTxs, failureRate*100)
 		}
 	}
 
@@ -676,10 +705,10 @@ func TestReplayJSONDatasetPerformance(t *testing.T) {
 
 	// Write header
 	err = writer.Write([]string{
-		"processing_workers",
 		"submitting_workers",
-		"throughput_tx_per_s",
-		"failed_transactions",
+		"orderer_submitters",
+		"throughput_evm_tx_per_s",
+		"uncommitted_transactions",
 		"total_transactions",
 		"failure_rate",
 	})
@@ -688,8 +717,8 @@ func TestReplayJSONDatasetPerformance(t *testing.T) {
 	// Write data rows
 	for _, result := range results {
 		err = writer.Write([]string{
-			fmt.Sprintf("%d", result.processingWorkers),
 			fmt.Sprintf("%d", result.submittingWorkers),
+			fmt.Sprintf("%d", result.ordererSubmitters),
 			fmt.Sprintf("%.2f", result.throughput),
 			fmt.Sprintf("%d", result.failedTransactions),
 			fmt.Sprintf("%d", result.totalTransactions),
