@@ -14,6 +14,9 @@ logging:
 gateway:
   listen: "0.0.0.0:8545"
 
+  # max-batch-size: 1024   # max EVM txs per merged committer tx (0/unset = unbounded
+  #                        # drain-all). The perf test overrides this via -max-batch-size.
+
   identity:
     msp-id: Org1MSP
     msp-dir: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp

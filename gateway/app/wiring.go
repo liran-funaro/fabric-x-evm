@@ -71,7 +71,7 @@ func NewGatewaySynchronizer(protocol string, db network.BlockHeightReader, chann
 // responsible for creating the chain store (so they can register its cleanup independently
 // of the rest of this wiring) and for creating and starting the synchronizer(s) that feed
 // committed blocks to chain/gateway/endorsers.
-func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int) (*core.Gateway, error) {
+func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int) (*core.Gateway, error) {
 	ec, err := core.NewEndorsementClient(endorsers, gwSigner, netCfg.Channel, netCfg.Namespace, netCfg.NsVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorsement client: %w", err)
@@ -88,6 +88,9 @@ func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Si
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gateway: %w", err)
 	}
+	// Bound the merged-batch size (0 = unbounded drain-all). Must be set before
+	// Start; the caller starts the gateway after BuildGateway returns.
+	gw.SetMaxBatchSize(maxBatchSize)
 
 	return gw, nil
 }
