@@ -226,7 +226,7 @@ func writeHeapProfile(filename string) {
 // cap, then measures how fast the drain-all executor commits them. Throughput is
 // reported in EVM tx/s (individual transfers), NOT committer tx/s: one committer
 // (Fabric) tx now merges many EVM txs, so each committed-batch notification is
-// credited with its committed sub-tx count (see gwcore.CountCommittedSubTxs).
+// credited with its EVM-tx count (common.TxNotification.EvmTxCount).
 // Returns: (evmThroughput, failedEVMTxCount, totalEVMTxCount).
 func runReplayTest(
 	t *testing.T,
@@ -477,7 +477,14 @@ func runReplayTest(
 					return
 				}
 				if notif.Status == committerpb.Status_COMMITTED {
-					n := gwcore.CountCommittedSubTxs(notif.Events)
+					// One committer tx merges many EVM txs; credit them all so
+					// throughput is EVM tx/s, not committer tx/s. A merged batch
+					// emits no per-tx event blob, so count from EvmTxCount (the
+					// invocation Args count) rather than the empty Events.
+					n := notif.EvmTxCount
+					if n <= 0 {
+						n = 1
+					}
 					newTotal := atomic.AddInt64(&committedEVM, int64(n))
 					atomic.AddInt64(&committedBatches, 1)
 					if metrics != nil {

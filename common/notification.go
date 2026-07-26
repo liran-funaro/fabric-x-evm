@@ -34,6 +34,13 @@ type TxNotification struct {
 	EthTxBytes []byte
 	EthTxHash  common.Hash // pre-computed; handlers that only need the hash skip UnmarshalBinary
 
+	// EvmTxCount is how many EVM transactions this committer (Fabric) tx carries:
+	// 1 for a legacy single-tx envelope, N for a merged batch (ProposalTypeEVMBatch).
+	// Derived from the invocation Args in the tx metadata, so it is available even
+	// though a merged batch emits no per-tx _event_ blind write. Throughput
+	// measurement sums it to report EVM tx/s rather than committer tx/s.
+	EvmTxCount int
+
 	// From AllTxStreamer (IncludeReadWriteSets must be true)
 	NsRWS  []blocks.NsReadWriteSet
 	Events []byte
@@ -71,8 +78,8 @@ func (d *AllTxBatchDispatcher) HandleBatch(ctx context.Context, batch notificati
 
 	notifs := make([]TxNotification, 0, len(batch.Events))
 	for _, event := range batch.Events {
-		// Extract Ethereum transaction from metadata
-		ethTxBytes, err := extractEthTxFromMetadata(event.Metadata)
+		// Extract the first Ethereum transaction and the EVM-tx count from metadata.
+		ethTxBytes, evmTxCount, err := extractEthTxFromMetadata(event.Metadata)
 		if err != nil {
 			notifLogger.Debugf("Skipping tx %s: %v", event.TxID, err)
 			continue
@@ -92,6 +99,7 @@ func (d *AllTxBatchDispatcher) HandleBatch(ctx context.Context, batch notificati
 			Status:     event.Status,
 			EthTxBytes: ethTxBytes,
 			EthTxHash:  ethTx.Hash(),
+			EvmTxCount: evmTxCount,
 			NsRWS:      nsrws,
 			Events:     events,
 		})
@@ -112,23 +120,26 @@ func (d *AllTxBatchDispatcher) HandleBatch(ctx context.Context, batch notificati
 	return nil
 }
 
-// extractEthTxFromMetadata extracts the Ethereum transaction bytes from the event metadata.
-// Metadata[0] contains the marshaled ChaincodeInput, which has Args[1] = eth tx bytes.
-func extractEthTxFromMetadata(metadata [][]byte) ([]byte, error) {
+// extractEthTxFromMetadata extracts, from the event metadata, the first Ethereum
+// transaction bytes and the count of EVM transactions the committer tx carries.
+// Metadata[0] is the marshaled ChaincodeInput: Args[0] is the proposal-type byte
+// and Args[1:] are the eth tx bytes (one for a single-tx envelope, N for a merged
+// batch), so Args[1] is the first tx and len(Args)-1 is the EVM-tx count.
+func extractEthTxFromMetadata(metadata [][]byte) ([]byte, int, error) {
 	if len(metadata) == 0 {
-		return nil, fmt.Errorf("no metadata")
+		return nil, 0, fmt.Errorf("no metadata")
 	}
 
 	var input peer.ChaincodeInput
 	if err := proto.Unmarshal(metadata[0], &input); err != nil {
-		return nil, fmt.Errorf("unmarshal input: %w", err)
+		return nil, 0, fmt.Errorf("unmarshal input: %w", err)
 	}
 
 	if len(input.Args) < 2 {
-		return nil, fmt.Errorf("insufficient args: %d", len(input.Args))
+		return nil, 0, fmt.Errorf("insufficient args: %d", len(input.Args))
 	}
 
-	return input.Args[1], nil
+	return input.Args[1], len(input.Args) - 1, nil
 }
 
 // namespacesToNsRWS converts applicationpb.TxNamespace slices (as delivered by
