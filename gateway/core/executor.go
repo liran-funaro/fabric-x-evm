@@ -17,6 +17,7 @@ import (
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
 
 // commitTimeoutDefault is the stall backstop applied by awaitCommit. It is
@@ -185,28 +186,65 @@ func (g *Gateway) backoff(ctx context.Context) {
 }
 
 // HandleTx implements common.TxHandler. It is the gateway's half of the
-// wait-for-commit signal: the AllTxBatchDispatcher delivers every committed
-// transaction here, and for each notification whose FabricTxID matches a
-// waiter currently registered by executeCycle/awaitCommit, it hands off the
-// outcome status. Notifications for unrecognized IDs (already handled,
-// abandoned, or simply not a batch this executor submitted) are ignored.
+// wait-for-commit signal in the notification-based topology: the
+// AllTxBatchDispatcher delivers every committed transaction here, and for
+// each notification whose FabricTxID matches a waiter currently registered
+// by executeCycle/awaitCommit, it hands off the outcome status. Notifications
+// for unrecognized IDs (already handled, abandoned, or simply not a batch
+// this executor submitted) are ignored.
 func (g *Gateway) HandleTx(_ context.Context, notifs []cmn.TxNotification) error {
-	g.commitMu.Lock()
-	defer g.commitMu.Unlock()
 	for _, n := range notifs {
-		ch, ok := g.commitWaiters[n.FabricTxID]
-		if !ok {
-			continue
-		}
-		select {
-		case ch <- n.Status:
-		default:
-			// Buffered size 1; a second send would mean the waiter already
-			// has a status pending. Shouldn't happen for a one-shot commit
-			// ID, but never block the notification dispatcher on it.
-		}
+		g.signalCommitOutcome(n.FabricTxID, n.Status)
 	}
 	return nil
+}
+
+// Handle implements blocks.BlockHandler. It is the gateway's half of the
+// wait-for-commit signal in the block-sync topology (no notification
+// stream): the synchronizer delivers every committed block here, and for
+// each transaction in it whose Fabric TxID (b.Transactions[i].ID) matches a
+// waiter currently registered by executeCycle/awaitCommit, it hands off the
+// commit/abort outcome via the same signalCommitOutcome path HandleTx uses.
+//
+// This looks at the block's committer-level transactions directly rather
+// than decoding embedded EVM sub-txs (contrast with ConvertToDomain): the
+// executor's waiter is keyed by the Fabric TxID of the committer transaction
+// that carried a whole merged batch, not by any individual EVM tx hash, so
+// b.Transactions[i].ID is exactly the correlation key it needs regardless of
+// how many EVM sub-txs that committer tx carried.
+//
+// A deployment wires at most one of Handle/HandleTx per topology (see
+// gateway/app.buildApp for block-sync, integration/test_helpers.go for
+// notification-based harnesses), but registering both is harmless: each
+// waiter is one-shot and removed after its first signal.
+func (g *Gateway) Handle(_ context.Context, b blocks.Block) error {
+	for _, tx := range b.Transactions {
+		status := committerpb.Status_ABORTED_MVCC_CONFLICT
+		if tx.Valid {
+			status = committerpb.Status_COMMITTED
+		}
+		g.signalCommitOutcome(tx.ID, status)
+	}
+	return nil
+}
+
+// signalCommitOutcome delivers status to the waiter registered for
+// fabricTxID, if any is currently registered. Shared by HandleTx
+// (notification-based topology) and Handle (block-sync topology).
+func (g *Gateway) signalCommitOutcome(fabricTxID string, status committerpb.Status) {
+	g.commitMu.Lock()
+	defer g.commitMu.Unlock()
+	ch, ok := g.commitWaiters[fabricTxID]
+	if !ok {
+		return
+	}
+	select {
+	case ch <- status:
+	default:
+		// Buffered size 1; a second send would mean the waiter already
+		// has a status pending. Shouldn't happen for a one-shot commit
+		// ID, but never block the notification dispatcher/synchronizer on it.
+	}
 }
 
 // hashesOf returns the hashes of a batch of transactions, in order.

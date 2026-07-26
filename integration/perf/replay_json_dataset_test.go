@@ -48,10 +48,19 @@ var metricsAddr = flag.String("metrics-addr", "0.0.0.0:2112", "address for Prome
 var enableMetrics = flag.Bool("enable-metrics", false, "enable Prometheus metrics export")
 var namespace = flag.String("namespace", "real", "namespace to commit transactions to")
 var dataset = flag.String("dataset", "testdata/USDC_dataset.json.gz", "dataset to use")
-var oldqueue = flag.Bool("oldqueue", false, "enable old queue")
+
+// TODO(stage-2.1 perf): the gateway is now a single drain-all executor with no per-tx
+// worker pool, so -workers/processingWorkerCount no longer configures anything real.
+// Drop it (and -outstanding below) once the perf harness is refactored to report
+// throughput as EVM tx/s instead of gateway-worker-scaled tx/s.
 var workers = flag.Int("workers", 20, "number of gateway workers processing transactions")
 var submitters = flag.Int("submitters", 10, "number of goroutines submitting transactions to the gateway")
 var orderers = flag.Int("orderers", 64, "number of goroutines submitting transactions to the orderer (BatchSubmitter workers)")
+
+// TODO(stage-2.1 perf): drop -outstanding, report EVM tx/s. The outstanding-tx
+// flow-control semaphore below predates the drain-all merged-batch executor and no
+// longer reflects how backpressure works; it's kept functional-but-vestigial here
+// pending the dedicated perf-testing refactor phase.
 var outstanding = flag.Int("outstanding", 10_000, "maximum number of outstanding transactions")
 
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
@@ -229,8 +238,6 @@ func runReplayTest(
 
 		// Wire up queue size metrics callbacks
 		gwcore.SetBatchSubmitterQueueSizeMetric = metrics.SetBatchSubmitterInputQueueSize
-		gwcore.SetTxQueueReadyListSizeMetric = metrics.SetTxQueueReadyListSize
-		gwcore.SetTxQueueWaitingListSizeMetric = metrics.SetTxQueueWaitingListSize
 	}
 
 	// USDC contract address
@@ -257,14 +264,6 @@ func runReplayTest(
 	// - Local: Traditional block-based synchronization
 	// - Fabric: Traditional block-based synchronization
 	// - Fabric-X: Notification-based (MemoryStore + NotificationDispatcher)
-	// th, err := integration.NewLocalTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", "fabric", map[string]any{"Gateway.WorkerCount": processingWorkerCount, "Gateway.SubmitterCount": ordererSubmitterCount, "Network.Namespace": *namespace}, factory, gwcore.NewTxQueueV2())
-	var queue gwcore.TxQueueInterface
-	if *oldqueue {
-		queue = gwcore.NewTxQueue()
-	} else {
-		queue = gwcore.NewTxQueueV2()
-	}
-	fmt.Printf("using queue type %T\n", queue)
 	fmt.Printf("using namespace %s", *namespace)
 	th, err := integration.NewFabricXTestHarnessWithNotifications(
 		t,
@@ -272,16 +271,13 @@ func runReplayTest(
 		evmConfig,
 		"testdata/USDC_contract.json",
 		map[string]any{
-			"Gateway.WorkerCount":    processingWorkerCount,
 			"Gateway.SubmitterCount": ordererSubmitterCount,
 			"Network.Namespace":      *namespace,
 		},
 		factory,
-		queue,
 		tracker,
 		gwConfig,
 	)
-	// th, err = integration.NewFabricTestHarnessWithFactoryAndTxQueue(t, integration.TestLogger{T: t}, evmConfig, "testdata/USDC_contract.json", map[string]any{"Gateway.WorkerCount": processingWorkerCount, "Gateway.SubmitterCount": ordererSubmitterCount, "Network.Namespace": *namespace}, factory, gwcore.NewTxQueueV2())
 	require.NoError(t, err) // harness setup must succeed before we deref th below
 
 	// wait for the priming tx to be committed: we can no longer

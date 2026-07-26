@@ -28,10 +28,12 @@ func NewNonceBypassGateway(gw *core.Gateway) *NonceBypassGateway {
 	return &NonceBypassGateway{Gateway: gw}
 }
 
-// SendTransaction bypasses nonce validation but still uses the transaction queue
-// to preserve MVCC retry logic and worker pool control.
+// SendTransaction bypasses nonce validation but still adds tx to the
+// gateway's pending pool, preserving the drain-all executor's two-phase
+// execution and MVCC retry logic.
 func (g *NonceBypassGateway) SendTransaction(ctx context.Context, tx *types.Transaction) error {
-	// Skip ValidateTx (which includes nonce validation) and directly enqueue
-	g.Gateway.TxQueue.Enqueue(tx)
+	// Skip ValidateTx (which includes nonce validation) and add straight to
+	// the pending pool.
+	g.Gateway.AddPending(tx)
 	return nil
 }

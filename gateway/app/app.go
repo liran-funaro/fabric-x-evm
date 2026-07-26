@@ -138,12 +138,13 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 	}
 
 	// Gateway owns the BatchSubmitter and will handle its lifecycle
-	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.WorkerCount, nil, cfg.Gateway.EndorsementChanSize, 0)
+	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	// Chain must be called before gateway, to persist blocks before marking transactions complete.
+	// Chain must be called before gateway, to persist blocks before the gateway signals
+	// commit/abort outcomes to the executor (see core.Gateway.Handle, gateway/core/executor.go).
 	handlers := append(extraHandlers, chain, gateway)
 	gwSync, err := NewGatewaySynchronizer(cfg.Network.Protocol, chain, cfg.Network.Channel, cfg.Gateway.Committer.ToPeerConf(), gwSigner, logger, handlers...)
 	if err != nil {
@@ -199,8 +200,8 @@ func (a *App) Run(ctx context.Context) error {
 
 	g.Go(func() error { return a.gwSync.Start(gctx) })
 
-	// Start gateway worker pool
-	appLogger.Debugf("starting gateway with %d workers", a.cfg.Gateway.WorkerCount)
+	// Start the gateway's single drain-all executor goroutine (see gateway/core/executor.go).
+	appLogger.Debug("starting gateway executor")
 	a.gateway.Start(gctx)
 
 	// Create HTTP server before starting goroutine so Shutdown can safely read a.httpServer

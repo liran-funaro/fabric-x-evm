@@ -35,33 +35,6 @@ type Submitter interface {
 	Close() error
 }
 
-// TxQueueInterface defines the interface that transaction queue implementations must satisfy.
-// This allows switching between different queue implementations (e.g., TxQueue and TxQueueV2).
-type TxQueueInterface interface {
-	// Enqueue adds a transaction to the queue
-	Enqueue(tx *types.Transaction)
-
-	// Dequeue removes and returns a transaction from the queue
-	// Returns (transaction, true) if successful, or (nil, false) if queue is closed
-	Dequeue() (*types.Transaction, bool)
-
-	// IsPending checks if a transaction is currently in the queue or being processed
-	IsPending(txHash common.Hash) *types.Transaction
-
-	// Complete removes a transaction from tracking. Safe to call for a hash
-	// that is not currently tracked.
-	Complete(txHash common.Hash)
-
-	// Close signals shutdown of the queue
-	Close()
-
-	// Handle processes block notifications from the synchronizer
-	Handle(ctx context.Context, block *domain.Block) error
-
-	// Stats returns statistics about processed transactions (total, invalid)
-	Stats() (total int, invalid int, totalEnq int, conflictEnq int)
-}
-
 var logger = flogging.MustGetLogger("gateway.core")
 
 // Gateway is the component that bridges Fabric-x and the EVM. Its API is the
@@ -146,12 +119,23 @@ func (g *Gateway) SendTransaction(ctx context.Context, tx *types.Transaction) er
 	if g.pending.Has(tx.Hash()) {
 		return domain.ErrTransactionAlreadyPending
 	}
+	g.AddPending(tx)
+	return nil
+}
+
+// AddPending adds tx directly to the pending pool and wakes the idle executor
+// if needed, skipping SendTransaction's pre-flight validation (including
+// nonce checks) and duplicate rejection -- PendingPool.Add itself is already
+// a safe no-op for a hash that's already pending. Exported for callers that
+// must bypass that validation, e.g. testimpl.NonceBypassGateway for
+// wrap-around replay scenarios where the same signed transactions are
+// resubmitted and normal nonce validation would reject them.
+func (g *Gateway) AddPending(tx *types.Transaction) {
 	g.pending.Add(tx)
 	select {
 	case g.arrivals <- struct{}{}:
 	default: // executor is already awake (busy or already notified); don't block
 	}
-	return nil
 }
 
 // CallContract is a query. It doesn't require a signature of the end user and doesn't change the ledger or nonce.

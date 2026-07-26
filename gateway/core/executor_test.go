@@ -19,6 +19,7 @@ import (
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	sdk "github.com/hyperledger/fabric-x-sdk"
+	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
@@ -223,4 +224,115 @@ func TestExecutorNonceGap(t *testing.T) {
 	require.False(t, g.pending.Has(txs[0].Hash()), "included tx[0] must be removed")
 	require.True(t, g.pending.Has(txs[1].Hash()), "excluded tx[1] must stay pending")
 	require.False(t, g.pending.Has(txs[2].Hash()), "included tx[2] must be removed")
+}
+
+// TestGatewayHandleCommitsOnValidBlockTx: same drain-cycle setup as
+// TestExecutorDrainCycle, but the commit outcome is delivered via Handle
+// (the block-sync topology's blocks.BlockHandler path) instead of HandleTx
+// (the notification topology). A block containing one Valid transaction
+// whose ID matches the submitted committer TxID must signal the waiter with
+// Status_COMMITTED, exactly as the notification path would, so the 3 merged
+// txs are removed from the pending pool.
+func TestGatewayHandleCommitsOnValidBlockTx(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	txs := addThreeTxs(g)
+
+	end, done := runCycleAndCapture(t, g)
+
+	fabricTxID, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+	require.NotEmpty(t, fabricTxID)
+
+	require.NoError(t, g.Handle(context.Background(), blocks.Block{
+		Number: 1,
+		Transactions: []blocks.Transaction{
+			{ID: fabricTxID, Valid: true},
+		},
+	}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the block-sync commit signal")
+	}
+
+	require.Equal(t, 0, g.pending.Len())
+	for _, tx := range txs {
+		require.False(t, g.pending.Has(tx.Hash()))
+	}
+}
+
+// TestGatewayHandleRollsBackOnInvalidBlockTx: mirrors
+// TestExecutorRollbackOnInvalid via the block-sync Handle path -- a block
+// reporting the committer tx as Invalid (tx.Valid == false) must signal an
+// abort, leaving the 3 merged txs pending for the next cycle to retry.
+func TestGatewayHandleRollsBackOnInvalidBlockTx(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	txs := addThreeTxs(g)
+
+	end, done := runCycleAndCapture(t, g)
+
+	fabricTxID, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+
+	require.NoError(t, g.Handle(context.Background(), blocks.Block{
+		Number: 1,
+		Transactions: []blocks.Transaction{
+			{ID: fabricTxID, Valid: false},
+		},
+	}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the block-sync abort signal")
+	}
+
+	require.Equal(t, 3, g.pending.Len())
+	for _, tx := range txs {
+		require.True(t, g.pending.Has(tx.Hash()))
+	}
+}
+
+// TestGatewayHandleIgnoresUnrelatedTx: a block containing a transaction whose
+// ID doesn't match any registered waiter (e.g. another gateway's batch, or a
+// block delivered before/after the one carrying this batch's committer tx)
+// must be silently ignored -- Handle must not panic or otherwise disturb an
+// in-flight cycle it doesn't recognize.
+func TestGatewayHandleIgnoresUnrelatedTx(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	// Short commitTimeout: the unrelated notification below must NOT be the
+	// thing that unblocks awaitCommit, so give the real (never-delivered)
+	// signal a fast backstop instead of relying on commitTimeoutDefault (60s)
+	// and leaking a long-lived goroutine past the end of this test.
+	g.commitTimeout = 50 * time.Millisecond
+	addThreeTxs(g)
+
+	_, done := runCycleAndCapture(t, g)
+
+	require.NoError(t, g.Handle(context.Background(), blocks.Block{
+		Number: 1,
+		Transactions: []blocks.Transaction{
+			{ID: "some-other-tx-id", Valid: true},
+		},
+	}))
+
+	select {
+	case <-done:
+		t.Fatal("executeCycle returned immediately after an unrelated block tx; it should still be awaiting its own commit")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	// The commit-wait backstop now fires (never having been signaled by the
+	// unrelated tx above), rolling the batch back.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the commit-wait timeout")
+	}
+
+	require.Equal(t, 3, g.pending.Len())
 }

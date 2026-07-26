@@ -54,7 +54,6 @@ type Gateway struct {
 
 	SyncTimeout time.Duration `mapstructure:"sync-timeout" yaml:"sync-timeout"`
 
-	WorkerCount         int `mapstructure:"worker-count"          yaml:"worker-count"`          // number of worker goroutines; defaults to 1 if not set
 	SubmitterCount      int `mapstructure:"submitter-count"       yaml:"submitter-count"`       // number of batch submitter worker goroutines; defaults to 16 if not set
 	EndorsementChanSize int `mapstructure:"endorsement-chan-size" yaml:"endorsement-chan-size"` // capacity of the endorsement channel; defaults to 1000 if not set
 }
