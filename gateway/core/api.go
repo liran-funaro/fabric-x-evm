@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -64,6 +65,16 @@ type Gateway struct {
 	// by New to commitTimeoutDefault; tests may override it to force a fast
 	// timeout. See executor.go.
 	commitTimeout time.Duration
+
+	// maxBatchSize bounds how many pending txs one drain cycle folds into a
+	// single merged committer tx (see executeCycle / PendingPool.DrainUpTo).
+	// 0 means unbounded -- the pure drain-all model, which assumes arrival is
+	// paced upstream (e.g. by the query service on the submit path). Set a
+	// positive bound via SetMaxBatchSize when submission can burst faster than
+	// the drain cycle (so a burst is not swallowed into one oversized Fabric
+	// tx that exceeds the orderer's max message size). Atomic so it can be set
+	// safely while the executor goroutine is running.
+	maxBatchSize atomic.Int64
 }
 
 type Store interface {
@@ -101,9 +112,18 @@ func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, cha
 	}, nil
 }
 
+// SetMaxBatchSize bounds how many pending txs a single drain cycle folds into
+// one merged committer tx. n <= 0 restores the unbounded drain-all default.
+// Safe to call at any time (the field is atomic); it takes effect on the next
+// drain cycle. See the maxBatchSize field and executeCycle.
+func (g *Gateway) SetMaxBatchSize(n int) {
+	g.maxBatchSize.Store(int64(n))
+}
+
 // Start launches the single drain-all executor goroutine (see executor.go).
 // There is no worker pool: one batch is in flight at a time, and its size is
-// however many txs were pending when the cycle started.
+// however many txs were pending when the cycle started (bounded by
+// maxBatchSize if set; see SetMaxBatchSize).
 func (g *Gateway) Start(ctx context.Context) {
 	g.wg.Add(1)
 	go g.runExecutor(ctx)

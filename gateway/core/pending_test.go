@@ -33,3 +33,41 @@ func TestPendingPoolAddDrainRemove(t *testing.T) {
 		t.Fatalf("after remove: len=%d hasB=%v hasA=%v", p.Len(), p.Has(b.Hash()), p.Has(a.Hash()))
 	}
 }
+
+func TestPendingPoolDrainUpTo(t *testing.T) {
+	p := NewPendingPool()
+	txs := make([]*types.Transaction, 5)
+	for i := range txs {
+		txs[i] = txWithNonce(uint64(i))
+		p.Add(txs[i])
+	}
+
+	// Cap smaller than the pool: exactly max txs, in insertion (FIFO) order.
+	got := p.DrainUpTo(3)
+	if len(got) != 3 {
+		t.Fatalf("DrainUpTo(3) returned %d, want 3", len(got))
+	}
+	for i, tx := range got {
+		if tx.Hash() != txs[i].Hash() {
+			t.Fatalf("DrainUpTo(3)[%d] = nonce %d, want insertion order nonce %d", i, tx.Nonce(), i)
+		}
+	}
+	// Non-destructive: all 5 remain pending for the next cycle.
+	if p.Len() != 5 {
+		t.Fatalf("after DrainUpTo len = %d, want 5 (non-destructive)", p.Len())
+	}
+
+	// Cap >= pool size, and the <= 0 (unbounded) cases, all return everything.
+	for _, max := range []int{5, 10, 0, -1} {
+		if got := p.DrainUpTo(max); len(got) != 5 {
+			t.Fatalf("DrainUpTo(%d) returned %d, want all 5", max, len(got))
+		}
+	}
+
+	// After removing the first 3, DrainUpTo(3) yields the remaining 2 in order.
+	p.Remove([]ethcommon.Hash{txs[0].Hash(), txs[1].Hash(), txs[2].Hash()})
+	got = p.DrainUpTo(3)
+	if len(got) != 2 || got[0].Hash() != txs[3].Hash() || got[1].Hash() != txs[4].Hash() {
+		t.Fatalf("after remove, DrainUpTo(3) = %d txs, want the 2 survivors in order", len(got))
+	}
+}

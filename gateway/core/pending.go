@@ -56,14 +56,31 @@ func (p *PendingPool) Get(hash ethcommon.Hash) (*types.Transaction, bool) {
 	return tx, ok
 }
 
+// DrainAll returns every pending tx in insertion order (non-destructive: the
+// caller Removes committed txs later). Equivalent to DrainUpTo(0).
 func (p *PendingPool) DrainAll() []*types.Transaction {
+	return p.DrainUpTo(0)
+}
+
+// DrainUpTo returns up to max pending txs in insertion (FIFO) order, or all of
+// them when max <= 0. It is non-destructive -- entries stay in the pool until
+// Remove -- so the executor can bound the size of a single merged batch (a
+// Fabric committer tx has a hard max message size, and a burst that outpaces
+// the drain cycle would otherwise be swallowed into one oversized batch)
+// without losing the remainder: the leftover txs are simply picked up by the
+// next drain cycle, which runs immediately after the current batch commits.
+func (p *PendingPool) DrainUpTo(max int) []*types.Transaction {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(p.order) == 0 {
+	n := len(p.order)
+	if n == 0 {
 		return nil
 	}
-	out := make([]*types.Transaction, 0, len(p.order))
-	for _, h := range p.order {
+	if max > 0 && max < n {
+		n = max
+	}
+	out := make([]*types.Transaction, 0, n)
+	for _, h := range p.order[:n] {
 		out = append(out, p.txs[h])
 	}
 	return out

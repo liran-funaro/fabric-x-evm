@@ -256,6 +256,29 @@ func decodeBatchOutcomes(events []byte) ([]execution.PerTxOutcome, error) {
 	return outcomes, nil
 }
 
+// CountCommittedSubTxs reports how many EVM sub-txs a merged-batch Fabric tx
+// actually committed, given that tx's committed Events blob: the number of
+// PerTxOutcomes that the endorser did NOT exclude (see IsExcludedOutcome).
+// This is the per-batch EVM-tx count that throughput measurement sums to
+// report EVM tx/s rather than committer/batch tx/s -- one committer tx now
+// carries many EVM txs (see EVMEngine.ExecuteMergedBatch). An event blob with
+// no decodable outcomes (an empty blob, or a legacy single-tx ProposalTypeEVMTx
+// envelope) counts as 1: one EVM tx per Fabric tx. Callers should only add this
+// for a committed (valid) Fabric tx; an invalidated batch commits nothing.
+func CountCommittedSubTxs(events []byte) int {
+	outcomes, err := decodeBatchOutcomes(events)
+	if err != nil || len(outcomes) == 0 {
+		return 1
+	}
+	n := 0
+	for _, o := range outcomes {
+		if !fc.IsExcludedOutcome(o.Status) {
+			n++
+		}
+	}
+	return n
+}
+
 // decodeBatchLogs decodes a successful sub-tx's raw eth-logs event
 // (json.Marshal([]execution.Log), unwrapped -- see EVMEngine.runOn) into
 // domain.Log entries, assigning a block-global, monotonically increasing

@@ -138,6 +138,43 @@ func TestExecutorDrainCycle(t *testing.T) {
 	}
 }
 
+// TestExecutorDrainCapBoundsBatch: with maxBatchSize set below the pending
+// count, one cycle folds only the first maxBatchSize txs into the merged
+// committer tx; the remainder stays pending for the next cycle. This is the
+// bound that keeps a submission burst from being swallowed into one oversized
+// Fabric tx (see PendingPool.DrainUpTo / Gateway.SetMaxBatchSize).
+func TestExecutorDrainCapBoundsBatch(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(2)
+	txs := addThreeTxs(g) // nonces 1,2,3 in insertion order
+
+	end, done := runCycleAndCapture(t, g)
+
+	// Only the first 2 txs were merged: Args[0]=type byte, Args[1..2]=2 txs.
+	require.Len(t, stub.gotInv.Args, 3)
+
+	fabricTxID, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: fabricTxID, Status: committerpb.Status_COMMITTED},
+	}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the commit notification")
+	}
+
+	// The two committed txs are gone; the third (beyond the cap) is still
+	// pending and will be drained next cycle.
+	require.Equal(t, 1, g.pending.Len())
+	require.False(t, g.pending.Has(txs[0].Hash()))
+	require.False(t, g.pending.Has(txs[1].Hash()))
+	require.True(t, g.pending.Has(txs[2].Hash()))
+}
+
 // TestExecutorRollbackOnInvalid: same setup, but the commit notification
 // reports an MVCC abort (invalid) -> the 3 txs remain pending so the next
 // cycle re-drains and retries them (rollback).

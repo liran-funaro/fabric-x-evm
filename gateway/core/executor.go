@@ -58,7 +58,11 @@ func (g *Gateway) runExecutor(ctx context.Context) {
 // then returns having done nothing else. Factored out of runExecutor so a
 // test can drive a single cycle deterministically without a real network.
 func (g *Gateway) executeCycle(ctx context.Context) {
-	batch := g.pending.DrainAll()
+	// Drain up to maxBatchSize txs (all of them when unbounded). Any remainder
+	// stays pending and is picked up by the next cycle, which runs immediately
+	// after this batch commits -- so a submission burst is pipelined across
+	// several right-sized batches instead of one oversized Fabric tx.
+	batch := g.pending.DrainUpTo(int(g.maxBatchSize.Load()))
 	if len(batch) == 0 {
 		g.waitForWork(ctx)
 		return
