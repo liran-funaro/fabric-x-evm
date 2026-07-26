@@ -293,7 +293,20 @@ This separation of concerns—VersionedDB for execution, SQLite for queries—al
 
 Fabric-EVM's performance characteristics differ fundamentally from traditional Ethereum due to Fabric's execute-order-validate (EOV) paradigm. While Ethereum follows an order-execute model where transactions are sequenced before execution, Fabric-EVM simulates transactions in parallel before ordering, enabling significantly higher throughput when transactions don't conflict. However, this approach introduces concurrency challenges that must be carefully managed to ensure both high performance and Ethereum client compatibility.
 
-**Key Design Tenet**: The EVM Gateway must not break Ethereum clients. It must remain fully compatible with Ethereum's APIs, their behavior, and failure model. In particular, because "MVCC conflict" does not exist in Ethereum RPC semantics, surfacing MVCC failures to clients would be a breaking change. The gateway must therefore mask such conflicts through retry mechanisms and intelligent scheduling.
+**Key Design Tenet**: The EVM Gateway must not break Ethereum clients. It must remain fully compatible with Ethereum's APIs, their behavior, and failure model. In particular, because "MVCC conflict" does not exist in Ethereum RPC semantics, surfacing MVCC failures to clients would be a breaking change. The gateway masks such conflicts by owning the order (below) and re-executing on the rare abort.
+
+### Execution model: drain-all two-phase merged batches
+
+The gateway does not run a fixed worker pool or a read/write dependency graph. Instead:
+
+- **Pending pool.** `eth_sendRawTransaction` validates a transaction and adds it to an in-memory pending pool — no dependency detection, no per-transaction ordering.
+- **Drain-all loop.** A single executor goroutine repeatedly drains the *entire* pending pool as one batch. Execution concurrency therefore equals the batch size and self-tunes to load; there is no worker-count knob.
+- **Two-phase execution.** For each batch, a parallel *warm* pass runs every transaction against one pinned query-service view (so all state reads are issued concurrently and the query service batches them), then a serial *authoritative* pass re-runs them in order so a later transaction observes earlier ones' writes, producing one merged read/write-set.
+- **One atomic commit per batch.** The batch commits as a single Fabric transaction (envelope `ProposalTypeEVMBatch`) whose metadata carries every EVM transaction unchanged; the committer performs one MVCC check and one commit for the whole batch. Throughput is therefore measured in EVM transactions per second — one committer transaction carries many.
+- **Commit tracking and rollback.** The executor waits for that committer transaction's outcome (delivered by the notification service / committed blocks, keyed by Fabric transaction ID): on success the batch's transactions are dropped from the pending pool; on an MVCC abort they are returned to the pool and re-drained. A transaction whose nonce exceeds its sender's current nonce is excluded from the batch and left pending until its predecessor fills the gap.
+- **Addressing.** Each EVM transaction in a merged batch is individually addressable as `(block number, transaction index, sub-index)` with its own receipt; the block indexer assigns a flat, contiguous `transactionIndex` per EVM transaction for Ethereum-client compatibility.
+
+The phased scaling roadmap below predates this model and is retained as historical context; the drain-all two-phase design supersedes its "dependency manager" and worker-pool milestones.
 
 ### Concurrency Challenges
 
