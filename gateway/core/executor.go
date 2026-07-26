@@ -9,6 +9,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -17,6 +18,25 @@ import (
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
 )
+
+// commitTimeoutDefault is the stall backstop applied by awaitCommit. It is
+// deliberately far above any normal BFT commit latency: it is not a tuning
+// parameter, it exists only so the single executor goroutine can never block
+// forever if a commit/abort notification for a submitted committer tx is
+// ever lost upstream (e.g. an earlier TxHandler panics in HandleBatch before
+// the gateway's own HandleTx runs). On timeout, awaitCommit returns an error
+// exactly like an MVCC abort would: the batch's txs are left pending and
+// re-drained next cycle. If the batch had in fact committed, its EVM txs are
+// now nonce-too-low on re-submission and get excluded during re-execution --
+// self-correcting.
+const commitTimeoutDefault = 60 * time.Second
+
+// failureBackoff is the fixed delay executeCycle waits after any error
+// (endorse, TxID extraction, submit, or await-commit failure) before
+// returning, so a persistent endorser/orderer outage -- or a string of
+// commit-wait timeouts -- doesn't spin a tight, log-flooding retry loop.
+// Never applied on the happy path.
+const failureBackoff = 50 * time.Millisecond
 
 // runExecutor is the drain-all loop: one batch in flight at a time. Each cycle
 // drains the whole pending pool, two-phase-executes + merges it into one
@@ -49,13 +69,15 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 	end, err := g.endorsers.ExecuteBatch(ctx, batch)
 	if err != nil {
 		logger.Errorf("batch endorse failed (%d txs): %v", len(batch), err)
-		return // txs stay pending; re-drained next cycle
+		g.backoff(ctx) // txs stay pending; re-drained next cycle
+		return
 	}
 
 	fabricTxID, err := committerTxID(end.Proposal)
 	if err != nil {
 		logger.Errorf("extract committer tx id (%d txs): %v", len(batch), err)
-		return // txs stay pending; re-drained next cycle
+		g.backoff(ctx) // txs stay pending; re-drained next cycle
+		return
 	}
 
 	// Register the waiter *before* submitting: otherwise a fast commit
@@ -65,12 +87,14 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 	if err := g.SubmitFabricTx(ctx, end); err != nil {
 		g.forgetCommitWaiter(fabricTxID)
 		logger.Errorf("batch submit failed (tx %s, %d txs): %v", fabricTxID, len(batch), err)
-		return // txs stay pending; re-drained next cycle
+		g.backoff(ctx) // txs stay pending; re-drained next cycle
+		return
 	}
 
 	if err := g.awaitCommit(ctx, fabricTxID, waitCh); err != nil {
 		logger.Errorf("batch %s did not commit (%d txs): %v", fabricTxID, len(batch), err)
-		return // rollback: txs stay pending; re-drained next cycle
+		g.backoff(ctx) // rollback: txs stay pending; re-drained next cycle
+		return
 	}
 
 	g.pending.Remove(hashesOf(batch)) // refine: remove only INCLUDED txs (Task 8)
@@ -117,14 +141,23 @@ func (g *Gateway) forgetCommitWaiter(fabricTxID string) {
 	g.commitMu.Unlock()
 }
 
-// awaitCommit blocks until fabricTxID's outcome is delivered via HandleTx, or
-// ctx is done, then removes the waiter. It returns nil only when the
-// committer tx committed valid; any other outcome (MVCC abort or any other
-// non-committed status, or ctx cancellation) is an error, and the caller must
-// leave the batch's txs pending so the next cycle re-drains and retries them
-// (rollback).
+// awaitCommit blocks until fabricTxID's outcome is delivered via HandleTx,
+// ctx is done, or the per-batch commit timeout (see commitTimeoutDefault)
+// elapses, then removes the waiter. It returns nil only when the committer
+// tx committed valid; any other outcome (MVCC abort, any other
+// non-committed status, ctx cancellation, or a timed-out wait) is an error,
+// and the caller must leave the batch's txs pending so the next cycle
+// re-drains and retries them (rollback).
 func (g *Gateway) awaitCommit(ctx context.Context, fabricTxID string, ch chan committerpb.Status) error {
 	defer g.forgetCommitWaiter(fabricTxID)
+
+	timeout := g.commitTimeout
+	if timeout <= 0 {
+		timeout = commitTimeoutDefault
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	select {
 	case status := <-ch:
 		if status != committerpb.Status_COMMITTED {
@@ -132,7 +165,19 @@ func (g *Gateway) awaitCommit(ctx context.Context, fabricTxID string, ch chan co
 		}
 		return nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return fmt.Errorf("await commit of tx %s: %w", fabricTxID, ctx.Err())
+	}
+}
+
+// backoff pauses briefly after an executeCycle error (endorse, TxID
+// extraction, submit, or await-commit failure) so a persistent
+// endorser/orderer outage -- or repeated commit-wait timeouts -- doesn't spin
+// a tight, log-flooding retry loop. It never delays the happy path, and
+// returns early if ctx is done.
+func (g *Gateway) backoff(ctx context.Context) {
+	select {
+	case <-time.After(failureBackoff):
+	case <-ctx.Done():
 	}
 }
 

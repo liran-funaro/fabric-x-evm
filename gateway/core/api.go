@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -85,6 +86,11 @@ type Gateway struct {
 	// executor.go: registerCommitWaiter/awaitCommit/HandleTx.
 	commitMu      sync.Mutex
 	commitWaiters map[string]chan committerpb.Status
+
+	// commitTimeout is the stall backstop applied by awaitCommit. Defaulted
+	// by New to commitTimeoutDefault; tests may override it to force a fast
+	// timeout. See executor.go.
+	commitTimeout time.Duration
 }
 
 type Store interface {
@@ -118,6 +124,7 @@ func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, cha
 		arrivals:        make(chan struct{}, 1),
 		endorsementChan: endorsementChan,
 		commitWaiters:   make(map[string]chan committerpb.Status),
+		commitTimeout:   commitTimeoutDefault,
 	}, nil
 }
 

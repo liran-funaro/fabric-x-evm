@@ -31,6 +31,7 @@ func newExecutorTestGateway(stub *stubEndorser) *Gateway {
 		arrivals:        make(chan struct{}, 1),
 		endorsementChan: make(chan sdk.Endorsement, 1),
 		commitWaiters:   make(map[string]chan committerpb.Status),
+		commitTimeout:   commitTimeoutDefault,
 	}
 }
 
@@ -125,6 +126,32 @@ func TestExecutorRollbackOnInvalid(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("executeCycle did not return after the abort notification")
+	}
+
+	require.Equal(t, 3, g.pending.Len())
+	for _, tx := range txs {
+		require.True(t, g.pending.Has(tx.Hash()))
+	}
+}
+
+// TestExecutorAwaitCommitTimesOut: if a commit/abort notification for a
+// registered FabricTxID is never delivered (e.g. lost upstream before the
+// gateway's HandleTx runs), awaitCommit must not block the executor forever.
+// A tiny commitTimeout override forces the stall backstop to fire quickly;
+// executeCycle then leaves the batch pending, exactly as it would for any
+// other await-commit failure (rollback).
+func TestExecutorAwaitCommitTimesOut(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.commitTimeout = 20 * time.Millisecond // force a fast timeout for this test
+	txs := addThreeTxs(g)
+
+	_, done := runCycleAndCapture(t, g) // submitted, but never HandleTx'd
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the commit-wait timeout")
 	}
 
 	require.Equal(t, 3, g.pending.Len())
