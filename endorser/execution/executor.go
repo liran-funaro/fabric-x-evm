@@ -53,6 +53,15 @@ type EVMEngine struct {
 	// kvs provides versioned storage with snapshot isolation
 	kvs       KVSSnapshotter
 	evmConfig EVMConfig
+
+	// stateDecorator, when non-nil, wraps the per-transaction StateDB just
+	// before execution in EVERY path -- Execute and both ExecuteBatch passes
+	// (warm and authoritative) -- so injected per-tx behavior applies uniformly
+	// however the tx is executed. Nil in production (no wrapping). Test harnesses
+	// set it via SetStateDecorator to replay historical traces on a fresh chain
+	// (e.g. balance/nonce priming keyed on the individual tx); see
+	// testimpl.EVMEngineWrapper.SetBalancePriming.
+	stateDecorator func(ExtendedStateDB, *types.Transaction) ExtendedStateDB
 }
 
 // NewEVMEngine creates a new EVMEngine.
@@ -63,6 +72,13 @@ func NewEVMEngine(namespace string, kvs KVSSnapshotter, evmConfig EVMConfig, mon
 		monotonicVersions: monotonicVersions,
 		evmConfig:         evmConfig,
 	}
+}
+
+// SetStateDecorator installs a per-transaction StateDB decorator applied in
+// every execution path (see the stateDecorator field). Intended for test
+// harnesses; production leaves it nil. Set it before the engine serves traffic.
+func (e *EVMEngine) SetStateDecorator(fn func(ExtendedStateDB, *types.Transaction) ExtendedStateDB) {
+	e.stateDecorator = fn
 }
 
 // Execute runs a state-changing transaction and returns the EVM result,
@@ -113,6 +129,11 @@ func committedFaultStatus(err error) (int32, bool) {
 // classification previously inlined in Execute, now shared by Execute and
 // ExecuteBatch so both paths classify a transaction identically.
 func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorsement.ExecutionResult, error) {
+	// Apply the optional per-tx StateDB decorator (test-only; nil in production).
+	// Wrapping here covers Execute and both ExecuteBatch passes uniformly.
+	if e.stateDecorator != nil {
+		state = e.stateDecorator(state, tx)
+	}
 	ex, err := NewExecutor(state, noopCloser{}, nil, e.evmConfig)
 	if err != nil {
 		return endorsement.ExecutionResult{}, err
@@ -478,6 +499,14 @@ func (h *Executor) PrepareMessage(tx *types.Transaction) (*core.Message, error) 
 // Send validates nonce, converts tx to a message, applies production defaults, and executes.
 func (h *Executor) Send(tx *types.Transaction) ([]byte, error) {
 	msg, err := h.PrepareMessage(tx)
+	if serr := h.state.Error(); serr != nil {
+		// A backing-store read failed while preparing (e.g. a stale query-service
+		// view during the nonce read). The prepare verdict (including any nonce
+		// rejection) was computed from missing state, so surface the read error
+		// itself -- NOT a *TxRejected -- so the caller aborts the batch and
+		// retries on a fresh view instead of spuriously excluding the tx.
+		return nil, serr
+	}
 	if err != nil {
 		// Invalid transaction rejected before execution (bad signature, nonce, ...).
 		return nil, &TxRejected{err: err}
@@ -524,6 +553,15 @@ func (h *Executor) ApplyMessage(msg *core.Message) ([]byte, error) {
 
 	// Use ApplyMessage to execute the transaction
 	result, err := core.ApplyMessage(evm, msg, gp)
+	if serr := h.state.Error(); serr != nil {
+		// A backing-store read failed mid-execution (e.g. a stale query-service
+		// view whose lifetime the batch exceeded). The EVM ran on zero-valued
+		// reads, so both result and err are meaningless. Discard them and
+		// surface the read error -- NOT a *TxRejected or *ExecFailure -- so the
+		// caller aborts the batch and retries on a fresh view.
+		h.state.RevertToSnapshot(snapshot)
+		return nil, serr
+	}
 	if err != nil {
 		// Pre-execution rejection: the message can't be applied to this state
 		// (nonce, funds, intrinsic gas, ...) and would never be accepted in a block.

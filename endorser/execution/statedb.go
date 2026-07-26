@@ -216,7 +216,29 @@ type StateDB struct {
 	journal        []any
 	validRevisions []revision
 	nextRevisionId int
+
+	// dbErr records the first backing-store read error seen during execution.
+	// The go-ethereum vm.StateDB accessors (GetState, GetBalance, GetNonce, ...)
+	// return no error, so a failed read cannot be surfaced inline; it is
+	// recorded here (returning a zero value to the EVM) and the Executor checks
+	// Error() after PrepareMessage and after ApplyMessage, aborting the
+	// transaction -- and with it the whole batch -- rather than committing a
+	// result computed from missing state. A stale query-service view (its
+	// lifetime exceeded by a large batch) is the common trigger; aborting lets
+	// the executor retry on a fresh view instead of crashing the endorser.
+	dbErr error
 }
+
+// setError records the first backing-store read error (see the dbErr field).
+func (s *StateDB) setError(err error) {
+	if s.dbErr == nil {
+		s.dbErr = err
+	}
+}
+
+// Error returns the first backing-store read error recorded during execution,
+// or nil if every read succeeded. See the dbErr field.
+func (s *StateDB) Error() error { return s.dbErr }
 
 // NewStateDB creates a new StateDB backed by the given ReadStore.
 // If blockNum is 0, the current block number is queried from store.
@@ -375,7 +397,8 @@ func (s *StateDB) markNewContract(addr common.Address) {
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	val, err := s.getState(accKey(addr, "bal"))
 	if err != nil {
-		panic(fmt.Errorf("GetBalance failed: %w", err))
+		s.setError(fmt.Errorf("GetBalance failed: %w", err))
+		return uint256.NewInt(0)
 	}
 	return bytesToUint256(val)
 }
@@ -406,7 +429,8 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 func (s *StateDB) GetNonce(addr common.Address) uint64 {
 	val, err := s.getState(accKey(addr, "nonce"))
 	if err != nil {
-		panic(fmt.Errorf("GetNonce failed: %w", err))
+		s.setError(fmt.Errorf("GetNonce failed: %w", err))
+		return 0
 	}
 	return bytesToUint64(val)
 }
@@ -420,7 +444,8 @@ func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.Non
 func (s *StateDB) GetCode(addr common.Address) []byte {
 	val, err := s.getState(accKey(addr, "code"))
 	if err != nil {
-		panic(fmt.Errorf("GetCode failed: %w", err))
+		s.setError(fmt.Errorf("GetCode failed: %w", err))
+		return nil
 	}
 	return val
 }
@@ -455,7 +480,8 @@ func (s *StateDB) GetState(addr common.Address, slot common.Hash) common.Hash {
 	key := storeKey(addr, slot)
 	val, err := s.getState(key)
 	if err != nil {
-		panic(fmt.Errorf("GetState failed: %w", err))
+		s.setError(fmt.Errorf("GetState failed: %w", err))
+		return common.Hash{}
 	}
 	if len(val) == 0 {
 		return common.Hash{}
@@ -479,7 +505,8 @@ func (s *StateDB) GetStateAndCommittedState(addr common.Address, slot common.Has
 	// Get committed state from store and journal the read (creates MVCC dependency)
 	committedVal, err := s.getStateFromStore(key)
 	if err != nil {
-		panic(fmt.Errorf("GetStateAndCommittedState failed: %w", err))
+		s.setError(fmt.Errorf("GetStateAndCommittedState failed: %w", err))
+		return current, common.Hash{}
 	}
 
 	var committed common.Hash
@@ -512,9 +539,10 @@ func (s *StateDB) SetState(addr common.Address, slot common.Hash, value common.H
 		// Not in journal, read directly from store WITHOUT creating a read dependency
 		record, err := s.store.Get(s.namespace, key)
 		if err != nil {
-			panic(fmt.Errorf("SetState failed to get previous value: %w", err))
-		}
-		if record != nil && !record.IsDelete && len(record.Value) > 0 {
+			// Record the read failure and proceed with a zero previous value;
+			// the Executor aborts the tx on Error() so this write is discarded.
+			s.setError(fmt.Errorf("SetState failed to get previous value: %w", err))
+		} else if record != nil && !record.IsDelete && len(record.Value) > 0 {
 			prev = common.BytesToHash(record.Value)
 		}
 	}

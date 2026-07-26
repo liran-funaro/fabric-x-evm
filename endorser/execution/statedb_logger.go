@@ -450,5 +450,11 @@ func (l *StateDBLogger) Logs() []Log {
 	return result
 }
 
+// Error forwards to the wrapped StateDB's recorded read error. See
+// ExtendedStateDB.Error / StateDB.setError.
+func (l *StateDBLogger) Error() error {
+	return l.inner.Error()
+}
+
 // Ensure StateDBLogger implements ExtendedStateDB
 var _ ExtendedStateDB = (*StateDBLogger)(nil)

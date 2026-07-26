@@ -84,9 +84,29 @@ func (w *EVMEngineWrapper) SetBlockContext(ctx *vm.BlockContext) {
 }
 
 // SetBalancePriming configures the wrapper for BalancePriming mode.
+//
+// The single-tx Execute path (below) builds a BalancePrimingExecutor directly.
+// The merged-batch path, however, runs on the embedded *execution.EVMEngine
+// (this wrapper does not override ExecuteBatch/ExecuteMergedBatch), so batch
+// sub-txs would otherwise bypass priming entirely -- fatal for historical-trace
+// replay, where every dataset tx carries a nonce that does not match the fresh
+// chain and would be excluded as nonce-too-high. Register a per-tx state
+// decorator on the base engine so the batch passes get the same balance + nonce
+// priming, keyed on each individual sub-tx.
 func (w *EVMEngineWrapper) SetBalancePriming(config *BalancePrimingConfig) {
 	w.mode = BalancePrimingMode
 	w.balancePriming = config
+
+	if config != nil && config.Enabled {
+		contractAddr := config.ContractAddress
+		mappingPos := config.MappingPosition
+		w.EVMEngine.SetStateDecorator(func(state execution.ExtendedStateDB, tx *types.Transaction) execution.ExtendedStateDB {
+			primed := NewBalancePrimingWrapper(state, contractAddr, mappingPos)
+			primed.SetExpectedNonce(tx.Nonce()) // pass the endorser's tx.Nonce()==ledgerNonce check
+			primed.SetSender()                  // enable zero-balance priming for the ERC-20 slots
+			return primed
+		})
+	}
 }
 
 // Execute runs a state-changing transaction and returns the EVM result.

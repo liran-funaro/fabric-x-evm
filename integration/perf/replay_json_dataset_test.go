@@ -65,7 +65,13 @@ var orderers = flag.Int("orderers", 64, "number of goroutines submitting transac
 // swallow the whole backlog into one oversized Fabric tx; a positive bound pipelines the
 // burst across right-sized batches. Sweep this to find the throughput/latency sweet spot.
 // 0 keeps the pure unbounded drain-all behavior (only sane when arrival is paced upstream).
-var maxBatchSize = flag.Int("max-batch-size", 1024, "max EVM txs per merged committer tx (0 = unbounded drain-all)")
+// Default 128 keeps a batch's two-phase execution comfortably inside the query-service
+// view lifetime (fabx-full.yaml requests view-timeout 5s): the warm pass issues ~one
+// GetRows RPC per distinct key (see query.View.Get), so an oversized batch can't finish
+// reading before its pinned view expires (which would otherwise surface as a stale-view
+// read error and abort+retry the batch forever). Sweep upward while watching that batches
+// still commit; batching the per-key reads would raise this ceiling substantially.
+var maxBatchSize = flag.Int("max-batch-size", 128, "max EVM txs per merged committer tx (0 = unbounded drain-all)")
 
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.

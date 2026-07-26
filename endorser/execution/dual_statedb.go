@@ -30,6 +30,12 @@ type ExtendedStateDB interface {
 	GetStorageRoot(addr common.Address) common.Hash
 	Result() blocks.ReadWriteSet
 	Logs() []Log
+	// Error returns the first backing-store read error recorded during
+	// execution (the vm.StateDB accessors cannot return one inline), or nil.
+	// The Executor checks it after PrepareMessage/ApplyMessage to abort a tx
+	// whose reads failed rather than commit a result computed from missing
+	// state. See StateDB.setError.
+	Error() error
 }
 
 // DualStateDB implements the ExtendedStateDB interface by delegating all calls
@@ -443,4 +449,11 @@ func (d *DualStateDB) Logs() []Log {
 	result := d.snapshotDB.Logs()
 	d.logger.Debugf("Logs: returning result len=%d", len(result))
 	return result
+}
+
+// Error forwards to the endorser StateDB's recorded read error (the ethStateDB
+// is an in-memory mirror with no backing-store reads to fail). See
+// ExtendedStateDB.Error / StateDB.setError.
+func (d *DualStateDB) Error() error {
+	return d.snapshotDB.Error()
 }
