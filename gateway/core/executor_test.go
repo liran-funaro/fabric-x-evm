@@ -8,15 +8,19 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"github.com/hyperledger/fabric-x-common/api/applicationpb"
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	"github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	sdk "github.com/hyperledger/fabric-x-sdk"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // newExecutorTestGateway builds a Gateway with just what executeCycle needs:
@@ -37,6 +41,34 @@ func newExecutorTestGateway(stub *stubEndorser) *Gateway {
 
 func okBatchResponse() *peer.ProposalResponse {
 	return &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
+}
+
+// batchResponseWithStatuses builds a signed batch ProposalResponse whose
+// top-level Payload decodes (via includedTxs/decodeProposalResponseOutcomes)
+// to one execution.PerTxOutcome per given status, mirroring the real
+// endorsement/fabricx.Builder.Endorse shape: Payload is a marshaled
+// applicationpb.Tx whose Metadata[1] is a marshaled peer.ChaincodeEvent
+// carrying the JSON-encoded outcomes. Used to make a stub endorser report
+// some sub-txs excluded (common.StatusTxRejected) without a real EVM engine.
+func batchResponseWithStatuses(t *testing.T, statuses ...int32) *peer.ProposalResponse {
+	t.Helper()
+	outcomes := make([]execution.PerTxOutcome, len(statuses))
+	for i, s := range statuses {
+		outcomes[i] = execution.PerTxOutcome{Status: s}
+	}
+	outcomesPayload, err := json.Marshal(outcomes)
+	require.NoError(t, err)
+
+	eventBytes, err := proto.Marshal(&peer.ChaincodeEvent{Payload: outcomesPayload, EventName: "log"})
+	require.NoError(t, err)
+
+	txPayload, err := proto.Marshal(&applicationpb.Tx{Metadata: [][]byte{nil, eventBytes}})
+	require.NoError(t, err)
+
+	return &peer.ProposalResponse{
+		Response: &peer.Response{Status: common.StatusOK},
+		Payload:  txPayload,
+	}
 }
 
 // addThreeTxs seeds the pool with 3 distinct pending txs and returns them.
@@ -158,4 +190,37 @@ func TestExecutorAwaitCommitTimesOut(t *testing.T) {
 	for _, tx := range txs {
 		require.True(t, g.pending.Has(tx.Hash()))
 	}
+}
+
+// TestExecutorNonceGap: 3 pending txs, but the endorser's signed response
+// reports the MIDDLE one excluded (common.StatusTxRejected -- e.g. a
+// nonce-too-high gap tx; see EVMEngine.ExecuteBatch's authoritative pass,
+// Task 8) while the other two are included. After a VALID commit
+// notification, executeCycle must remove only the two INCLUDED txs from the
+// pending pool; the excluded one stays pending so a future cycle retries it
+// once its predecessor fills the gap.
+func TestExecutorNonceGap(t *testing.T) {
+	stub := &stubEndorser{execResp: batchResponseWithStatuses(t, common.StatusOK, common.StatusTxRejected, common.StatusOK)}
+	g := newExecutorTestGateway(stub)
+	txs := addThreeTxs(g)
+
+	end, done := runCycleAndCapture(t, g)
+
+	fabricTxID, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: fabricTxID, Status: committerpb.Status_COMMITTED},
+	}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the commit notification")
+	}
+
+	require.Equal(t, 1, g.pending.Len())
+	require.False(t, g.pending.Has(txs[0].Hash()), "included tx[0] must be removed")
+	require.True(t, g.pending.Has(txs[1].Hash()), "excluded tx[1] must stay pending")
+	require.False(t, g.pending.Has(txs[2].Hash()), "included tx[2] must be removed")
 }

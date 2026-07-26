@@ -66,7 +66,7 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
-	end, err := g.endorsers.ExecuteBatch(ctx, batch)
+	end, included, err := g.endorsers.ExecuteBatch(ctx, batch)
 	if err != nil {
 		logger.Errorf("batch endorse failed (%d txs): %v", len(batch), err)
 		g.backoff(ctx) // txs stay pending; re-drained next cycle
@@ -97,7 +97,10 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
-	g.pending.Remove(hashesOf(batch)) // refine: remove only INCLUDED txs (Task 8)
+	// Remove only the INCLUDED txs: an excluded one (nonce gap, rejected, ...)
+	// was never committed and stays pending, so a future cycle re-drains and
+	// retries it once its predecessor fills the gap.
+	g.pending.Remove(hashesOf(included))
 }
 
 // committerTxID recovers the Fabric TxID of the committer transaction that

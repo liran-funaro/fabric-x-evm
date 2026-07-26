@@ -8,9 +8,11 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
@@ -24,6 +26,14 @@ import (
 //     an authoritative pass re-runs them in order against an overlay of that
 //     snapshot, applying each tx's write-set before running the next so a later
 //     tx observes earlier writes.
+//
+// In the len(txs)>1 authoritative pass, a tx that runOn rejects before
+// execution (nonce gap, bad signature, insufficient funds, ...) is EXCLUDED
+// rather than aborting the batch: it gets a sentinel result (Status
+// common.StatusTxRejected, empty RWS) in its slot and the rest of the batch
+// still runs. This always returns exactly len(txs) results (one slot per
+// input tx, index = sub-index) unless a genuine server-side fault occurs, in
+// which case it still returns an error as before.
 func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) ([]endorsement.ExecutionResult, error) {
 	if len(txs) == 0 {
 		return nil, nil
@@ -86,6 +96,24 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}
 		res, err := e.runOn(state, tx)
 		if err != nil {
+			if _, ok := errors.AsType[*TxRejected](err); ok {
+				// Excluded, not aborted: a client-rejected tx (nonce gap, bad
+				// signature, insufficient funds, ...) can never be included as
+				// it stands, but the rest of the batch must still make
+				// progress. Record a sentinel outcome with an empty RWS --
+				// MergeResults folds it in as a no-op -- and continue without
+				// applying anything to the overlay. The caller (chain.go's
+				// block parser) recognizes this status and skips it entirely:
+				// no domain tx, no committed write. The excluded tx itself
+				// stays pending and is retried once its gap is filled.
+				out = append(out, endorsement.ExecutionResult{
+					Status:  common.StatusTxRejected,
+					Message: err.Error(),
+				})
+				continue
+			}
+			// A genuine server-side fault (not a client rejection): still
+			// abort the whole batch, as before.
 			return nil, err
 		}
 		overlay.apply(res.RWS)

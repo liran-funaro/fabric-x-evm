@@ -238,6 +238,99 @@ func TestConvertToDomainBatch(t *testing.T) {
 	assert.NotEqual(t, sub0.TxHash, sub1.TxHash)
 }
 
+// TestConvertToDomainBatch_SkipsExcludedSubTx verifies that a batch sub-tx
+// EXCLUDED by the endorser (execution.PerTxOutcome.Status == StatusTxRejected
+// / 400 -- see endorser/execution.EVMEngine.ExecuteBatch's authoritative pass,
+// Task 8) never becomes a domain.Transaction: it was never committed (its RWS
+// was empty), so it must not get a receipt, and the flat block-global TxIndex
+// must not advance for it -- only the surrounding included sub-txs consume an
+// index, and those indices stay contiguous.
+func TestConvertToDomainBatch_SkipsExcludedSubTx(t *testing.T) {
+	key0, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	key1, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	key2, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	ethb0 := marshaledEthTx(t, key0, common.HexToAddress("0x0000000000000000000000000000000000000001"), big.NewInt(1))
+	ethbGap := marshaledEthTx(t, key1, common.HexToAddress("0x0000000000000000000000000000000000000002"), big.NewInt(2))
+	ethb2 := marshaledEthTx(t, key2, common.HexToAddress("0x0000000000000000000000000000000000000003"), big.NewInt(3))
+
+	successLogs0, err := json.Marshal([]execution.Log{{
+		Address: common.HexToAddress("0x4444444444444444444444444444444444444444").Bytes(),
+		Data:    []byte("log-0"),
+	}})
+	require.NoError(t, err)
+	successLogs2, err := json.Marshal([]execution.Log{{
+		Address: common.HexToAddress("0x5555555555555555555555555555555555555555").Bytes(),
+		Data:    []byte("log-2"),
+	}})
+	require.NoError(t, err)
+
+	// sub-index 1 (the middle eth tx) was excluded by the endorser: Status 400
+	// (StatusTxRejected) and an empty Event, exactly what EVMEngine.ExecuteBatch's
+	// sentinel result produces for a nonce-gap/rejected tx.
+	outcomes := []execution.PerTxOutcome{
+		{Status: co.StatusOK, Event: successLogs0},
+		{Status: co.StatusTxRejected},
+		{Status: co.StatusOK, Event: successLogs2},
+	}
+	outcomesPayload, err := json.Marshal(outcomes)
+	require.NoError(t, err)
+
+	eventsBytes, err := proto.Marshal(&peer.ChaincodeEvent{
+		Payload:   outcomesPayload,
+		EventName: "log",
+	})
+	require.NoError(t, err)
+
+	b := blocks.Block{
+		Number:     101,
+		Hash:       []byte("excl-block-hash"),
+		ParentHash: []byte("excl-parent-hash"),
+		Timestamp:  11111,
+		Transactions: []blocks.Transaction{{
+			ID:        "tx-batch-excl",
+			Number:    0,
+			Valid:     true,
+			Status:    0,
+			InputArgs: [][]byte{{byte(co.ProposalTypeEVMBatch)}, ethb0, ethbGap, ethb2},
+			Events:    eventsBytes,
+		}},
+	}
+
+	got := ConvertToDomain(b)
+
+	// Only 2 domain txs: the excluded middle sub-tx produced none.
+	require.Len(t, got.Transactions, 2)
+
+	sub0 := got.Transactions[0]
+	assert.Equal(t, int64(0), sub0.TxIndex)
+	assert.Equal(t, int64(0), sub0.SubIndex)
+	assert.Equal(t, uint8(1), sub0.Status)
+	require.Len(t, sub0.Logs, 1)
+	assert.Equal(t, []byte("log-0"), sub0.Logs[0].Data)
+
+	// The excluded sub-tx (original sub-index 1) contributed no domain tx and
+	// did NOT consume a flat TxIndex: the next included sub-tx gets TxIndex 1,
+	// not 2, even though its own SubIndex (position within the Fabric tx) is 2.
+	sub2 := got.Transactions[1]
+	assert.Equal(t, int64(1), sub2.TxIndex)
+	assert.Equal(t, int64(2), sub2.SubIndex)
+	assert.Equal(t, uint8(1), sub2.Status)
+	require.Len(t, sub2.Logs, 1)
+	assert.Equal(t, []byte("log-2"), sub2.Logs[0].Data)
+
+	// No duplicate/gapped flat indices among what WAS emitted.
+	seen := map[int64]bool{}
+	for _, etx := range got.Transactions {
+		assert.False(t, seen[etx.TxIndex], "duplicate TxIndex %d", etx.TxIndex)
+		seen[etx.TxIndex] = true
+	}
+	assert.Equal(t, []int64{0, 1}, []int64{sub0.TxIndex, sub2.TxIndex})
+}
+
 func TestConvertToDomain_EmptyBlock(t *testing.T) {
 	b := blocks.Block{Number: 5}
 	got := ConvertToDomain(b)

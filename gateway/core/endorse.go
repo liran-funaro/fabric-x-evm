@@ -18,9 +18,12 @@ import (
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"github.com/hyperledger/fabric-x-common/api/applicationpb"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/endorser/api"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	sdk "github.com/hyperledger/fabric-x-sdk"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
@@ -121,19 +124,29 @@ func (e EndorsementClient) ExecuteTransaction(ctx context.Context, tx *types.Tra
 // ExecuteBatch endorses a batch of EVM transactions as one merged Fabric tx.
 // The invocation carries the batch: Args[0]=ProposalTypeEVMBatch, Args[1..N]=the
 // marshaled EVM txs, in batch order.
-func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, error) {
+//
+// The endorser may EXCLUDE some of txs from the batch (a client-rejected tx,
+// e.g. a nonce gap — see endorser/execution.EVMEngine.ExecuteBatch's
+// authoritative pass) while still endorsing the rest: the committer tx's Args
+// still carry all of txs (so the FabricTxID/invocation stays the same), but
+// only the included ones actually commit anything. ExecuteBatch decodes which
+// txs were included from the signed response and returns that subset
+// alongside the endorsement, so the caller (the executor's drain loop) knows
+// to leave the excluded ones pending for a future cycle instead of removing
+// them from the pool.
+func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, []*types.Transaction, error) {
 	args := make([][]byte, 0, len(txs)+1)
 	args = append(args, []byte{byte(common.ProposalTypeEVMBatch)})
 	for _, tx := range txs {
 		b, err := tx.MarshalBinary()
 		if err != nil {
-			return sdk.Endorsement{}, err
+			return sdk.Endorsement{}, nil, err
 		}
 		args = append(args, b)
 	}
 	inv, err := e.createInvocation(args)
 	if err != nil {
-		return sdk.Endorsement{}, err
+		return sdk.Endorsement{}, nil, err
 	}
 
 	// Derive a cancellable context so goroutines can stop early on error
@@ -173,14 +186,80 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 	// Return first error in slice order — stable and deterministic
 	for _, err := range errs {
 		if err != nil {
-			return sdk.Endorsement{}, err
+			return sdk.Endorsement{}, nil, err
 		}
+	}
+
+	// Every responding endorser executed the same deterministic batch, so any
+	// one signed response decodes the same per-sub-tx outcomes; use the first
+	// non-nil one.
+	var signed *peer.ProposalResponse
+	for _, r := range res {
+		if r != nil {
+			signed = r
+			break
+		}
+	}
+	included, err := includedTxs(signed, txs)
+	if err != nil {
+		return sdk.Endorsement{}, nil, fmt.Errorf("decode included txs: %w", err)
 	}
 
 	return sdk.Endorsement{
 		Proposal:  inv.Proposal,
 		Responses: res,
-	}, nil
+	}, included, nil
+}
+
+// includedTxs decodes txs' per-sub-tx outcomes from resp (see
+// decodeProposalResponseOutcomes) and returns the subset that was actually
+// included — i.e. not excluded with common.StatusTxRejected. When outcomes
+// can't be recovered at all (e.g. a bare/test response with no payload), every
+// tx is treated as included: the safe default when there is nothing to
+// exclude on, and what preserves pre-Task-8 "whole batch commits" behavior.
+func includedTxs(resp *peer.ProposalResponse, txs []*types.Transaction) ([]*types.Transaction, error) {
+	outcomes, err := decodeProposalResponseOutcomes(resp)
+	if err != nil {
+		return nil, err
+	}
+	if outcomes == nil {
+		return txs, nil
+	}
+
+	included := make([]*types.Transaction, 0, len(txs))
+	for i, tx := range txs {
+		if i < len(outcomes) && outcomes[i].Status == common.StatusTxRejected {
+			continue // excluded: never committed, caller leaves it pending
+		}
+		included = append(included, tx)
+	}
+	return included, nil
+}
+
+// decodeProposalResponseOutcomes recovers the per-sub-tx outcomes
+// (execution.PerTxOutcome, one per sub-index) from a signed batch
+// ProposalResponse's top-level Payload — the applicationpb.Tx envelope built
+// by endorsement/fabricx.Builder.Endorse (Metadata[0]=input args,
+// Metadata[1]=the merged ExecutionResult.Event wrapped in one ChaincodeEvent).
+// This is the same envelope blocks/fabricx.BlockParser.ParseTx later decodes
+// into blocks.Transaction.Events for the committed block — see
+// decodeBatchOutcomes in chain.go, which this reuses for the inner
+// ChaincodeEvent/JSON decode once the outer applicationpb.Tx layer is
+// stripped. Returns (nil, nil) — "nothing to decode", not an error — for a
+// nil/payload-less response, so callers can fall back to treating every tx as
+// included.
+func decodeProposalResponseOutcomes(resp *peer.ProposalResponse) ([]execution.PerTxOutcome, error) {
+	if resp == nil || len(resp.Payload) == 0 {
+		return nil, nil
+	}
+	var ptx applicationpb.Tx
+	if err := proto.Unmarshal(resp.Payload, &ptx); err != nil {
+		return nil, fmt.Errorf("unmarshal proposal response payload: %w", err)
+	}
+	if len(ptx.Metadata) < 2 || len(ptx.Metadata[1]) == 0 {
+		return nil, nil
+	}
+	return decodeBatchOutcomes(ptx.Metadata[1])
 }
 
 // CallContract queries a smart contract and returns the value.

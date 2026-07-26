@@ -246,6 +246,111 @@ func TestExecuteBatchFreshKeyCreatedMidBatch(t *testing.T) {
 	}
 }
 
+// TestExecuteBatchExcludesNonceGap seeds accounts A and B, then runs a 3-tx
+// batch [A->B transfer, D's nonce-gap tx (nonce 1 with no nonce-0 tx for D, so
+// it is rejected before execution), B->C transfer] and asserts:
+//   - ExecuteBatch does NOT abort the whole batch on the middle tx's rejection
+//     (no error, 3 results back).
+//   - The middle result is excluded: Status 400 (common.StatusTxRejected) with
+//     an EMPTY RWS (no reads, no writes) -- its rejection must not leak any
+//     state into the batch.
+//   - The other two txs still execute normally, in order: the third tx's own
+//     RWS proves it observed the first tx's write via the overlay (exactly
+//     like TestExecuteBatchSequentialDependency), and the merged RWS (via
+//     MergeResults, which the exclusion design leaves unchanged) carries both
+//     of their writes but nothing from the excluded middle tx.
+func TestExecuteBatchExcludesNonceGap(t *testing.T) {
+	backend, err := state.NewWriteDB(Channel, "file:batch_nonce_gap?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA, addrA := newTestKey(t)
+	keyB, addrB := newTestKey(t)
+	_, addrC := newTestKey(t)
+	keyD, _ := newTestKey(t) // D is never seeded; it has ledger nonce 0.
+
+	const (
+		initialA = 1_000
+		initialB = 50  // alone, insufficient to cover amount2 below
+		amount1  = 300 // tx1: A -> B
+		amount2  = 100 // tx3: B -> C; needs tx1's delivery (50+300=350 >= 100)
+	)
+	seedAccounts(t, backend, map[ethcommon.Address]int64{addrA: initialA, addrB: initialB})
+
+	kvs := &testVersionedDBSnapshotter{db: backend}
+	cfg := EVMConfig{ChainConfig: common.BuildChainConfig(4011)}
+	engine := NewEVMEngine(Namespace, kvs, cfg, false)
+
+	tx1 := newTransferTx(t, cfg.ChainConfig, keyA, addrB, big.NewInt(amount1), 0)
+	// D's ledger nonce is 0 (never seeded/written), but this tx carries nonce 1:
+	// a gap -- rejected with ErrNonceTooHigh before any execution/state read.
+	gapTx := newTransferTx(t, cfg.ChainConfig, keyD, addrC, big.NewInt(1), 1)
+	tx3 := newTransferTx(t, cfg.ChainConfig, keyB, addrC, big.NewInt(amount2), 0)
+
+	results, err := engine.ExecuteBatch(context.Background(), []*types.Transaction{tx1, gapTx, tx3})
+	if err != nil {
+		t.Fatalf("ExecuteBatch must exclude the rejected tx, not abort the batch: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+
+	if results[0].Status != 200 {
+		t.Fatalf("tx1: status = %d, message = %q, want 200 (OK)", results[0].Status, results[0].Message)
+	}
+
+	if results[1].Status != common.StatusTxRejected {
+		t.Fatalf("gapTx: status = %d, want %d (StatusTxRejected)", results[1].Status, common.StatusTxRejected)
+	}
+	if len(results[1].RWS.Reads) != 0 || len(results[1].RWS.Writes) != 0 {
+		t.Fatalf("gapTx: RWS = %+v, want empty (excluded tx must not contribute reads or writes)", results[1].RWS)
+	}
+
+	if results[2].Status != 200 {
+		t.Fatalf("tx3: status = %d, message = %q, want 200 (OK) — tx3 must see tx1's write via the overlay despite the excluded middle tx", results[2].Status, results[2].Message)
+	}
+
+	balKey := accKey(addrB, "bal")
+	var tx3Wrote bool
+	for _, w := range results[2].RWS.Writes {
+		if w.Key != balKey {
+			continue
+		}
+		tx3Wrote = true
+		got := bytesToUint256(w.Value)
+		want := uint256.NewInt(uint64(initialB + amount1 - amount2))
+		if got.Cmp(want) != 0 {
+			t.Errorf("B balance after tx3 = %s, want %s (initialB=%d + amount1=%d - amount2=%d)",
+				got, want, initialB, amount1, amount2)
+		}
+	}
+	if !tx3Wrote {
+		t.Fatalf("expected tx3's RWS to include a write to B's balance key %q; writes = %+v", balKey, results[2].RWS.Writes)
+	}
+
+	// The merged RWS (what actually lands in the committed Fabric tx) carries
+	// both included txs' writes and nothing from the excluded gap tx.
+	merged, events := MergeResults(results)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (one per result, index = sub-index), got %d", len(events))
+	}
+	mergedWrites := map[string][]byte{}
+	for _, w := range merged.Writes {
+		mergedWrites[w.Key] = w.Value
+	}
+	if _, ok := mergedWrites[accKey(addrA, "bal")]; !ok {
+		t.Errorf("merged RWS missing A's balance write from tx1; writes = %+v", merged.Writes)
+	}
+	if _, ok := mergedWrites[balKey]; !ok {
+		t.Errorf("merged RWS missing B's balance write from tx3; writes = %+v", merged.Writes)
+	}
+	// D never appears: the excluded tx contributed nothing to the merged set.
+	if _, ok := mergedWrites[accKey(addrC, "bal")]; !ok {
+		t.Errorf("merged RWS missing C's balance write from tx3; writes = %+v", merged.Writes)
+	}
+}
+
 // TestExecuteBatchSingleMatchesExecute asserts ExecuteBatch([tx]) returns the
 // same RWS as Execute(tx) for one transaction: the N==1 path must be
 // indistinguishable from today's Execute.
