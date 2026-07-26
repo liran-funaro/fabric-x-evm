@@ -9,7 +9,6 @@ package core
 import (
 	"context"
 	"fmt"
-	"log"
 	"math"
 	"math/big"
 	"sync"
@@ -19,10 +18,10 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
+	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	sdk "github.com/hyperledger/fabric-x-sdk"
-	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
 
 type Signer interface {
@@ -75,11 +74,17 @@ type Gateway struct {
 	chainID         *big.Int
 	ChainConfig     *params.ChainConfig
 	Signer          types.Signer
-	TxQueue         TxQueueInterface
-	workerCount     int
+	pending         *PendingPool
+	arrivals        chan struct{} // non-blocking wake-up for the idle executor loop
 	wg              sync.WaitGroup
 	stopOnce        sync.Once
 	endorsementChan chan sdk.Endorsement // Channel to send endorsements to BatchSubmitter
+
+	// commitWaiters correlates a submitted committer tx (by FabricTxID) with
+	// the executor goroutine awaiting its commit/abort outcome. See
+	// executor.go: registerCommitWaiter/awaitCommit/HandleTx.
+	commitMu      sync.Mutex
+	commitWaiters map[string]chan committerpb.Status
 }
 
 type Store interface {
@@ -98,19 +103,9 @@ type Store interface {
 }
 
 // New creates a new Ethereum Gateway.
-// If txQueue is nil, NewTxQueue() will be used as the default.
 // batchSubmitter handles all endorsement submissions and is owned by the Gateway.
 // endorsementChan is the channel to send endorsements to the BatchSubmitter.
-func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, chainID int64, workerCount int, txQueue TxQueueInterface, endorsementChan chan sdk.Endorsement) (*Gateway, error) {
-	if workerCount <= 0 {
-		workerCount = 1
-	}
-
-	// Use default TxQueue if none provided
-	if txQueue == nil {
-		txQueue = NewTxQueue()
-	}
-
+func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, chainID int64, endorsementChan chan sdk.Endorsement) (*Gateway, error) {
 	cid := big.NewInt(chainID)
 	return &Gateway{
 		endorsers:       ec,
@@ -119,63 +114,36 @@ func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, cha
 		chainID:         cid,
 		ChainConfig:     cmn.BuildChainConfig(chainID),
 		Signer:          types.LatestSignerForChainID(cid),
-		TxQueue:         txQueue,
-		workerCount:     workerCount,
+		pending:         NewPendingPool(),
+		arrivals:        make(chan struct{}, 1),
 		endorsementChan: endorsementChan,
+		commitWaiters:   make(map[string]chan committerpb.Status),
 	}, nil
 }
 
-// Start initializes the worker pool to process transactions from the queue
+// Start launches the single drain-all executor goroutine (see executor.go).
+// There is no worker pool: one batch is in flight at a time, and its size is
+// however many txs were pending when the cycle started.
 func (g *Gateway) Start(ctx context.Context) {
-	for range g.workerCount {
-		g.wg.Add(1)
-		go g.worker(ctx)
-	}
+	g.wg.Add(1)
+	go g.runExecutor(ctx)
 }
 
-// worker processes transactions from the queue
-func (g *Gateway) worker(ctx context.Context) {
-	defer g.wg.Done()
-
-	for {
-		tx, ok := g.TxQueue.Dequeue()
-		if !ok {
-			// Queue is closed and empty
-			return
-		}
-
-		// Process the transaction (old SendTransaction logic)
-		if err := g.processTx(ctx, tx); err != nil {
-			logger.Errorf("tx %s failed: %v", tx.Hash().Hex(), err)
-			g.TxQueue.Complete(tx.Hash())
-			continue
-		}
-	}
-}
-
-// processTx handles the actual transaction processing
-func (g *Gateway) processTx(ctx context.Context, tx *types.Transaction) error {
-	end, err := g.ExecuteEthTx(ctx, tx)
-	if err != nil {
-		return err
-	}
-	if err := g.SubmitFabricTx(ctx, end); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// SendTransaction runs geth-style pre-flight validation, then enqueues the tx
-// for async endorse/submit. Mirrors eth_sendRawTransaction's failure model.
+// SendTransaction runs geth-style pre-flight validation, then adds the tx to
+// the pending pool for the executor loop to pick up on its next drain.
+// Mirrors eth_sendRawTransaction's failure model.
 func (g *Gateway) SendTransaction(ctx context.Context, tx *types.Transaction) error {
 	if err := ValidateTx(ctx, tx, g.ChainConfig, g.Signer, g); err != nil {
 		return err
 	}
-	if g.TxQueue.IsPending(tx.Hash()) != nil {
+	if g.pending.Has(tx.Hash()) {
 		return domain.ErrTransactionAlreadyPending
 	}
-	g.TxQueue.Enqueue(tx)
+	g.pending.Add(tx)
+	select {
+	case g.arrivals <- struct{}{}:
+	default: // executor is already awake (busy or already notified); don't block
+	}
 	return nil
 }
 
@@ -264,19 +232,19 @@ func (g *Gateway) NonceAt(ctx context.Context, account common.Address, blockNumb
 
 // Transactions
 
-// TransactionByHash retrieves transaction data from either the queue or database.
-// It first checks if the transaction is in the queue (pending or in-progress),
+// TransactionByHash retrieves transaction data from either the pending pool or database.
+// It first checks if the transaction is pending (accepted but not yet committed),
 // then queries the database for committed transactions.
 //
 // Return values represent three possible states:
-// - State 1 (Pending): Transaction in queue → tx with BlockNumber=0 (becomes null in JSON)
+// - State 1 (Pending): Transaction in the pending pool → tx with BlockNumber=0 (becomes null in JSON)
 // - State 2 (Completed): Transaction in database → tx with block data populated
 // - State 3 (Not Found): Transaction in neither location → nil
 //
 // The pending status is signaled by BlockNumber=0, which the API layer converts to null.
 func (g *Gateway) TransactionByHash(ctx context.Context, hash common.Hash) (*domain.Transaction, error) {
-	// Check if transaction is pending in the queue (either waiting or being processed)
-	if pendingTx := g.TxQueue.IsPending(hash); pendingTx != nil {
+	// Check if the transaction is pending (accepted but not yet committed).
+	if pendingTx, ok := g.pending.Get(hash); ok {
 		// Transaction is pending - return it with zero block fields
 		// The API layer will convert these to nil in the JSON response
 		rawTx, err := pendingTx.MarshalBinary()
@@ -305,13 +273,13 @@ func (g *Gateway) TransactionByHash(ctx context.Context, hash common.Hash) (*dom
 		}, nil
 	}
 
-	// Transaction not in queue, check database for committed transaction
+	// Transaction not pending, check database for committed transaction
 	tx, err := g.store.GetTransactionByHash(ctx, hash.Bytes())
 	if err != nil {
 		return nil, err
 	}
 	if tx == nil {
-		// Transaction not found in queue or database
+		// Transaction not found pending or in the database
 		return nil, nil
 	}
 
@@ -340,15 +308,18 @@ func (g *Gateway) GetLogs(ctx context.Context, query domain.LogFilter) ([]domain
 	return g.store.GetLogs(ctx, query)
 }
 
-// Stop performs an orderly shutdown of the gateway.
-// It closes the transaction queue, waits for all workers to finish, and closes the batch submitter.
+// Stop performs an orderly shutdown of the gateway. It waits for the executor
+// loop to finish, then stops and closes the batch submitter.
+//
+// The executor loop (runExecutor) only exits once the ctx passed to Start is
+// canceled, so the caller must cancel that ctx before (or concurrently with)
+// calling Stop; otherwise Stop blocks forever in wg.Wait(). The existing
+// caller (gateway/app) already does this: it cancels the context and only
+// then calls Stop from its shutdown path.
 func (g *Gateway) Stop() error {
 	var err error
 	g.stopOnce.Do(func() {
-		// Close the queue to signal workers to stop
-		g.TxQueue.Close()
-
-		// Wait for all workers to finish processing
+		// Wait for the executor goroutine to finish.
 		g.wg.Wait()
 
 		// Stop and close batch submitter
@@ -356,22 +327,5 @@ func (g *Gateway) Stop() error {
 		err = g.batchSubmitter.Close()
 	})
 
-	total, invalid, totalEnq, conflictEnq := g.TxQueue.Stats()
-	if total > 0 {
-		log.Println("gw stats: valid/invalid/invalid rate        ", total, invalid, float64(invalid)/float64(total))
-		log.Println("gw stats: total/conflicting/conflicting rate", totalEnq, conflictEnq, float64(conflictEnq)/float64(totalEnq))
-	}
-
-	return err
-}
-
-// Handle processes block notifications and marks transactions as complete.
-// This method implements blocks.BlockHandler and can be registered with the synchronizer
-// to receive notifications when blocks are committed. It converts the blocks.Block to domain.Block
-// and delegates to the TxQueue's Handle method.
-func (g *Gateway) Handle(ctx context.Context, b blocks.Block) error {
-	// Convert blocks.Block to domain.Block using the shared conversion function
-	domainBlock := ConvertToDomain(b)
-	err := g.TxQueue.Handle(ctx, &domainBlock)
 	return err
 }

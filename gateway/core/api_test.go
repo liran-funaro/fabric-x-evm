@@ -29,7 +29,8 @@ func TestSendTransaction_DuplicateRejected(t *testing.T) {
 	g := &Gateway{
 		ChainConfig: cfg,
 		Signer:      signer,
-		TxQueue:     NewTxQueue(),
+		pending:     NewPendingPool(),
+		arrivals:    make(chan struct{}, 1),
 		endorsers:   newClient(nonceStub()),
 	}
 
@@ -40,7 +41,7 @@ func TestSendTransaction_DuplicateRejected(t *testing.T) {
 	err := g.SendTransaction(context.Background(), tx)
 	require.ErrorIs(t, err, domain.ErrTransactionAlreadyPending)
 
-	assert.NotNil(t, g.TxQueue.IsPending(tx.Hash()))
+	assert.True(t, g.pending.Has(tx.Hash()))
 }
 
 // The gateway's state readers forward straight to the endorsers.

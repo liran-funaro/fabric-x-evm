@@ -47,6 +47,15 @@ func (p *PendingPool) Has(hash ethcommon.Hash) bool {
 	return ok
 }
 
+// Get returns the pending transaction for hash, if present. Used by
+// TransactionByHash to serve a not-yet-committed tx.
+func (p *PendingPool) Get(hash ethcommon.Hash) (*types.Transaction, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tx, ok := p.txs[hash]
+	return tx, ok
+}
+
 func (p *PendingPool) DrainAll() []*types.Transaction {
 	p.mu.Lock()
 	defer p.mu.Unlock()
