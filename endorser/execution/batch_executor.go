@@ -11,6 +11,7 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
@@ -54,6 +55,13 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}
 		res, err := e.runOn(state, txs[0])
 		if err != nil {
+			if rej, ok := errors.AsType[*TxRejected](err); ok {
+				// Excluded, not aborted: align with the len(txs)>1 path below
+				// so a single pending tx (e.g. a lone nonce-gap tx with no
+				// batchmate yet) doesn't hard-fail the whole cycle just
+				// because it happens to be alone.
+				return []endorsement.ExecutionResult{excludedResult(rej)}, nil
+			}
 			return nil, err
 		}
 		return []endorsement.ExecutionResult{res}, nil
@@ -96,7 +104,7 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}
 		res, err := e.runOn(state, tx)
 		if err != nil {
-			if _, ok := errors.AsType[*TxRejected](err); ok {
+			if rej, ok := errors.AsType[*TxRejected](err); ok {
 				// Excluded, not aborted: a client-rejected tx (nonce gap, bad
 				// signature, insufficient funds, ...) can never be included as
 				// it stands, but the rest of the batch must still make
@@ -104,12 +112,12 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 				// MergeResults folds it in as a no-op -- and continue without
 				// applying anything to the overlay. The caller (chain.go's
 				// block parser) recognizes this status and skips it entirely:
-				// no domain tx, no committed write. The excluded tx itself
-				// stays pending and is retried once its gap is filled.
-				out = append(out, endorsement.ExecutionResult{
-					Status:  common.StatusTxRejected,
-					Message: err.Error(),
-				})
+				// no domain tx, no committed write. A RETRYABLE exclusion
+				// (nonce too high, insufficient funds, ...) stays pending and
+				// is retried once its gap is filled; a TERMINAL exclusion
+				// (nonce too low) can never resolve as this exact tx and the
+				// caller should evict it instead (see excludedResult).
+				out = append(out, excludedResult(rej))
 				continue
 			}
 			// A genuine server-side fault (not a client rejection): still
@@ -120,6 +128,29 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		out = append(out, res)
 	}
 	return out, nil
+}
+
+// excludedResult builds the sentinel outcome for a tx that runOn rejected
+// before execution (see the len(txs)==1 and len(txs)>1 cases above): never
+// executed, so its RWS/Event stay empty. rej's underlying error further
+// classifies the exclusion as:
+//   - TERMINAL (common.StatusTxRejectedTerminal): nonce too low. This exact
+//     tx can never succeed as submitted -- either an earlier tx with the
+//     same nonce already landed, or this one did -- so the caller should
+//     evict it from the pending pool rather than retry it forever.
+//   - RETRYABLE (common.StatusTxRejected), the default: nonce too high,
+//     insufficient funds, bad signature, .... It may still succeed once
+//     ledger state catches up (e.g. its predecessor commits), so the caller
+//     must leave it pending.
+func excludedResult(rej *TxRejected) endorsement.ExecutionResult {
+	status := common.StatusTxRejected
+	if errors.Is(rej, core.ErrNonceTooLow) {
+		status = common.StatusTxRejectedTerminal
+	}
+	return endorsement.ExecutionResult{
+		Status:  status,
+		Message: rej.Error(),
+	}
 }
 
 // newState builds an ExtendedStateDB over reader, wrapping it with StateDBLogger

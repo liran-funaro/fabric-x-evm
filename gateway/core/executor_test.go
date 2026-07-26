@@ -45,7 +45,7 @@ func okBatchResponse() *peer.ProposalResponse {
 }
 
 // batchResponseWithStatuses builds a signed batch ProposalResponse whose
-// top-level Payload decodes (via includedTxs/decodeProposalResponseOutcomes)
+// top-level Payload decodes (via classifyBatchOutcomes/decodeProposalResponseOutcomes)
 // to one execution.PerTxOutcome per given status, mirroring the real
 // endorsement/fabricx.Builder.Endorse shape: Payload is a marshaled
 // applicationpb.Tx whose Metadata[1] is a marshaled peer.ChaincodeEvent
@@ -224,6 +224,95 @@ func TestExecutorNonceGap(t *testing.T) {
 	require.False(t, g.pending.Has(txs[0].Hash()), "included tx[0] must be removed")
 	require.True(t, g.pending.Has(txs[1].Hash()), "excluded tx[1] must stay pending")
 	require.False(t, g.pending.Has(txs[2].Hash()), "included tx[2] must be removed")
+}
+
+// TestExecutorAllExcludedDoesNotSubmitOrSpin: all 3 pending txs are reported
+// excluded (common.StatusTxRejected) by the endorser -- e.g. every drained tx
+// happens to be a nonce-gap tx with no filler present yet (FIX I1(a)).
+// executeCycle must NOT submit an empty committer tx for a batch with nothing
+// included, and must NOT return immediately -- returning immediately would
+// make runExecutor's loop busy-spin, re-draining and re-endorsing the exact
+// same excluded txs cycle after cycle with no backoff. Instead it blocks in
+// waitForWork exactly as the empty-pool case does, until either ctx is done
+// or new work arrives. None of the 3 txs are removed from the pending pool.
+func TestExecutorAllExcludedDoesNotSubmitOrSpin(t *testing.T) {
+	stub := &stubEndorser{execResp: batchResponseWithStatuses(t, common.StatusTxRejected, common.StatusTxRejected, common.StatusTxRejected)}
+	g := newExecutorTestGateway(stub)
+	txs := addThreeTxs(g)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		g.executeCycle(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-g.endorsementChan:
+		t.Fatal("executeCycle submitted a committer tx for a batch with nothing included")
+	case <-done:
+		t.Fatal("executeCycle returned immediately instead of waiting for new work (would busy-spin runExecutor's loop)")
+	case <-time.After(200 * time.Millisecond):
+		// still blocked in waitForWork, as expected
+	}
+
+	cancel() // simulate shutdown to unblock waitForWork, like a real ctx cancellation would
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after ctx cancellation")
+	}
+
+	require.Equal(t, 3, g.pending.Len())
+	for _, tx := range txs {
+		require.True(t, g.pending.Has(tx.Hash()), "an all-excluded batch must leave every tx pending")
+	}
+}
+
+// TestExecutorTerminalExclusionEvictedRetryableStays: 3 pending txs; the
+// endorser's signed response reports tx[0] included (common.StatusOK), tx[1]
+// excluded TERMINALLY (common.StatusTxRejectedTerminal -- e.g. nonce too low:
+// this exact tx can never succeed as submitted), and tx[2] excluded
+// RETRYABLY (common.StatusTxRejected -- e.g. nonce too high). FIX I1(b):
+//   - The terminally-excluded tx is evicted from the pending pool
+//     unconditionally, as soon as ExecuteBatch returns -- even before the
+//     batch's committer tx has committed (the exclusion reflects pre-cycle
+//     ledger state, so it holds no matter what the rest of the batch does).
+//   - The retryable-excluded tx stays pending throughout: it may still
+//     succeed once ledger state catches up (mirrors TestExecutorNonceGap).
+//   - The included tx is removed only after a VALID commit notification.
+func TestExecutorTerminalExclusionEvictedRetryableStays(t *testing.T) {
+	stub := &stubEndorser{execResp: batchResponseWithStatuses(t, common.StatusOK, common.StatusTxRejectedTerminal, common.StatusTxRejected)}
+	g := newExecutorTestGateway(stub)
+	txs := addThreeTxs(g)
+
+	end, done := runCycleAndCapture(t, g)
+
+	// Terminal eviction is unconditional: it must already have happened by the
+	// time the committer tx is submitted, well before any commit notification.
+	require.Equal(t, 2, g.pending.Len(), "terminal tx must be evicted as soon as ExecuteBatch returns")
+	require.True(t, g.pending.Has(txs[0].Hash()), "included tx[0] stays pending until commit")
+	require.False(t, g.pending.Has(txs[1].Hash()), "terminal tx[1] must be evicted immediately")
+	require.True(t, g.pending.Has(txs[2].Hash()), "retryable tx[2] stays pending")
+
+	fabricTxID, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: fabricTxID, Status: committerpb.Status_COMMITTED},
+	}))
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("executeCycle did not return after the commit notification")
+	}
+
+	require.Equal(t, 1, g.pending.Len())
+	require.False(t, g.pending.Has(txs[0].Hash()), "included tx[0] must be removed after commit")
+	require.False(t, g.pending.Has(txs[1].Hash()), "terminal tx[1] must stay evicted")
+	require.True(t, g.pending.Has(txs[2].Hash()), "retryable tx[2] must stay pending")
 }
 
 // TestGatewayHandleCommitsOnValidBlockTx: same drain-cycle setup as

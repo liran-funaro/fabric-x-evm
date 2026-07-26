@@ -58,6 +58,29 @@ func newTransferTx(t *testing.T, cfg *params.ChainConfig, key *ecdsa.PrivateKey,
 	return tx
 }
 
+// newFailingCreationTx builds and signs a contract-creation transaction whose
+// init code is the single INVALID opcode (0xfe). geth's core.ApplyMessage
+// accepts the message (100_000 gas is well above the ~53000 intrinsic gas for
+// contract creation with 1-byte init code, and free gas -- see Executor.execute
+// -- means buyGas never requires sender balance), but the EVM interpreter
+// faults on INVALID with vm.ErrInvalidOpCode, which Executor.ApplyMessage
+// wraps as *ExecFailure -- NOT *TxRejected, and NOT a revert (ErrExecutionReverted).
+// This is the deterministic trigger for FIX C1's committed-but-faulted path.
+func newFailingCreationTx(t *testing.T, cfg *params.ChainConfig, key *ecdsa.PrivateKey, nonce uint64) *types.Transaction {
+	t.Helper()
+	signer := types.MakeSigner(cfg, big.NewInt(0), 1_000_000)
+	tx, err := types.SignNewTx(key, signer, &types.LegacyTx{
+		Nonce: nonce,
+		Gas:   100_000,
+		To:    nil,          // contract creation
+		Data:  []byte{0xfe}, // INVALID opcode
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}
+
 // assertSameRWS compares two ReadWriteSets for equality ignoring slice order:
 // StateDB.Result() iterates Go maps when building Reads/Writes, so two
 // independent simulations of the same operations may return them in a
@@ -348,6 +371,128 @@ func TestExecuteBatchExcludesNonceGap(t *testing.T) {
 	// D never appears: the excluded tx contributed nothing to the merged set.
 	if _, ok := mergedWrites[accKey(addrC, "bal")]; !ok {
 		t.Errorf("merged RWS missing C's balance write from tx3; writes = %+v", merged.Writes)
+	}
+}
+
+// TestExecuteBatchExecFailureDoesNotAbort seeds accounts A and B, then runs a
+// 3-tx batch [A->B transfer, F's contract-creation tx whose init code faults
+// with an EVM-level error (INVALID opcode; see newFailingCreationTx), B->C
+// transfer] and asserts (FIX C1):
+//   - ExecuteBatch does NOT abort the whole batch on the middle tx's EVM
+//     fault (no error, 3 results back). Unlike a pre-execution rejection
+//     (*TxRejected), a committed-but-faulted outcome (*ExecFailure) must be
+//     endorsed, not treated as a batch-aborting Go error.
+//   - The middle result's Status is common.StatusExecFailure (460), and its
+//     own RWS carries F's nonce bump (0 -> 1): geth's core.ApplyMessage
+//     commits the nonce increment (and gas deduction) for a faulted-but-applied
+//     message exactly as it would for a success -- only a pre-execution
+//     rejection skips this and reverts the snapshot.
+//   - The other two txs still execute normally and succeed (Status 200), with
+//     tx3 observing tx1's write via the overlay exactly as in
+//     TestExecuteBatchExcludesNonceGap.
+//   - The merged RWS (via MergeResults) carries both included txs' writes AND
+//     the failed tx's nonce-bump write.
+func TestExecuteBatchExecFailureDoesNotAbort(t *testing.T) {
+	backend, err := state.NewWriteDB(Channel, "file:batch_exec_failure?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA, addrA := newTestKey(t)
+	keyB, addrB := newTestKey(t)
+	_, addrC := newTestKey(t)
+	keyF, addrF := newTestKey(t) // F is never seeded; ledger nonce/balance both 0.
+
+	const (
+		initialA = 1_000
+		initialB = 50  // alone, insufficient to cover amount2 below
+		amount1  = 300 // tx1: A -> B
+		amount2  = 100 // tx3: B -> C; needs tx1's delivery (50+300=350 >= 100)
+	)
+	seedAccounts(t, backend, map[ethcommon.Address]int64{addrA: initialA, addrB: initialB})
+
+	kvs := &testVersionedDBSnapshotter{db: backend}
+	cfg := EVMConfig{ChainConfig: common.BuildChainConfig(4011)}
+	engine := NewEVMEngine(Namespace, kvs, cfg, false)
+
+	tx1 := newTransferTx(t, cfg.ChainConfig, keyA, addrB, big.NewInt(amount1), 0)
+	failTx := newFailingCreationTx(t, cfg.ChainConfig, keyF, 0)
+	tx3 := newTransferTx(t, cfg.ChainConfig, keyB, addrC, big.NewInt(amount2), 0)
+
+	results, err := engine.ExecuteBatch(context.Background(), []*types.Transaction{tx1, failTx, tx3})
+	if err != nil {
+		t.Fatalf("ExecuteBatch must endorse an ExecFailure as a committed outcome, not abort the batch: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d", len(results))
+	}
+
+	if results[0].Status != 200 {
+		t.Fatalf("tx1: status = %d, message = %q, want 200 (OK)", results[0].Status, results[0].Message)
+	}
+
+	if results[1].Status != common.StatusExecFailure {
+		t.Fatalf("failTx: status = %d, message = %q, want %d (StatusExecFailure)", results[1].Status, results[1].Message, common.StatusExecFailure)
+	}
+
+	nonceKey := accKey(addrF, "nonce")
+	var nonceWritten bool
+	for _, w := range results[1].RWS.Writes {
+		if w.Key != nonceKey {
+			continue
+		}
+		nonceWritten = true
+		got := bytesToUint64(w.Value)
+		if got != 1 {
+			t.Errorf("F's nonce after failTx = %d, want 1 (geth bumps the nonce for a committed-but-faulted message)", got)
+		}
+	}
+	if !nonceWritten {
+		t.Fatalf("expected failTx's RWS to include a nonce bump for F (key %q); writes = %+v", nonceKey, results[1].RWS.Writes)
+	}
+
+	if results[2].Status != 200 {
+		t.Fatalf("tx3: status = %d, message = %q, want 200 (OK) — tx3 must still execute despite the middle tx's EVM fault", results[2].Status, results[2].Message)
+	}
+
+	balKey := accKey(addrB, "bal")
+	var tx3Wrote bool
+	for _, w := range results[2].RWS.Writes {
+		if w.Key != balKey {
+			continue
+		}
+		tx3Wrote = true
+		got := bytesToUint256(w.Value)
+		want := uint256.NewInt(uint64(initialB + amount1 - amount2))
+		if got.Cmp(want) != 0 {
+			t.Errorf("B balance after tx3 = %s, want %s (initialB=%d + amount1=%d - amount2=%d)",
+				got, want, initialB, amount1, amount2)
+		}
+	}
+	if !tx3Wrote {
+		t.Fatalf("expected tx3's RWS to include a write to B's balance key %q; writes = %+v", balKey, results[2].RWS.Writes)
+	}
+
+	// The merged RWS (what actually lands in the committed Fabric tx) carries
+	// both included txs' writes AND the failed tx's nonce bump.
+	merged, events := MergeResults(results)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (one per result, index = sub-index), got %d", len(events))
+	}
+	mergedWrites := map[string][]byte{}
+	for _, w := range merged.Writes {
+		mergedWrites[w.Key] = w.Value
+	}
+	if _, ok := mergedWrites[accKey(addrA, "bal")]; !ok {
+		t.Errorf("merged RWS missing A's balance write from tx1; writes = %+v", merged.Writes)
+	}
+	if _, ok := mergedWrites[balKey]; !ok {
+		t.Errorf("merged RWS missing B's balance write from tx3; writes = %+v", merged.Writes)
+	}
+	if got, ok := mergedWrites[nonceKey]; !ok {
+		t.Errorf("merged RWS missing F's nonce bump from failTx; writes = %+v", merged.Writes)
+	} else if bytesToUint64(got) != 1 {
+		t.Errorf("merged RWS F's nonce = %d, want 1", bytesToUint64(got))
 	}
 }
 

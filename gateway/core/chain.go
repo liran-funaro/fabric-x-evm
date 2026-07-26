@@ -190,11 +190,13 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 					outcome = outcomes[sub]
 				}
 
-				if outcome.Status == fc.StatusTxRejected {
+				if fc.IsExcludedOutcome(outcome.Status) {
 					// Excluded by the endorser (see EVMEngine.ExecuteBatch's
-					// authoritative pass, Task 8): never executed/committed
-					// with an empty RWS, so it gets no domain tx or receipt,
-					// and the flat TxIndex must not advance for it.
+					// authoritative pass, Task 8) -- retryable (nonce too
+					// high, ...) or terminal (nonce too low): either way,
+					// never executed/committed with an empty RWS, so it gets
+					// no domain tx or receipt, and the flat TxIndex must not
+					// advance for it.
 					continue
 				}
 

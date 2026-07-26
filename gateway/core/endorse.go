@@ -129,24 +129,32 @@ func (e EndorsementClient) ExecuteTransaction(ctx context.Context, tx *types.Tra
 // e.g. a nonce gap — see endorser/execution.EVMEngine.ExecuteBatch's
 // authoritative pass) while still endorsing the rest: the committer tx's Args
 // still carry all of txs (so the FabricTxID/invocation stays the same), but
-// only the included ones actually commit anything. ExecuteBatch decodes which
-// txs were included from the signed response and returns that subset
-// alongside the endorsement, so the caller (the executor's drain loop) knows
-// to leave the excluded ones pending for a future cycle instead of removing
-// them from the pool.
-func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, []*types.Transaction, error) {
+// only the included ones actually commit anything. ExecuteBatch decodes each
+// tx's outcome from the signed response and returns two subsets alongside the
+// endorsement:
+//   - included: actually executed (success, revert, or ExecFailure — every
+//     committed outcome); the caller removes these from the pending pool
+//     once the batch's committer tx commits.
+//   - terminal: excluded for a reason that can never resolve as this exact
+//     tx stands (nonce too low); the caller should evict these from the
+//     pending pool unconditionally, regardless of this batch's own outcome.
+//
+// A tx excluded for a RETRYABLE reason (nonce too high, insufficient funds,
+// ...) appears in neither slice: the caller leaves it pending for a future
+// cycle instead of removing or evicting it.
+func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, []*types.Transaction, []*types.Transaction, error) {
 	args := make([][]byte, 0, len(txs)+1)
 	args = append(args, []byte{byte(common.ProposalTypeEVMBatch)})
 	for _, tx := range txs {
 		b, err := tx.MarshalBinary()
 		if err != nil {
-			return sdk.Endorsement{}, nil, err
+			return sdk.Endorsement{}, nil, nil, err
 		}
 		args = append(args, b)
 	}
 	inv, err := e.createInvocation(args)
 	if err != nil {
-		return sdk.Endorsement{}, nil, err
+		return sdk.Endorsement{}, nil, nil, err
 	}
 
 	// Derive a cancellable context so goroutines can stop early on error
@@ -186,7 +194,7 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 	// Return first error in slice order — stable and deterministic
 	for _, err := range errs {
 		if err != nil {
-			return sdk.Endorsement{}, nil, err
+			return sdk.Endorsement{}, nil, nil, err
 		}
 	}
 
@@ -200,40 +208,61 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 			break
 		}
 	}
-	included, err := includedTxs(signed, txs)
+	included, terminal, err := classifyBatchOutcomes(signed, txs)
 	if err != nil {
-		return sdk.Endorsement{}, nil, fmt.Errorf("decode included txs: %w", err)
+		return sdk.Endorsement{}, nil, nil, fmt.Errorf("decode included txs: %w", err)
 	}
 
 	return sdk.Endorsement{
 		Proposal:  inv.Proposal,
 		Responses: res,
-	}, included, nil
+	}, included, terminal, nil
 }
 
-// includedTxs decodes txs' per-sub-tx outcomes from resp (see
-// decodeProposalResponseOutcomes) and returns the subset that was actually
-// included — i.e. not excluded with common.StatusTxRejected. When outcomes
-// can't be recovered at all (e.g. a bare/test response with no payload), every
-// tx is treated as included: the safe default when there is nothing to
-// exclude on, and what preserves pre-Task-8 "whole batch commits" behavior.
-func includedTxs(resp *peer.ProposalResponse, txs []*types.Transaction) ([]*types.Transaction, error) {
+// classifyBatchOutcomes decodes txs' per-sub-tx outcomes from resp (see
+// decodeProposalResponseOutcomes) and splits txs into:
+//   - included: actually executed (success, revert, or ExecFailure) — i.e.
+//     not excluded at all. Safe to remove from the pending pool once the
+//     batch's committer tx commits.
+//   - terminal: excluded with common.StatusTxRejectedTerminal (nonce too
+//     low): can never succeed as this exact tx stands. Safe to evict from
+//     the pending pool unconditionally — the exclusion reflects ledger state
+//     from BEFORE this cycle's batch ran, so it holds regardless of whether
+//     the rest of this batch goes on to commit, abort, or time out.
+//
+// A tx excluded with common.StatusTxRejected (retryable: nonce too high,
+// insufficient funds, ...) appears in neither slice: the caller leaves it
+// pending for a future cycle.
+//
+// When outcomes can't be recovered at all (e.g. a bare/test response with no
+// payload), every tx is treated as included and terminal is empty: the safe
+// default when there is nothing to exclude on, and what preserves
+// pre-Task-8 "whole batch commits" behavior.
+func classifyBatchOutcomes(resp *peer.ProposalResponse, txs []*types.Transaction) (included, terminal []*types.Transaction, err error) {
 	outcomes, err := decodeProposalResponseOutcomes(resp)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if outcomes == nil {
-		return txs, nil
+		return txs, nil, nil
 	}
 
-	included := make([]*types.Transaction, 0, len(txs))
+	included = make([]*types.Transaction, 0, len(txs))
 	for i, tx := range txs {
-		if i < len(outcomes) && outcomes[i].Status == common.StatusTxRejected {
-			continue // excluded: never committed, caller leaves it pending
+		var status int32
+		if i < len(outcomes) {
+			status = outcomes[i].Status
 		}
-		included = append(included, tx)
+		switch status {
+		case common.StatusTxRejectedTerminal:
+			terminal = append(terminal, tx) // excluded, can never succeed as submitted
+		case common.StatusTxRejected:
+			// excluded, retryable: never committed, caller leaves it pending
+		default:
+			included = append(included, tx)
+		}
 	}
-	return included, nil
+	return included, terminal, nil
 }
 
 // decodeProposalResponseOutcomes recovers the per-sub-tx outcomes

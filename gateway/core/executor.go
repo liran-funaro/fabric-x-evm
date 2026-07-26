@@ -60,17 +60,36 @@ func (g *Gateway) runExecutor(ctx context.Context) {
 func (g *Gateway) executeCycle(ctx context.Context) {
 	batch := g.pending.DrainAll()
 	if len(batch) == 0 {
-		select {
-		case <-ctx.Done():
-		case <-g.arrivals: // signaled by SendTransaction when the pool was empty
-		}
+		g.waitForWork(ctx)
 		return
 	}
 
-	end, included, err := g.endorsers.ExecuteBatch(ctx, batch)
+	end, included, terminal, err := g.endorsers.ExecuteBatch(ctx, batch)
 	if err != nil {
 		logger.Errorf("batch endorse failed (%d txs): %v", len(batch), err)
 		g.backoff(ctx) // txs stay pending; re-drained next cycle
+		return
+	}
+
+	// Evict terminally-excluded txs (nonce too low, ...) unconditionally: the
+	// exclusion reflects ledger state from BEFORE this cycle's batch ran, so
+	// it holds no matter what happens to the rest of this batch below (commit,
+	// abort, or timeout). Left in the pool, a nonce-too-low tx could never
+	// succeed as submitted and would leak forever (see
+	// EndorsementClient.ExecuteBatch / classifyBatchOutcomes).
+	if len(terminal) > 0 {
+		g.pending.Remove(hashesOf(terminal))
+	}
+
+	if len(included) == 0 {
+		// Every drained tx was excluded (e.g. a lone nonce-gap tx with no
+		// filler yet present). There is nothing to submit this cycle:
+		// submitting an empty committer tx would waste a Fabric round-trip,
+		// and looping back to DrainAll immediately (with no backoff) would
+		// busy-spin since the same excluded tx(s) would just be drained again.
+		// Wait for genuinely new work instead, exactly as the empty-pool case
+		// above does.
+		g.waitForWork(ctx)
 		return
 	}
 
@@ -170,6 +189,18 @@ func (g *Gateway) awaitCommit(ctx context.Context, fabricTxID string, ch chan co
 		return nil
 	case <-ctx.Done():
 		return fmt.Errorf("await commit of tx %s: %w", fabricTxID, ctx.Err())
+	}
+}
+
+// waitForWork blocks until either ctx is done or new work arrives (see
+// AddPending's non-blocking signal on g.arrivals). Used both when the pending
+// pool is empty and when a drained batch's every tx was excluded: in both
+// cases there is nothing usable to submit this cycle, and looping back to
+// DrainAll immediately would busy-spin/log-flood for no reason.
+func (g *Gateway) waitForWork(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+	case <-g.arrivals:
 	}
 }
 

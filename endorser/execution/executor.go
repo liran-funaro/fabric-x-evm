@@ -89,6 +89,25 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction) (endorse
 	return e.runOn(state, tx)
 }
 
+// committedFaultStatus classifies a committed-but-faulted EVM outcome -- a
+// revert or an *ExecFailure (out of gas, invalid opcode, ...) -- and reports
+// its endorsable status code. Both are DISTINCT from a pre-execution
+// rejection (*TxRejected): geth's Executor.ApplyMessage bumps the sender's
+// nonce and deducts gas for either one exactly as it would for a success (see
+// its comment), so state.Result() already reflects that write, and the
+// caller must endorse it as a committed outcome rather than abort. Returns
+// (0, false) for anything else (a pre-execution rejection, or a genuine
+// non-EVM error), which the caller must still treat as an error.
+func committedFaultStatus(err error) (int32, bool) {
+	if errors.Is(err, vm.ErrExecutionReverted) {
+		return fxcommon.StatusEVMRevert, true
+	}
+	if _, ok := errors.AsType[*ExecFailure](err); ok {
+		return fxcommon.StatusExecFailure, true
+	}
+	return 0, false
+}
+
 // runOn executes tx against the given state (already constructed over a reader)
 // and returns the endorsement result. It contains the revert/logs/success
 // classification previously inlined in Execute, now shared by Execute and
@@ -101,18 +120,29 @@ func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorse
 
 	ret, err := ex.Send(tx)
 	if err != nil {
-		if !errors.Is(err, vm.ErrExecutionReverted) {
+		status, ok := committedFaultStatus(err)
+		if !ok {
+			// Pre-execution rejection (*TxRejected) or a genuine server-side
+			// fault: never committed, no RWS to endorse. The caller
+			// (Execute, or ExecuteBatch's N==1/N>1 paths) decides whether a
+			// *TxRejected should exclude-not-abort; anything else aborts.
 			return endorsement.ExecutionResult{}, err
 		}
-		// Revert: a committed outcome, endorsed as Status 201 with a revert event.
+		// A committed-but-faulted outcome (revert or ExecFailure): endorsed
+		// with no Go error, exactly like a success, so the batch/single-tx
+		// caller never treats it as an abort. Reuse the revert event marker:
+		// chain.go's legacy single-tx path only needs to know "not a plain
+		// success" from the event shape (see fc.IsRevertEvent), while the
+		// batch path already gets the real status from PerTxOutcome.Status
+		// rather than sniffing the event.
 		event, mErr := fxcommon.MarshalRevert(ret, "", tx.Hash().Hex())
 		if mErr != nil {
-			return endorsement.ExecutionResult{}, fmt.Errorf("marshal revert event: %w", mErr)
+			return endorsement.ExecutionResult{}, fmt.Errorf("marshal fault event: %w", mErr)
 		}
 		return endorsement.ExecutionResult{
 			RWS:     state.Result(),
 			Event:   event,
-			Status:  201,
+			Status:  status,
 			Message: err.Error(),
 			Payload: ret,
 		}, nil
