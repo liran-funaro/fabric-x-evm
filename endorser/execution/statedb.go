@@ -69,11 +69,15 @@ type ReadStore interface {
 	Close() error
 }
 
-// revision represents a snapshot point in the journal.
+// revision represents a snapshot point in the journal: the lengths of the
+// reads, writes, and effects slices (plus logs) at Snapshot() time, so
+// RevertToSnapshot can truncate each back and reverse-replay the effects since.
 type revision struct {
-	id           int
-	journalIndex int
-	logIndex     int
+	id          int
+	readIndex   int
+	writeIndex  int
+	effectIndex int
+	logIndex    int
 }
 
 // accessList tracks addresses and storage slots accessed during transaction execution.
@@ -153,50 +157,59 @@ func (al *accessList) deleteSlot(addr common.Address, slot common.Hash) {
 	delete(al.slots[idx], slot)
 }
 
-// Journal entry types for different operations:
+// The journal was a single []any (boxing every read/write/effect into an
+// interface = one heap allocation per entry -- the #2 allocator in the profile).
+// It is now three un-boxed, purpose-built value slices:
+//
+//   - reads/writes: the hot path. Reads and writes have disjoint payloads and
+//     are consumed independently (getStateFromJournal only inspects writes;
+//     Result folds each into its own map; revert truncates both), so keeping
+//     them apart lets each record hold only its own fields -- far leaner than
+//     one union struct. The MVCC read version is stored inline (value, not
+//     *blocks.Version) so a read no longer allocates a pointer; the single
+//     *blocks.Version is materialized once per unique key in Result().
+//   - effects: the rare EVM-mechanics entries (refund, SELFDESTRUCT, EIP-6780
+//     new-contract, EIP-1153 transient, EIP-2929 access list) that exist only
+//     to be undone by RevertToSnapshot. Their mutual order (per kind) is
+//     preserved, which is all revert needs; they never interleave with the
+//     read/write sets semantically.
+//
+// A revision records the length of all three slices (plus logs) so a snapshot
+// can be reverted by truncating reads/writes/effects and reverse-replaying the
+// effects added since.
+type effectKind uint8
 
-// readEntry records a read from the ReadStore.
-// This creates an MVCC read dependency.
-type readEntry struct {
-	read blocks.KVRead
+const (
+	effRefund       effectKind = iota // gas refund change (carries prevRefund)
+	effSelfDestruct                   // SELFDESTRUCT (carries addr)
+	effNewContract                    // address added to newContracts (EIP-6780)
+	effTransient                      // transient storage change (EIP-1153)
+	effAccessAddr                     // access-list address addition (EIP-2929)
+	effAccessSlot                     // access-list slot addition (EIP-2929)
+)
+
+// readRec is one journaled read: the KVS key plus its inline MVCC version
+// (hasVersion is false when the key was absent, i.e. a nil version in the set).
+type readRec struct {
+	key        string
+	version    blocks.Version
+	hasVersion bool
 }
 
-// writeEntry records a write operation.
-type writeEntry struct {
-	write blocks.KVWrite
+// writeRec is one journaled write or delete.
+type writeRec struct {
+	key      string
+	value    []byte
+	isDelete bool
 }
 
-// refundEntry records a gas refund change.
-type refundEntry struct {
-	prevRefund uint64
-}
-
-// selfDestructEntry records a SELFDESTRUCT operation.
-type selfDestructEntry struct {
-	addr common.Address
-}
-
-// newContractEntry records an address added to newContracts (EIP-6780 tracking).
-type newContractEntry struct {
-	addr common.Address
-}
-
-// transientStorageChange records a transient storage change for snapshot/revert support.
-type transientStorageChange struct {
-	account  common.Address
-	key      common.Hash
-	prevalue common.Hash
-}
-
-// accessListAddAddressEntry records an address addition to the access list.
-type accessListAddAddressEntry struct {
-	addr common.Address
-}
-
-// accessListAddSlotEntry records a slot addition to the access list.
-type accessListAddSlotEntry struct {
-	addr common.Address
-	slot common.Hash
+// effectRec is one reversible EVM-mechanics change (see the effects slice above).
+type effectRec struct {
+	kind       effectKind
+	addr       common.Address // selfDestruct / newContract / access / transient account
+	hash       common.Hash    // effAccessSlot: slot; effTransient: key
+	prevHash   common.Hash    // effTransient: previous value
+	prevRefund uint64         // effRefund: previous refund counter
 }
 
 // StateDB implements ExtendedStateDB by combining ledger state management
@@ -214,8 +227,11 @@ type StateDB struct {
 	accessList       *accessList                                    // EIP-2929/2930 access list (not persisted, reset per transaction)
 	transientStorage map[common.Address]map[common.Hash]common.Hash // EIP-1153 transient storage (not persisted, reset per transaction)
 
-	// Snapshot/revert support: single journal tracks ALL operations
-	journal        []any
+	// Snapshot/revert support: three un-boxed journals (see the readRec /
+	// writeRec / effectRec types) replace the old []any interface journal.
+	reads          []readRec
+	writes         []writeRec
+	effects        []effectRec
 	validRevisions []revision
 	nextRevisionId int
 
@@ -255,7 +271,6 @@ func NewStateDB(ctx context.Context, store ReadStore, namespace string, blockNum
 		newContracts:      make(map[common.Address]struct{}),
 		accessList:        newAccessList(),
 		transientStorage:  make(map[common.Address]map[common.Hash]common.Hash),
-		journal:           make([]any, 0),
 		validRevisions:    make([]revision, 0),
 		nextRevisionId:    0,
 	}, nil
@@ -333,12 +348,12 @@ func storeKey(addr common.Address, slot common.Hash) string {
 // getStateFromJournal scans the journal backwards to find the latest write for a key.
 // Returns the value and true if found, or nil and false if not found.
 func (s *StateDB) getStateFromJournal(key string) ([]byte, bool) {
-	for i := len(s.journal) - 1; i >= 0; i-- {
-		if w, ok := s.journal[i].(writeEntry); ok && w.write.Key == key {
-			if w.write.IsDelete {
+	for i := len(s.writes) - 1; i >= 0; i-- {
+		if w := &s.writes[i]; w.key == key {
+			if w.isDelete {
 				return nil, true
 			}
-			return w.write.Value, true
+			return w.value, true
 		}
 	}
 	return nil, false
@@ -353,7 +368,7 @@ func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
 	}
 
 	var val []byte
-	var read = blocks.KVRead{Key: key}
+	r := readRec{key: key}
 	if record != nil {
 		// Use the value from the record, even if IsDelete is true
 		// (IsDelete: true with non-nil Value happens during snapshot revert)
@@ -362,10 +377,11 @@ func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
 		// Only set version in read set if the key is not marked as deleted
 		// When IsDelete is true, we want a nil version in the read set for MVCC
 		if !record.IsDelete {
+			r.hasVersion = true
 			if s.monotonicVersions {
-				read.Version = &blocks.Version{BlockNum: record.Version}
+				r.version = blocks.Version{BlockNum: record.Version}
 			} else {
-				read.Version = &blocks.Version{
+				r.version = blocks.Version{
 					BlockNum: record.BlockNum,
 					TxNum:    record.TxNum,
 				}
@@ -374,7 +390,7 @@ func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
 	}
 
 	// Journal the read - this creates an MVCC dependency
-	s.journal = append(s.journal, readEntry{read: read})
+	s.reads = append(s.reads, r)
 	return val, nil
 }
 
@@ -393,13 +409,13 @@ func (s *StateDB) getState(key string) ([]byte, error) {
 // putState writes a value to the journal (blind write - no read dependency).
 // Empty values are treated as deletes (standard Fabric behavior).
 func (s *StateDB) putState(key string, value []byte) {
-	write := blocks.KVWrite{Key: key}
+	w := writeRec{key: key}
 	if len(value) == 0 {
-		write.IsDelete = true
+		w.isDelete = true
 	} else {
-		write.Value = value
+		w.value = value
 	}
-	s.journal = append(s.journal, writeEntry{write: write})
+	s.writes = append(s.writes, w)
 }
 
 // -------------------- vm.StateDB interface implementation --------------------
@@ -422,7 +438,7 @@ func (s *StateDB) markNewContract(addr common.Address) {
 	if _, exists := s.newContracts[addr]; exists {
 		return
 	}
-	s.journal = append(s.journal, newContractEntry{addr: addr})
+	s.effects = append(s.effects, effectRec{kind: effNewContract, addr: addr})
 	s.newContracts[addr] = struct{}{}
 }
 
@@ -603,7 +619,7 @@ func (s *StateDB) SelfDestruct(addr common.Address) {
 		s.putState(accKey(addr, "bal"), uint256ToBytes(uint256.NewInt(0)))
 	}
 	if _, isNew := s.newContracts[addr]; isNew {
-		s.journal = append(s.journal, selfDestructEntry{addr: addr})
+		s.effects = append(s.effects, effectRec{kind: effSelfDestruct, addr: addr})
 		s.selfDestructed[addr] = struct{}{}
 	}
 }
@@ -650,7 +666,7 @@ func (s *StateDB) GetRefund() uint64 {
 
 // AddRefund adds to the gas refund counter.
 func (s *StateDB) AddRefund(gas uint64) {
-	s.journal = append(s.journal, refundEntry{prevRefund: s.refund})
+	s.effects = append(s.effects, effectRec{kind: effRefund, prevRefund: s.refund})
 	s.refund += gas
 }
 
@@ -659,7 +675,7 @@ func (s *StateDB) SubRefund(gas uint64) {
 	if gas > s.refund {
 		panic(fmt.Sprintf("Refund counter below zero (gas: %d > refund: %d)", gas, s.refund))
 	}
-	s.journal = append(s.journal, refundEntry{prevRefund: s.refund})
+	s.effects = append(s.effects, effectRec{kind: effRefund, prevRefund: s.refund})
 	s.refund -= gas
 }
 
@@ -681,9 +697,11 @@ func (s *StateDB) Snapshot() int {
 	id := s.nextRevisionId
 	s.nextRevisionId++
 	s.validRevisions = append(s.validRevisions, revision{
-		id:           id,
-		journalIndex: len(s.journal),
-		logIndex:     len(s.logs),
+		id:          id,
+		readIndex:   len(s.reads),
+		writeIndex:  len(s.writes),
+		effectIndex: len(s.effects),
+		logIndex:    len(s.logs),
 	})
 	return id
 }
@@ -704,32 +722,37 @@ func (s *StateDB) RevertToSnapshot(revid int) {
 
 	snapshot := s.validRevisions[idx]
 
-	// Revert in-memory state by replaying journal entries in reverse
-	for i := len(s.journal) - 1; i >= snapshot.journalIndex; i-- {
-		switch e := s.journal[i].(type) {
-		case refundEntry:
+	// Undo reversible EVM-mechanics changes by replaying effects in reverse.
+	// Reads/writes carry no side effects beyond their slices, so truncation
+	// (below) fully reverts them.
+	for i := len(s.effects) - 1; i >= snapshot.effectIndex; i-- {
+		e := &s.effects[i]
+		switch e.kind {
+		case effRefund:
 			s.refund = e.prevRefund
-		case selfDestructEntry:
+		case effSelfDestruct:
 			delete(s.selfDestructed, e.addr)
-		case newContractEntry:
+		case effNewContract:
 			delete(s.newContracts, e.addr)
-		case transientStorageChange:
+		case effTransient:
 			// Revert transient storage to previous value
-			if s.transientStorage[e.account] == nil {
-				s.transientStorage[e.account] = make(map[common.Hash]common.Hash)
+			if s.transientStorage[e.addr] == nil {
+				s.transientStorage[e.addr] = make(map[common.Hash]common.Hash)
 			}
-			s.transientStorage[e.account][e.key] = e.prevalue
-		case accessListAddAddressEntry:
+			s.transientStorage[e.addr][e.hash] = e.prevHash
+		case effAccessAddr:
 			// Revert access list address addition
 			s.accessList.deleteAddress(e.addr)
-		case accessListAddSlotEntry:
+		case effAccessSlot:
 			// Revert access list slot addition
-			s.accessList.deleteSlot(e.addr, e.slot)
+			s.accessList.deleteSlot(e.addr, e.hash)
 		}
 	}
 
-	// Truncate journal, logs, and revisions
-	s.journal = s.journal[:snapshot.journalIndex]
+	// Truncate reads, writes, effects, logs, and revisions
+	s.reads = s.reads[:snapshot.readIndex]
+	s.writes = s.writes[:snapshot.writeIndex]
+	s.effects = s.effects[:snapshot.effectIndex]
 	s.logs = s.logs[:snapshot.logIndex]
 	s.validRevisions = s.validRevisions[:idx]
 }
@@ -739,13 +762,23 @@ func (s *StateDB) Result() blocks.ReadWriteSet {
 	reads := make(map[string]blocks.KVRead)
 	writes := make(map[string]blocks.KVWrite)
 
-	for _, entry := range s.journal {
-		switch e := entry.(type) {
-		case readEntry:
-			reads[e.read.Key] = e.read
-		case writeEntry:
-			writes[e.write.Key] = e.write
+	for i := range s.reads {
+		r := &s.reads[i]
+		// First-seen wins: every read of a key under one view carries the same
+		// version, so this matches the old last-seen assignment while allocating
+		// the *blocks.Version at most once per unique key.
+		if _, ok := reads[r.key]; !ok {
+			var vptr *blocks.Version
+			if r.hasVersion {
+				v := r.version
+				vptr = &v
+			}
+			reads[r.key] = blocks.KVRead{Key: r.key, Version: vptr}
 		}
+	}
+	for i := range s.writes {
+		w := &s.writes[i]
+		writes[w.key] = blocks.KVWrite{Key: w.key, IsDelete: w.isDelete, Value: w.value}
 	}
 
 	rws := blocks.ReadWriteSet{
@@ -780,10 +813,11 @@ func (s *StateDB) SetTransientState(addr common.Address, key, value common.Hash)
 	prev := s.GetTransientState(addr, key)
 
 	// Create journal entry to track the change
-	s.journal = append(s.journal, transientStorageChange{
-		account:  addr,
-		key:      key,
-		prevalue: prev,
+	s.effects = append(s.effects, effectRec{
+		kind:     effTransient,
+		addr:     addr,
+		hash:     key,
+		prevHash: prev,
 	})
 
 	// Set the new value
@@ -810,7 +844,7 @@ func (s *StateDB) AddAddressToAccessList(addr common.Address) {
 	if s.accessList.containsAddress(addr) {
 		return
 	}
-	s.journal = append(s.journal, accessListAddAddressEntry{addr: addr})
+	s.effects = append(s.effects, effectRec{kind: effAccessAddr, addr: addr})
 	s.accessList.addAddress(addr)
 }
 
@@ -822,10 +856,10 @@ func (s *StateDB) AddSlotToAccessList(addr common.Address, slot common.Hash) {
 	}
 	// Add address journal entry if address is not present
 	if !addrOk {
-		s.journal = append(s.journal, accessListAddAddressEntry{addr: addr})
+		s.effects = append(s.effects, effectRec{kind: effAccessAddr, addr: addr})
 	}
 	// Always add slot journal entry
-	s.journal = append(s.journal, accessListAddSlotEntry{addr: addr, slot: slot})
+	s.effects = append(s.effects, effectRec{kind: effAccessSlot, addr: addr, hash: slot})
 	s.accessList.addSlot(addr, slot)
 }
 
