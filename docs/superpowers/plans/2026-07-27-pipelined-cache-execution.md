@@ -559,4 +559,14 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 
 **Type consistency:** `VersionedCache` methods (`Read`/`ApplyWrites`/`NoteCommitted`/`NoteInvalidated`/`DrainEvictions`/`Len`) are used with identical signatures in Tasks 2, 4, 5, 6. `NewCachedSnapshotter(execution.KVSSnapshotter, *VersionedCache) execution.KVSSnapshotter` consistent Tasks 2–3. `resolveInflight(string,bool)` / `cascadeFrom(string)` / `trackInflight(string,[]*types.Transaction)` consistent Tasks 4–6. `Watch(string)` consistent Tasks 4, 6.
 
-**Open risk flagged for review:** blind write of a *pre-existing* key not in the read-set would get spec version 0 (wrong); correct for read-modify-write workloads (EVM SLOADs before SSTORE; nonce/balance always read). If a real workload does blind overwrites, `ApplyWrites` needs a committed-version lookup — note for Task 1 hardening if it arises.
+**Blind-write base version — RESOLVED (do not leave as a risk).** `ApplyWrites` needs a committed base version for every written key that is not already cached. This is guaranteed: the EVM SLOADs before every SSTORE (EIP-2200/2929 gas metering), and `StateDB` reads before writing every account field (`AddBalance`/`SubBalance` call `GetBalance`, the nonce is read in `PrepareMessage`, `SetCode` calls `GetCode`), so the authoritative read-set already carries a versioned read for every written key. To make it airtight rather than rely on geth internals, add a **warm-pass safety read**: ensure the RWS carries a versioned read for every written key even if some future path writes without reading. Implement in Task 1a below; it is safe in the CFT sole-writer model (the added read cannot cause a spurious conflict — no competing writer exists).
+
+### Task 1a: Guarantee a base version for every written key
+
+**Files:** Modify `endorser/execution/statedb.go` (write path / `Result`), Test `endorser/execution/statedb_test.go` (or the flow tests).
+
+- [ ] **Step 1: Failing test** — build a `StateDB` over a reader where key `k` has committed version 5; perform a write to `k` WITHOUT a prior `GetState`; assert `Result().Reads` contains `k` with version 5 (a versioned read was captured for the write).
+- [ ] **Step 2: Run — expect FAIL** (blind write leaves `k` out of the read-set).
+- [ ] **Step 3: Implement** — in `Result()` (RWS build), for every write key with no read-set entry, fetch its committed record via the store once and add a versioned `KVRead` (dedup against existing reads; a key already read is untouched). Keep the existing `SetState` prev-read behavior; this only ensures the read-set is complete for spec-version derivation.
+- [ ] **Step 4: Run — expect PASS**; run `./endorser/execution/... -race` and the flow benchmarks (must stay >100K — this is one guarded store read per otherwise-blind write, ~zero for real read-modify-write txs).
+- [ ] **Step 5: Commit** — `feat(execution): ensure every written key carries a versioned read (spec-version base)`
