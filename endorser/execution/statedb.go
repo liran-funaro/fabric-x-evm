@@ -36,8 +36,10 @@ package execution
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math/big"
+	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -288,18 +290,42 @@ func NewStateDBWithDualState(ctx context.Context, store ReadStore, namespace str
 
 // Helper functions for key generation
 // accKey / storeKey derive the internal KVS keys for an account field / storage
-// slot. They use common.Bytes2Hex (plain lowercase hex) rather than addr.Hex(),
-// which computes an EIP-55 keccak256 checksum on every call -- pure waste for an
-// internal, non-user-facing key and, per profiling, the single largest allocator
-// and a top CPU cost in execution. The downstream parser (gateway/storage/trie)
-// uses common.HexToAddress/HexToHash, which are case- and 0x-prefix-insensitive,
-// so the keys remain parseable.
+// slot. They use plain lowercase hex rather than addr.Hex(), which computes an
+// EIP-55 keccak256 checksum on every call -- pure waste for an internal,
+// non-user-facing key and, per profiling, the single largest allocator and a top
+// CPU cost in execution. The downstream parser (gateway/storage/trie) uses
+// common.HexToAddress/HexToHash, which are case- and 0x-prefix-insensitive, so
+// the keys remain parseable.
+//
+// Each key is built in a SINGLE allocation: the previous "acc:"+Bytes2Hex(...)+
+// ":"+typ form allocated twice (the hex string, then the concatenation) on every
+// state access -- together the largest allocator in the profile. Here the exact
+// byte length is computed up front, hex is encoded directly into the buffer, and
+// unsafe.String hands the finished buffer to the string without a copy (the
+// buffer is never mutated or aliased afterward). The output is byte-for-byte
+// identical to the old form.
 func accKey(addr common.Address, typ string) string {
-	return "acc:" + common.Bytes2Hex(addr[:]) + ":" + typ
+	const prefix = "acc:"
+	buf := make([]byte, len(prefix)+2*len(addr)+1+len(typ))
+	n := copy(buf, prefix)
+	hex.Encode(buf[n:], addr[:])
+	n += 2 * len(addr)
+	buf[n] = ':'
+	n++
+	copy(buf[n:], typ)
+	return unsafe.String(&buf[0], len(buf))
 }
 
 func storeKey(addr common.Address, slot common.Hash) string {
-	return "str:" + common.Bytes2Hex(addr[:]) + ":" + common.Bytes2Hex(slot[:])
+	const prefix = "str:"
+	buf := make([]byte, len(prefix)+2*len(addr)+1+2*len(slot))
+	n := copy(buf, prefix)
+	hex.Encode(buf[n:], addr[:])
+	n += 2 * len(addr)
+	buf[n] = ':'
+	n++
+	hex.Encode(buf[n:], slot[:])
+	return unsafe.String(&buf[0], len(buf))
 }
 
 // -------------------- Internal state query helpers --------------------
