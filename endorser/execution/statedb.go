@@ -789,7 +789,30 @@ func (s *StateDB) RevertToSnapshot(revid int) {
 	s.validRevisions = s.validRevisions[:idx]
 }
 
+// toKVRead converts a journaled read record into a blocks.KVRead, materializing
+// the *blocks.Version at most once (nil when the key was absent or deleted).
+func toKVRead(key string, r *readRec) blocks.KVRead {
+	var vptr *blocks.Version
+	if r.hasVersion {
+		v := r.version
+		vptr = &v
+	}
+	return blocks.KVRead{Key: key, Version: vptr}
+}
+
 // Result returns the read-write set containing all non-reverted operations.
+//
+// Every written key is guaranteed a read-set entry: VersionedCache.ApplyWrites
+// (the cross-batch cache, gateway/core/versioned_cache.go) derives each
+// written key's speculative MVCC version from its READ in this same RWS -- a
+// write with no matching read looks like a from-genesis write (spec version
+// 0) even if the key already has committed history. The EVM's SLOAD-before-
+// SSTORE (EIP-2929) and this StateDB's read-before-write balance/nonce/code
+// helpers make that hold today, but SetState's blind write and CreateAccount's
+// zeroing writes do NOT journal a read -- so below, any write key still
+// missing from the read set is backfilled with ONE store fetch, recorded
+// exactly as getStateFromStore would record it. Keys already read (the common
+// read-modify-write case) are left untouched and are not re-fetched.
 func (s *StateDB) Result() blocks.ReadWriteSet {
 	reads := make(map[string]blocks.KVRead)
 	writes := make(map[string]blocks.KVWrite)
@@ -800,17 +823,28 @@ func (s *StateDB) Result() blocks.ReadWriteSet {
 		// version, so this matches the old last-seen assignment while allocating
 		// the *blocks.Version at most once per unique key.
 		if _, ok := reads[r.key]; !ok {
-			var vptr *blocks.Version
-			if r.hasVersion {
-				v := r.version
-				vptr = &v
-			}
-			reads[r.key] = blocks.KVRead{Key: r.key, Version: vptr}
+			reads[r.key] = toKVRead(r.key, r)
 		}
 	}
 	for i := range s.writes {
 		w := &s.writes[i]
 		writes[w.key] = blocks.KVWrite{Key: w.key, IsDelete: w.isDelete, Value: w.value}
+	}
+
+	// Backfill a base version for every write key with no read-set entry (see
+	// the doc comment above). getStateFromStore appends the fetched record to
+	// s.reads too; harmless here since Result() is the last thing done with a
+	// StateDB before it is either discarded or reset (which truncates s.reads
+	// back to empty) for the next tx.
+	for key := range writes {
+		if _, ok := reads[key]; ok {
+			continue
+		}
+		if _, err := s.getStateFromStore(key); err != nil {
+			s.setError(fmt.Errorf("Result failed to backfill read for write key %q: %w", key, err))
+			continue
+		}
+		reads[key] = toKVRead(key, &s.reads[len(s.reads)-1])
 	}
 
 	rws := blocks.ReadWriteSet{
