@@ -51,11 +51,16 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	defer reader.Close()
 
 	if len(txs) == 1 {
-		state, err := e.newState(reader)
-		if err != nil {
-			return nil, err
+		var res endorsement.ExecutionResult
+		var err error
+		if e.stateDecorator == nil && !e.evmConfig.DebugLogs {
+			res, err = e.executeReusing(reader, txs[0])
+		} else {
+			var state ExtendedStateDB
+			if state, err = e.newState(reader); err == nil {
+				res, err = e.runOn(state, txs[0])
+			}
 		}
-		res, err := e.runOn(state, txs[0])
 		if err != nil {
 			if rej, ok := errors.AsType[*TxRejected](err); ok {
 				// Excluded, not aborted: align with the len(txs)>1 path below
@@ -227,6 +232,37 @@ func (e *EVMEngine) newReusableExecutor(store ReadStore) (*StateDB, *Executor, e
 	}
 	ex.primeEVM()
 	return sdb, ex, nil
+}
+
+// getExec returns a reusableExec ready to run against store: a recycled one from
+// the pool (reset in place) or a freshly built one. Fast path only.
+func (e *EVMEngine) getExec(store ReadStore) (*reusableExec, error) {
+	if v := e.execPool.Get(); v != nil {
+		re := v.(*reusableExec)
+		re.sdb.reset(store)
+		return re, nil
+	}
+	sdb, ex, err := e.newReusableExecutor(store)
+	if err != nil {
+		return nil, err
+	}
+	return &reusableExec{sdb: sdb, ex: ex}, nil
+}
+
+// putExec returns re to the pool for reuse by a later single-tx execution.
+func (e *EVMEngine) putExec(re *reusableExec) { e.execPool.Put(re) }
+
+// executeReusing runs one tx on a pooled, reused StateDB+Executor and returns
+// the raw classification, exactly as runOn would over a fresh newState(reader)
+// -- minus the production-nil decorator. Used by the single-tx fast path
+// (Execute and ExecuteBatch's N==1 case).
+func (e *EVMEngine) executeReusing(reader ReadStore, tx *types.Transaction) (endorsement.ExecutionResult, error) {
+	re, err := e.getExec(reader)
+	if err != nil {
+		return endorsement.ExecutionResult{}, err
+	}
+	defer e.putExec(re)
+	return e.classify(re.ex, re.sdb, tx)
 }
 
 // newState builds an ExtendedStateDB over reader, wrapping it with StateDBLogger

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -68,6 +69,20 @@ type EVMEngine struct {
 	// (e.g. balance/nonce priming keyed on the individual tx); see
 	// testimpl.EVMEngineWrapper.SetBalancePriming.
 	stateDecorator func(ExtendedStateDB, *types.Transaction) ExtendedStateDB
+
+	// execPool recycles reusableExec (a StateDB+Executor+primed EVM) across the
+	// single-tx paths (Execute and ExecuteBatch's N==1 case), which otherwise
+	// rebuild all per-tx machinery on every call. sync.Pool makes reuse safe
+	// under concurrent Execute calls: each caller gets its own instance. Only
+	// used on the fast path (no decorator, no debug logging).
+	execPool sync.Pool
+}
+
+// reusableExec bundles a StateDB with the Executor (and primed EVM) bound to it,
+// so a pooled unit can be reset in place and re-run without rebuilding either.
+type reusableExec struct {
+	sdb *StateDB
+	ex  *Executor
 }
 
 // NewEVMEngine creates a new EVMEngine.
@@ -102,6 +117,12 @@ func (e *EVMEngine) Execute(ctx context.Context, tx *types.Transaction) (endorse
 		return endorsement.ExecutionResult{}, err
 	}
 	defer reader.Close()
+
+	// Fast path (production): run on a pooled, reused StateDB+Executor so
+	// repeated Execute calls do not rebuild all per-tx machinery.
+	if e.stateDecorator == nil && !e.evmConfig.DebugLogs {
+		return e.executeReusing(reader, tx)
+	}
 
 	state, err := e.newState(reader)
 	if err != nil {
