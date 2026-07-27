@@ -34,6 +34,12 @@ type EVMConfig struct {
 	MaxTxGas uint64
 	// DebugLogs wraps the per-tx StateDB in StateDBLogger when true.
 	DebugLogs bool
+	// WarmWorkers bounds the concurrency of ExecuteBatch's warm pass. 0 means
+	// runtime.GOMAXPROCS. A bounded pool avoids the scheduler churn of spawning
+	// one goroutine per tx (profiling showed that churn dominated batch CPU);
+	// deployments with high query-service read latency may raise it to overlap
+	// more concurrent reads.
+	WarmWorkers int
 }
 
 // KVSSnapshotter is the port execution uses to obtain a versioned read snapshot

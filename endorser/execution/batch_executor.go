@@ -9,7 +9,9 @@ package execution
 import (
 	"context"
 	"errors"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -67,29 +69,44 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		return []endorsement.ExecutionResult{res}, nil
 	}
 
-	// Warm pass: run every tx concurrently against the shared snapshot. Each tx
-	// gets its own state so concurrent execution can't corrupt a shared journal.
-	// Results and errors are intentionally discarded (`_, _ =`): this pass exists
-	// only to warm a caching reader (e.g. the query-service view backing
-	// `reader`) before the sequential pass below, which is what surfaces real
-	// results and errors. A tx that would fail here (e.g. against pre-batch
-	// state) is not a bug — the authoritative pass is what runs for real.
+	// Warm pass: run every tx against the shared snapshot to warm any caching
+	// reader (e.g. the query-service view backing `reader`) before the sequential
+	// pass below, which is what surfaces real results and errors. A tx that would
+	// fail here (e.g. against pre-batch state) is not a bug.
+	//
+	// A BOUNDED worker pool -- not one goroutine per tx -- pulls txs via an atomic
+	// index: spawning a goroutine per tx made scheduler park/unpark churn (usleep,
+	// cond_wait/signal) dominate batch CPU in profiling. Each worker gets its own
+	// per-tx state so concurrent execution never shares a journal.
+	warmWorkers := e.evmConfig.WarmWorkers
+	if warmWorkers <= 0 {
+		warmWorkers = runtime.GOMAXPROCS(0)
+	}
+	if warmWorkers > len(txs) {
+		warmWorkers = len(txs)
+	}
+	var next atomic.Int64
 	var wg sync.WaitGroup
-	for _, tx := range txs {
+	for range warmWorkers {
 		wg.Add(1)
-		go func(tx *types.Transaction) {
+		go func() {
 			defer wg.Done()
-			// The StateDB accessors panic when the underlying store returns a
-			// read error (as opposed to the clean absent-key (nil, nil) case),
-			// and PrepareMessage reads the sender's nonce before anything else.
-			// A transient reader error in this best-effort warm pass must not
-			// crash the endorser: recover and leave the key un-warmed. The
-			// authoritative pass re-runs the tx and surfaces any real error.
-			defer func() { _ = recover() }()
-			if s, err := e.newState(reader); err == nil {
-				_, _ = e.runOn(s, tx) // warm only; ignore result/error.
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= len(txs) {
+					return
+				}
+				// StateDB accessors record a read error rather than panic now,
+				// but recover defensively: a warm-pass failure must never crash
+				// the endorser -- the authoritative pass re-runs and surfaces it.
+				func(tx *types.Transaction) {
+					defer func() { _ = recover() }()
+					if s, err := e.newState(reader); err == nil {
+						_, _ = e.runOn(s, tx) // warm only; ignore result/error.
+					}
+				}(txs[i])
 			}
-		}(tx)
+		}()
 	}
 	wg.Wait()
 

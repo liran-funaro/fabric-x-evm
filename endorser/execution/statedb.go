@@ -287,12 +287,19 @@ func NewStateDBWithDualState(ctx context.Context, store ReadStore, namespace str
 }
 
 // Helper functions for key generation
+// accKey / storeKey derive the internal KVS keys for an account field / storage
+// slot. They use common.Bytes2Hex (plain lowercase hex) rather than addr.Hex(),
+// which computes an EIP-55 keccak256 checksum on every call -- pure waste for an
+// internal, non-user-facing key and, per profiling, the single largest allocator
+// and a top CPU cost in execution. The downstream parser (gateway/storage/trie)
+// uses common.HexToAddress/HexToHash, which are case- and 0x-prefix-insensitive,
+// so the keys remain parseable.
 func accKey(addr common.Address, typ string) string {
-	return "acc:" + addr.Hex() + ":" + typ
+	return "acc:" + common.Bytes2Hex(addr[:]) + ":" + typ
 }
 
 func storeKey(addr common.Address, slot common.Hash) string {
-	return "str:" + addr.Hex() + ":" + slot.Hex()
+	return "str:" + common.Bytes2Hex(addr[:]) + ":" + common.Bytes2Hex(slot[:])
 }
 
 // -------------------- Internal state query helpers --------------------
