@@ -144,7 +144,16 @@ func (e *EVMEngine) runOn(state ExtendedStateDB, tx *types.Transaction) (endorse
 	if err != nil {
 		return endorsement.ExecutionResult{}, err
 	}
+	return e.classify(ex, state, tx)
+}
 
+// classify runs tx on the given (already-built) Executor and turns the raw EVM
+// outcome into an endorsement result: a committed-but-faulted outcome (revert /
+// ExecFailure) becomes a Go-error-free result with the right status, everything
+// else propagates. Extracted from runOn so the batch fast path can drive it with
+// a REUSED Executor+StateDB (reset between txs) while keeping identical
+// classification. state must be the same StateDB the Executor was built over.
+func (e *EVMEngine) classify(ex *Executor, state ExtendedStateDB, tx *types.Transaction) (endorsement.ExecutionResult, error) {
 	ret, err := ex.Send(tx)
 	if err != nil {
 		status, ok := committedFaultStatus(err)
@@ -327,13 +336,28 @@ func (e *EVMEngine) newSnapshotAt(blockNumber *big.Int) (ExtendedStateDB, ReadSt
 	return stateDB, reader, nil
 }
 
-// Executor is a per-transaction EVM execution context.
+// Executor is an EVM execution context. Historically one-per-transaction, it can
+// now be reused across a batch's transactions (see EVMEngine.ExecuteBatch): the
+// block context, signer and EVM are fixed for a whole batch, so they are built
+// once here and reused, and the per-tx StateDB is reset in place between txs.
 type Executor struct {
 	state    ExtendedStateDB
 	reader   ReadStore // reader that must be closed when done
 	ChainCfg *params.ChainConfig
 	BlockCtx vm.BlockContext
 	maxTxGas uint64
+
+	// signer is derived solely from ChainCfg + block number/time (all fixed for
+	// this Executor), so it is computed once here rather than per PrepareMessage.
+	signer types.Signer
+
+	// evm, when non-nil, is reused across ApplyMessage calls instead of building
+	// a fresh vm.EVM per tx. Safe because geth's stateTransition sets a fresh
+	// TxContext per tx (SetTxContext), call depth returns to 0 after each
+	// top-level call, and the jump-dest cache is code-keyed; Release (which
+	// recycles the stack arena) is never called between txs. It is bound to
+	// `state`, so reuse requires resetting that StateDB in place, not swapping it.
+	evm *vm.EVM
 }
 
 // NewExecutor creates an Executor with the provided StateDB and reader.
@@ -377,7 +401,16 @@ func NewExecutor(stateDB ExtendedStateDB, reader ReadStore, blockNumber *big.Int
 		ChainCfg: evmConfig.ChainConfig,
 		BlockCtx: blockCtx,
 		maxTxGas: evmConfig.MaxTxGas,
+		signer:   types.MakeSigner(evmConfig.ChainConfig, blockCtx.BlockNumber, blockCtx.Time),
 	}, nil
+}
+
+// primeEVM binds a reusable vm.EVM to this Executor so ApplyMessage no longer
+// builds a fresh one per tx. Call once after construction on the batch fast
+// path; the EVM is bound to h.state, so that StateDB must be reset in place
+// (not replaced) between txs.
+func (h *Executor) primeEVM() {
+	h.evm = vm.NewEVM(h.BlockCtx, h.state, h.ChainCfg, vm.Config{})
 }
 
 // Close releases the reader's snapshot reference.
@@ -483,9 +516,7 @@ func (h *Executor) Call(msg ethereum.CallMsg) ([]byte, error) {
 // core.Message. Exported for testimpl wrappers that build a message without the
 // production free-gas defaults.
 func (h *Executor) PrepareMessage(tx *types.Transaction) (*core.Message, error) {
-	signer := types.MakeSigner(h.ChainCfg, h.BlockCtx.BlockNumber, h.BlockCtx.Time)
-
-	from, err := types.Sender(signer, tx)
+	from, err := types.Sender(h.signer, tx)
 	if err != nil {
 		return nil, err
 	}
@@ -499,7 +530,7 @@ func (h *Executor) PrepareMessage(tx *types.Transaction) (*core.Message, error) 
 		return nil, core.ErrNonceTooHigh
 	}
 
-	return core.TransactionToMessage(tx, signer, h.BlockCtx.BaseFee)
+	return core.TransactionToMessage(tx, h.signer, h.BlockCtx.BaseFee)
 }
 
 // Send validates nonce, converts tx to a message, applies production defaults, and executes.
@@ -547,7 +578,13 @@ func (h *Executor) execute(msg *core.Message) ([]byte, error) {
 // ApplyMessage runs msg on the EVM exactly as provided, without production defaults.
 // Use this in test infrastructure (testimpl) when real gas pricing is needed.
 func (h *Executor) ApplyMessage(msg *core.Message) ([]byte, error) {
-	evm := vm.NewEVM(h.BlockCtx, h.state, h.ChainCfg, vm.Config{})
+	// Reuse the bound EVM if one was primed (batch path); otherwise build a
+	// fresh one (single-tx path). stateTransition sets a fresh TxContext per tx,
+	// so a reused EVM starts each tx clean.
+	evm := h.evm
+	if evm == nil {
+		evm = vm.NewEVM(h.BlockCtx, h.state, h.ChainCfg, vm.Config{})
+	}
 
 	// Snapshot before execution mirrors geth's approach and allows reverting on error.
 	snapshot := h.state.Snapshot()

@@ -69,6 +69,14 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		return []endorsement.ExecutionResult{res}, nil
 	}
 
+	// The fast path (production: no per-tx decorator, no debug logging) reuses
+	// one StateDB+Executor per warm-pass worker and one for the whole
+	// authoritative pass, resetting the StateDB in place between txs, so the
+	// per-tx machinery (StateDB maps, access list, block context, signer, EVM)
+	// is built once instead of per tx. The slow path (a decorator or debug
+	// logging wraps each StateDB) keeps building fresh per-tx state via newState.
+	fast := e.stateDecorator == nil && !e.evmConfig.DebugLogs
+
 	// Warm pass: run every tx against the shared snapshot to warm any caching
 	// reader (e.g. the query-service view backing `reader`) before the sequential
 	// pass below, which is what surfaces real results and errors. A tx that would
@@ -91,6 +99,17 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// Fast path: one reused StateDB+Executor for this worker, reset per
+			// tx. Each worker owns its own, so concurrent warming never shares
+			// mutable state (verified under -race).
+			var sdb *StateDB
+			var ex *Executor
+			if fast {
+				var err error
+				if sdb, ex, err = e.newReusableExecutor(reader); err != nil {
+					return
+				}
+			}
 			for {
 				i := int(next.Add(1)) - 1
 				if i >= len(txs) {
@@ -101,6 +120,11 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 				// the endorser -- the authoritative pass re-runs and surfaces it.
 				func(tx *types.Transaction) {
 					defer func() { _ = recover() }()
+					if fast {
+						sdb.reset(reader)
+						_, _ = e.classify(ex, sdb, tx) // warm only; ignore result/error.
+						return
+					}
 					if s, err := e.newState(reader); err == nil {
 						_, _ = e.runOn(s, tx) // warm only; ignore result/error.
 					}
@@ -114,12 +138,28 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	// overlay carrying every earlier tx's writes from this batch.
 	overlay := &overlayReader{under: reader, writes: map[string]*blocks.WriteRecord{}}
 	out := make([]endorsement.ExecutionResult, 0, len(txs))
-	for _, tx := range txs {
-		state, err := e.newState(overlay)
-		if err != nil {
+	// Fast path: one reused StateDB+Executor for the whole (serial) pass, reset
+	// against the overlay before each tx.
+	var authSdb *StateDB
+	var authEx *Executor
+	if fast {
+		var err error
+		if authSdb, authEx, err = e.newReusableExecutor(overlay); err != nil {
 			return nil, err
 		}
-		res, err := e.runOn(state, tx)
+	}
+	for _, tx := range txs {
+		var res endorsement.ExecutionResult
+		var err error
+		if fast {
+			authSdb.reset(overlay)
+			res, err = e.classify(authEx, authSdb, tx)
+		} else {
+			var state ExtendedStateDB
+			if state, err = e.newState(overlay); err == nil {
+				res, err = e.runOn(state, tx)
+			}
+		}
 		if err != nil {
 			if rej, ok := errors.AsType[*TxRejected](err); ok {
 				// Excluded, not aborted: a client-rejected tx (nonce gap, bad
@@ -168,6 +208,25 @@ func excludedResult(rej *TxRejected) endorsement.ExecutionResult {
 		Status:  status,
 		Message: rej.Error(),
 	}
+}
+
+// newReusableExecutor builds a bare *StateDB and an *Executor (with a primed,
+// reusable EVM) bound to it, for the batch fast path. The pair is reused across
+// many txs: reset the StateDB in place (which the Executor and EVM both point
+// at) between txs. Only valid when no decorator/debug wrapping is in play (the
+// caller gates on `fast`), so the concrete *StateDB -- required by reset -- is
+// exactly what the Executor holds.
+func (e *EVMEngine) newReusableExecutor(store ReadStore) (*StateDB, *Executor, error) {
+	sdb, err := NewStateDB(context.TODO(), store, e.namespace, 0, e.monotonicVersions)
+	if err != nil {
+		return nil, nil, err
+	}
+	ex, err := NewExecutor(sdb, noopCloser{}, nil, e.evmConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+	ex.primeEVM()
+	return sdb, ex, nil
 }
 
 // newState builds an ExtendedStateDB over reader, wrapping it with StateDBLogger

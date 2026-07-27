@@ -143,6 +143,14 @@ func (al *accessList) deleteAddress(addr common.Address) {
 	delete(al.addresses, addr)
 }
 
+// reset empties the access list for reuse across transactions, keeping the
+// backing map and slot-slice capacity so Prepare no longer allocates a fresh
+// access list (newAccessList was a top allocator) on every tx.
+func (al *accessList) reset() {
+	clear(al.addresses)
+	al.slots = al.slots[:0]
+}
+
 // deleteSlot removes a storage slot from the access list.
 // This is used when reverting snapshots.
 func (al *accessList) deleteSlot(addr common.Address, slot common.Hash) {
@@ -257,6 +265,30 @@ func (s *StateDB) setError(err error) {
 // Error returns the first backing-store read error recorded during execution,
 // or nil if every read succeeded. See the dbErr field.
 func (s *StateDB) Error() error { return s.dbErr }
+
+// reset returns the StateDB to its freshly-constructed state while retaining
+// every allocated map and slice, so a batch can reuse ONE StateDB across its
+// transactions instead of building a fresh one per tx (NewStateDB's maps and the
+// access-list map were among the top allocators). store becomes the new backing
+// reader -- the authoritative pass swaps the shared snapshot for the write
+// overlay between txs. A Result() taken before reset stays valid: it copies keys
+// and values into its own maps, so clearing the journals here does not disturb it.
+// NOT safe for concurrent use: each warm-pass worker owns its own StateDB.
+func (s *StateDB) reset(store ReadStore) {
+	s.store = store
+	s.refund = 0
+	s.dbErr = nil
+	s.nextRevisionId = 0
+	s.logs = s.logs[:0]
+	s.reads = s.reads[:0]
+	s.writes = s.writes[:0]
+	s.effects = s.effects[:0]
+	s.validRevisions = s.validRevisions[:0]
+	clear(s.selfDestructed)
+	clear(s.newContracts)
+	clear(s.transientStorage)
+	s.accessList.reset()
+}
 
 // NewStateDB creates a new StateDB backed by the given ReadStore.
 // If blockNum is 0, the current block number is queried from store.
@@ -866,8 +898,9 @@ func (s *StateDB) AddSlotToAccessList(addr common.Address, slot common.Hash) {
 // Prepare initializes the access list and transient storage for a new transaction.
 // This follows EIP-2929 (Berlin) and EIP-2930 semantics.
 func (s *StateDB) Prepare(rules params.Rules, sender, coinbase common.Address, dest *common.Address, precompiles []common.Address, txAccesses types.AccessList) {
-	// Reset access list for new transaction (EIP-2929)
-	s.accessList = newAccessList()
+	// Reset access list for new transaction (EIP-2929). Reusing the existing
+	// list's map (rather than newAccessList) avoids a per-tx allocation.
+	s.accessList.reset()
 
 	// Add sender to access list
 	s.accessList.addAddress(sender)
