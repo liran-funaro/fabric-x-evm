@@ -30,12 +30,20 @@ import (
 // query service and the returned *storage.RevertibleLightKVS is nil. In "memory" mode
 // the store reads from an in-process RevertibleLightKVS, which is also returned so the
 // caller can register it as a block handler and use its revert API (test RPC).
+//
+// cacheWrap, if non-nil, is applied to the store before it is handed to the EVM engine,
+// layering the gateway's cross-batch VersionedCache over the read path (see
+// gateway/core.NewCachedSnapshotter). nil means identity -- the engine reads the store
+// directly. endorser/app cannot import gateway/core (that would invert the dependency),
+// so the cache-wrapping closure is built and owned by the caller that wires up both the
+// endorsers and the gateway sharing one cache instance.
 func NewEndorserCore(
 	cfg config.Endorser,
 	channel, namespace, protocol string,
 	signer sdk.Signer,
 	evmConfig execution.EVMConfig,
 	testImpl bool,
+	cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter,
 ) (*core.Endorser, execution.KVSSnapshotter, *storage.RevertibleLightKVS, endorsement.Builder, error) {
 	var store execution.KVSSnapshotter
 	var back *storage.RevertibleLightKVS
@@ -63,8 +71,13 @@ func NewEndorserCore(
 		builder = efab.NewEndorsementBuilder(signer)
 	}
 
+	snap := execution.KVSSnapshotter(store)
+	if cacheWrap != nil {
+		snap = cacheWrap(snap)
+	}
+
 	end, err := core.New(
-		execution.NewEVMEngine(namespace, store, evmConfig, monotonicVersions),
+		execution.NewEVMEngine(namespace, snap, evmConfig, monotonicVersions),
 		builder,
 	)
 	if err != nil {
@@ -79,12 +92,15 @@ func NewEndorserCore(
 // (query-service reads, or feeding the returned RevertibleLightKVS in "memory" mode) is
 // owned by the caller. Returns the endorser and, in "memory" mode, the
 // RevertibleLightKVS instance for state management (nil in "query-service" mode).
+//
+// cacheWrap is forwarded to NewEndorserCore -- see its doc comment. nil means identity.
 func NewEndorser(
 	cfg config.Endorser,
 	network common.Network,
 	signer sdk.Signer,
 	logger sdk.Logger,
 	testImpl bool,
+	cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter,
 ) (*core.Endorser, *storage.RevertibleLightKVS, error) {
 	evmConfig := execution.EVMConfig{
 		ChainConfig: common.BuildChainConfig(network.ChainID),
@@ -92,7 +108,7 @@ func NewEndorser(
 		DebugLogs:   cfg.DebugLogs,
 	}
 
-	end, _, back, _, err := NewEndorserCore(cfg, network.Channel, network.Namespace, network.Protocol, signer, evmConfig, testImpl)
+	end, _, back, _, err := NewEndorserCore(cfg, network.Channel, network.Namespace, network.Protocol, signer, evmConfig, testImpl, cacheWrap)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -24,6 +24,7 @@ import (
 
 	eapi "github.com/hyperledger/fabric-x-evm/endorser/api"
 	eapp "github.com/hyperledger/fabric-x-evm/endorser/app"
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	estorage "github.com/hyperledger/fabric-x-evm/endorser/storage"
 	"github.com/hyperledger/fabric-x-evm/gateway/api"
 	"github.com/hyperledger/fabric-x-evm/gateway/config"
@@ -81,6 +82,15 @@ func NewTestNodeWithConfig(ctx context.Context, cfg config.Config, testAccountsP
 func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableTestRPC bool, testAccountsPath string) (*App, error) {
 	logger := sdk.NewStdLogger("gateway")
 
+	// Exactly one VersionedCache per gateway, shared by every endorser built below
+	// (their engines read through it, cache-wrapped via cacheWrap) and by the
+	// gateway itself (passed to BuildGateway below) -- see the cache field doc on
+	// gateway/core.Gateway. Diverging instances would silently break pipelining.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
 	// Create endorsers.
 	endorsers := make([]eapi.Service, 0, len(cfg.Endorsers))
 	var firstBack *estorage.RevertibleLightKVS // Keep first endorser's backing store for test server
@@ -97,7 +107,7 @@ func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableT
 			return nil, fmt.Errorf("failed to create signer: %w", err)
 		}
 
-		end, back, err := eapp.NewEndorser(ecfg, cfg.Network, eSigner, logger, enableTestRPC)
+		end, back, err := eapp.NewEndorser(ecfg, cfg.Network, eSigner, logger, enableTestRPC, cacheWrap)
 		if err != nil {
 			return nil, fmt.Errorf("endorser %d (%s): %w", i, ecfg.Name, err)
 		}
@@ -115,12 +125,14 @@ func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableT
 		extraHandlers = append(extraHandlers, firstBack)
 	}
 
-	return buildApp(ctx, cfg, gwSigner, logger, endorsers, firstBack, enableTestRPC, testAccountsPath, extraHandlers...)
+	return buildApp(ctx, cfg, gwSigner, logger, endorsers, firstBack, enableTestRPC, testAccountsPath, cache, extraHandlers...)
 }
 
 // buildApp wires up the gateway from pre-built endorsers.
+// cache is the VersionedCache shared with those endorsers (see newApp/NewTestNode,
+// which create it) -- passed straight through to BuildGateway.
 // extraHandlers are prepended to the synchronizer handler list, ahead of chain/gateway.
-func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logger sdk.Logger, endorsers []eapi.Service, lightKVS *estorage.RevertibleLightKVS, enableTestRPC bool, testAccountsPath string, extraHandlers ...blocks.BlockHandler) (*App, error) {
+func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logger sdk.Logger, endorsers []eapi.Service, lightKVS *estorage.RevertibleLightKVS, enableTestRPC bool, testAccountsPath string, cache *core.VersionedCache, extraHandlers ...blocks.BlockHandler) (*App, error) {
 	orderers := make([]network.OrdererConf, len(cfg.Gateway.Orderers))
 	for i, o := range cfg.Gateway.Orderers {
 		orderers[i] = o.ToOrdererConf()
@@ -138,7 +150,7 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 	}
 
 	// Gateway owns the BatchSubmitter and will handle its lifecycle
-	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize)
+	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cache)
 	if err != nil {
 		return nil, err
 	}

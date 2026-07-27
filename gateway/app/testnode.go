@@ -21,6 +21,7 @@ import (
 	econfig "github.com/hyperledger/fabric-x-evm/endorser/config"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/gateway/config"
+	"github.com/hyperledger/fabric-x-evm/gateway/core"
 )
 
 // localSigner is a no-MSP signer: fabrictest doesn't validate real certificates.
@@ -67,9 +68,18 @@ func NewTestNode(ctx context.Context, tcfg TestNodeConfig) (*App, error) {
 		ChainConfig: common.BuildChainConfig(tcfg.ChainID),
 	}
 
+	// Exactly one VersionedCache per gateway, shared by the endorser built below
+	// (its engine reads through it, cache-wrapped via cacheWrap) and by the
+	// gateway itself (passed to buildApp below) -- see newApp's identical wiring
+	// and the cache field doc on gateway/core.Gateway.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
 	// HistorySize=128 gives evm_snapshot/evm_revert enough history to rewind through.
 	ecfg := econfig.Endorser{Database: econfig.DB{Database: "memory", HistorySize: 128}}
-	endorser, _, back, _, err := eapp.NewEndorserCore(ecfg, testNodeChannel, testNodeNamespace, protocol, signer, evmConfig, true)
+	endorser, _, back, _, err := eapp.NewEndorserCore(ecfg, testNodeChannel, testNodeNamespace, protocol, signer, evmConfig, true, cacheWrap)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorser: %w", err)
 	}
@@ -99,7 +109,7 @@ func NewTestNode(ctx context.Context, tcfg TestNodeConfig) (*App, error) {
 		},
 	}
 
-	application, err := buildApp(ctx, cfg, signer, logger, []eapi.Service{endorser}, back, true, tcfg.TestAccountsPath, back)
+	application, err := buildApp(ctx, cfg, signer, logger, []eapi.Service{endorser}, back, true, tcfg.TestAccountsPath, cache, back)
 	if err != nil {
 		return nil, err
 	}

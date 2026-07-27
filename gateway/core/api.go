@@ -43,10 +43,15 @@ var logger = flogging.MustGetLogger("gateway.core")
 // contract, the gateway requests endorsement from a set of EVM endorsers. It then
 // submits a signed transaction with the read/writeset to the Fabric orderers.
 type Gateway struct {
-	batchSubmitter  *BatchSubmitter
-	endorsers       *EndorsementClient
-	store           Store
-	chainID         *big.Int
+	batchSubmitter *BatchSubmitter
+	endorsers      *EndorsementClient
+	store          Store
+	chainID        *big.Int
+	// cache is the cross-batch VersionedCache shared with the endorser engines'
+	// read path (see gateway/core.NewCachedSnapshotter). Exactly one instance
+	// per gateway; nil until Task 4 wires the executor to write through it, at
+	// which point every read stays neutral until ApplyWrites is first called.
+	cache           *VersionedCache
 	ChainConfig     *params.ChainConfig
 	Signer          types.Signer
 	pending         *PendingPool
@@ -95,7 +100,11 @@ type Store interface {
 // New creates a new Ethereum Gateway.
 // batchSubmitter handles all endorsement submissions and is owned by the Gateway.
 // endorsementChan is the channel to send endorsements to the BatchSubmitter.
-func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, chainID int64, endorsementChan chan sdk.Endorsement) (*Gateway, error) {
+// cache is the cross-batch VersionedCache shared with this gateway's endorser
+// engines (the SAME instance passed to their cacheWrap -- see
+// endorser/app.NewEndorserCore); the caller wiring endorsers and the gateway
+// together owns creating it exactly once.
+func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, chainID int64, endorsementChan chan sdk.Endorsement, cache *VersionedCache) (*Gateway, error) {
 	cid := big.NewInt(chainID)
 	return &Gateway{
 		endorsers:       ec,
@@ -109,6 +118,7 @@ func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, cha
 		endorsementChan: endorsementChan,
 		commitWaiters:   make(map[string]chan committerpb.Status),
 		commitTimeout:   commitTimeoutDefault,
+		cache:           cache,
 	}, nil
 }
 

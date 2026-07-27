@@ -117,9 +117,9 @@ func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []fxcommon.Tx
 
 // balancePrimingEndorserFactory creates endorsers with balance priming support for testing.
 func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig) integration.EndorserFactory {
-	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) integration.EndorserComponents {
+	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) integration.EndorserComponents {
 		// Create the base endorser components
-		readStore, backing, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+		readStore, backing, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol, cacheWrap)
 
 		// Extract the base EVMEngine
 		baseEngine, ok := baseEndorser.Engine.(*execution.EVMEngine)
@@ -127,10 +127,15 @@ func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig
 			t.Fatalf("Expected *execution.EVMEngine, got %T", baseEndorser.Engine)
 		}
 
+		snap := execution.KVSSnapshotter(readStore)
+		if cacheWrap != nil {
+			snap = cacheWrap(snap)
+		}
+
 		// Wrap the engine with balance priming support
 		wrappedEngine := testimpl.NewEVMEngineWrapper(
 			namespace,
-			readStore,
+			snap,
 			evmConfig,
 			protocol == "fabric-x", // monotonicVersions
 			baseEngine,

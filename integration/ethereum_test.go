@@ -454,11 +454,16 @@ type ethereumTestHarness struct {
 // wrappedEndorserFactory creates endorsers wrapped with testimpl wrappers for ethStateDB tracking.
 // blockCtx injects the test-specific EVM block context (fork rules, coinbase, difficulty, etc.).
 func wrappedEndorserFactory(blockCtx *vm.BlockContext) EndorserFactory {
-	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) EndorserComponents {
-		readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) EndorserComponents {
+		readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol, cacheWrap)
 
-		engine := execution.NewEVMEngine(namespace, readStore, evmConfig, protocol == "fabric-x")
-		engineWrapper := testimpl.NewEVMEngineWrapper(namespace, readStore, evmConfig, protocol == "fabric-x", engine)
+		snap := execution.KVSSnapshotter(readStore)
+		if cacheWrap != nil {
+			snap = cacheWrap(snap)
+		}
+
+		engine := execution.NewEVMEngine(namespace, snap, evmConfig, protocol == "fabric-x")
+		engineWrapper := testimpl.NewEVMEngineWrapper(namespace, snap, evmConfig, protocol == "fabric-x", engine)
 		engineWrapper.SetBlockContext(blockCtx)
 
 		wrapper := testimpl.NewEndorserWrapper(end, engineWrapper)

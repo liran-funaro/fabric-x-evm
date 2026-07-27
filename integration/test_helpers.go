@@ -122,13 +122,17 @@ func (th *TestHarness) PrimeStateFromJSON(ctx context.Context, jsonFilePath stri
 //
 // If useNotifications is true, uses NotificationDispatcher + MemoryStore instead of
 // Synchronizer + Chain. This is intended for fabric-x performance testing.
-func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool) (*TestHarness, *network.Synchronizer, error) {
-	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil)
+//
+// cache is the VersionedCache shared with endorsers (the SAME instance the caller passed
+// as cacheWrap to prepareHarnessConfig/buildEndorsers) -- passed straight through to
+// app.BuildGateway so the harness's one gateway and its endorsers agree on one cache.
+func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, cache *core.VersionedCache) (*TestHarness, *network.Synchronizer, error) {
+	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil, cache)
 }
 
 // buildTestHarnessWithExtraHandler is like buildTestHarness but accepts an optional extra TxHandler
 // that will be inserted into the notification handler chain right before the cleanup handler.
-func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler) (*TestHarness, *network.Synchronizer, error) {
+func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler, cache *core.VersionedCache) (*TestHarness, *network.Synchronizer, error) {
 	dbs := make([]storage.KVS, len(endorsers))
 	readStores := make([]execution.KVSSnapshotter, len(endorsers))
 	builders := make([]endorsement.Builder, len(endorsers))
@@ -192,7 +196,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	if cfg.Network.Namespace == "synthetic" {
 		txPerSec = 10000
 	}
-	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize)
+	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize, cache)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -359,10 +363,13 @@ type EndorserComponents struct {
 
 // EndorserFactory is a function that creates an endorser along with its dependencies.
 // Service is the eapi.Service interface which both *ecore.Endorser and *testimpl.EndorserWrapper implement.
-type EndorserFactory func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) EndorserComponents
+// cacheWrap, if non-nil, must be applied (directly or via NewEndorser) to any
+// execution.KVSSnapshotter the factory builds an EVM engine over, so that engine reads
+// through the harness's shared VersionedCache -- see NewEndorser and buildTestHarness.
+type EndorserFactory func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) EndorserComponents
 
 // buildEndorsers creates endorsers using the provided factory function.
-func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConfig, factory EndorserFactory) []EndorserComponents {
+func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConfig, factory EndorserFactory, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) []EndorserComponents {
 	endorsers := make([]EndorserComponents, len(cfg.Endorsers))
 	for i, ecfg := range cfg.Endorsers {
 		// LightKVS needs at least one history slot to record the pre-write snapshot on
@@ -370,7 +377,7 @@ func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConf
 		if ecfg.Database.HistorySize == 0 {
 			ecfg.Database.HistorySize = 1
 		}
-		endorsers[i] = factory(t, ecfg, cfg.Network.Channel, cfg.Network.Namespace, evmConfig, cfg.Network.Protocol)
+		endorsers[i] = factory(t, ecfg, cfg.Network.Channel, cfg.Network.Namespace, evmConfig, cfg.Network.Protocol, cacheWrap)
 	}
 	return endorsers
 }
@@ -380,18 +387,20 @@ func buildEndorsers(t *testing.T, cfg config.Config, evmConfig execution.EVMConf
 // backing store this package updates directly (see buildTestHarnessWithExtraHandler's handler
 // registration) — unless the config already selects query-service, e.g. for perf tests that
 // run against a real query service.
-func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) EndorserComponents {
+func defaultEndorserFactory(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) EndorserComponents {
 	if ecfg.Database.Database != "query-service" {
 		ecfg.Database.Database = "memory"
 	}
-	readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol)
+	readStore, backing, builder, end := NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol, cacheWrap)
 	return EndorserComponents{ReadStore: readStore, KVS: backing, Builder: builder, Service: end}
 }
 
 // prepareHarnessConfig applies configOverrides to cfg, derives evmConfig.ChainConfig from
 // cfg.Network.ChainID when not already set, and builds all endorsers via factory. Shared
-// tail of every harness constructor below.
-func prepareHarnessConfig(t *testing.T, cfg *config.Config, evmConfig *execution.EVMConfig, configOverrides map[string]any, factory EndorserFactory) ([]EndorserComponents, error) {
+// tail of every harness constructor below. cacheWrap is forwarded to every endorser built
+// (see EndorserFactory) so all of this harness's endorsers share the one VersionedCache
+// created alongside the harness's single gateway.
+func prepareHarnessConfig(t *testing.T, cfg *config.Config, evmConfig *execution.EVMConfig, configOverrides map[string]any, factory EndorserFactory, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) ([]EndorserComponents, error) {
 	if err := applyConfigOverrides(cfg, configOverrides); err != nil {
 		return nil, err
 	}
@@ -400,7 +409,7 @@ func prepareHarnessConfig(t *testing.T, cfg *config.Config, evmConfig *execution
 		evmConfig.ChainConfig = common.BuildChainConfig(cfg.Network.ChainID)
 	}
 
-	return buildEndorsers(t, *cfg, *evmConfig, factory), nil
+	return buildEndorsers(t, *cfg, *evmConfig, factory, cacheWrap), nil
 }
 
 // NewLocalTestHarness commits updates directly to the DB, bypassing peers and orderers.
@@ -456,7 +465,15 @@ func NewLocalTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig e
 			},
 		},
 	}
-	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, factory)
+	// Exactly one VersionedCache for this harness's one gateway, shared by every
+	// endorser built below via cacheWrap -- see buildTestHarness's doc comment
+	// and the THE CRITICAL INVARIANT note on gateway/core.Gateway.cache.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
+	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, factory, cacheWrap)
 	if err != nil {
 		return nil, err
 	}
@@ -471,7 +488,7 @@ func NewLocalTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig e
 		peer.Port = nw.PeerPort
 	}
 
-	th, _, err := buildTestHarness(t, logger, cfg, evmConfig, primeDbPath, bypass, endorsers, false)
+	th, _, err := buildTestHarness(t, logger, cfg, evmConfig, primeDbPath, bypass, endorsers, false, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -488,12 +505,18 @@ func newFileConfigHarness(t *testing.T, logger sdk.Logger, evmConfig execution.E
 		return nil, fmt.Errorf("load config: %w", err)
 	}
 
-	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, defaultEndorserFactory)
+	// Exactly one VersionedCache for this harness's one gateway -- see above.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
+	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, defaultEndorserFactory, cacheWrap)
 	if err != nil {
 		return nil, err
 	}
 
-	th, sync, err := buildTestHarness(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, false)
+	th, sync, err := buildTestHarness(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, false, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -524,13 +547,19 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 		return nil, fmt.Errorf("load config: %w", err)
 	}
 
-	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, factory)
+	// Exactly one VersionedCache for this harness's one gateway -- see above.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
+	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, factory, cacheWrap)
 	if err != nil {
 		return nil, err
 	}
 
 	// Use buildTestHarness with useNotifications=true and extraHandler
-	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler)
+	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -543,8 +572,9 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 // readStore is always non-nil: it's what the engine reads through. backing is non-nil only
 // in "memory" mode (the in-process RevertibleLightKVS to feed with committed blocks); in
 // "query-service" mode it's nil since state comes from the live query service.
+// cacheWrap is forwarded to NewEndorserCore -- nil means identity (no cache layer).
 // Exported for use by custom endorser factories.
-func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string) (readStore execution.KVSSnapshotter, backing storage.KVS, builder endorsement.Builder, end *ecore.Endorser) {
+func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) (readStore execution.KVSSnapshotter, backing storage.KVS, builder endorsement.Builder, end *ecore.Endorser) {
 	t.Helper()
 
 	var signer sdk.Signer
@@ -558,7 +588,7 @@ func NewEndorser(t *testing.T, cfg econf.Endorser, channel, namespace string, ev
 		}
 	}
 
-	end, readStore, back, builder, err := eapp.NewEndorserCore(cfg, channel, namespace, protocol, signer, evmConfig, false)
+	end, readStore, back, builder, err := eapp.NewEndorserCore(cfg, channel, namespace, protocol, signer, evmConfig, false, cacheWrap)
 	if err != nil {
 		t.Fatalf("NewEndorserCore: %v", err)
 	}

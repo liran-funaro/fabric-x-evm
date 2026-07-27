@@ -71,7 +71,12 @@ func NewGatewaySynchronizer(protocol string, db network.BlockHeightReader, chann
 // responsible for creating the chain store (so they can register its cleanup independently
 // of the rest of this wiring) and for creating and starting the synchronizer(s) that feed
 // committed blocks to chain/gateway/endorsers.
-func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int) (*core.Gateway, error) {
+//
+// cache is the cross-batch VersionedCache shared with endorsers -- the caller must create
+// exactly one *core.VersionedCache per gateway and pass the SAME pointer both here and to
+// the cacheWrap given to the endorser factory (see endorser/app.NewEndorserCore), or
+// pipelined reads silently diverge between the gateway's writes and the endorsers' reads.
+func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int, cache *core.VersionedCache) (*core.Gateway, error) {
 	ec, err := core.NewEndorsementClient(endorsers, gwSigner, netCfg.Channel, netCfg.Namespace, netCfg.NsVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorsement client: %w", err)
@@ -84,7 +89,7 @@ func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Si
 	batchSubmitter := core.NewBatchSubmitter(submitters, endorsementChan, submitterCount, txPerSec)
 	batchSubmitter.Start(ctx)
 
-	gw, err := core.New(ec, batchSubmitter, chain, netCfg.ChainID, endorsementChan)
+	gw, err := core.New(ec, batchSubmitter, chain, netCfg.ChainID, endorsementChan, cache)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gateway: %w", err)
 	}
