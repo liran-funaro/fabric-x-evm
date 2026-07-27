@@ -196,8 +196,17 @@ func (e *EVMEngine) classify(ex *Executor, state ExtendedStateDB, tx *types.Tran
 		if mErr != nil {
 			return endorsement.ExecutionResult{}, fmt.Errorf("marshal fault event: %w", mErr)
 		}
+		rws := state.Result()
+		if serr := state.Error(); serr != nil {
+			// Result()'s read-set backfill (see StateDB.Result) can itself fail a
+			// store read -- e.g. the same stale query-service view that
+			// Send/ApplyMessage already guard against, just hit one read later.
+			// Treat it identically: abort rather than endorse an RWS missing a
+			// read the backfill couldn't complete.
+			return endorsement.ExecutionResult{}, serr
+		}
 		return endorsement.ExecutionResult{
-			RWS:     state.Result(),
+			RWS:     rws,
 			Event:   event,
 			Status:  status,
 			Message: err.Error(),
@@ -213,7 +222,14 @@ func (e *EVMEngine) classify(ex *Executor, state ExtendedStateDB, tx *types.Tran
 		}
 	}
 
-	return endorsement.Success(state.Result(), logs, ret), nil
+	rws := state.Result()
+	if serr := state.Error(); serr != nil {
+		// See the comment on the committed-fault branch above: Result()'s
+		// backfill can fail a store read even though Send/ApplyMessage's own
+		// checkpoints already passed.
+		return endorsement.ExecutionResult{}, serr
+	}
+	return endorsement.Success(rws, logs, ret), nil
 }
 
 // PerTxOutcome carries one sub-tx's outcome within a merged batch endorsement:
