@@ -100,6 +100,46 @@ func TestConvertToDomain_SkipsCommitterInvalidTx(t *testing.T) {
 	require.Len(t, got.Transactions, 0, "a committer-invalid tx must produce no receipt row")
 }
 
+// TestConvertToDomain_InvalidTxDoesNotAdvanceTxIndex guards the second half of the
+// skip contract: a committer-invalid tx must not consume a flat block-global TxIndex.
+// A valid tx following an invalid one in the same block must therefore land at
+// TxIndex 0 (not 1) -- mirroring TestConvertToDomainBatch_SkipsExcludedSubTx for the
+// batch-exclusion path. Without the skip guard this test fails: the invalid tx would
+// emit a row at index 0 and the valid tx would slip to index 1.
+func TestConvertToDomain_InvalidTxDoesNotAdvanceTxIndex(t *testing.T) {
+	badKey, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	goodKey, err := crypto.GenerateKey()
+	require.NoError(t, err)
+
+	badEthb := marshaledEthTx(t, badKey, common.HexToAddress("0x1111111111111111111111111111111111111111"), big.NewInt(100))
+	goodEthb := marshaledEthTx(t, goodKey, common.HexToAddress("0x2222222222222222222222222222222222222222"), big.NewInt(200))
+
+	b := blocks.Block{
+		Number: 1,
+		Transactions: []blocks.Transaction{
+			{
+				ID:        "tx-invalid",
+				Number:    0,
+				Valid:     false, // committer-invalid: skipped, must not consume an index
+				InputArgs: [][]byte{{byte(co.ProposalTypeEVMTx)}, badEthb},
+			},
+			{
+				ID:        "tx-valid",
+				Number:    1,
+				Valid:     true,
+				InputArgs: [][]byte{{byte(co.ProposalTypeEVMTx)}, goodEthb},
+			},
+		},
+	}
+
+	got := ConvertToDomain(b)
+
+	require.Len(t, got.Transactions, 1, "only the valid tx yields a domain tx")
+	assert.Equal(t, "tx-valid", got.Transactions[0].FabricTxID)
+	assert.Equal(t, int64(0), got.Transactions[0].TxIndex, "the skipped invalid tx must not advance the flat txIndex")
+}
+
 func TestConvertToDomain_SkipsInsufficientInputArgs(t *testing.T) {
 	b := blocks.Block{
 		Number: 1,
