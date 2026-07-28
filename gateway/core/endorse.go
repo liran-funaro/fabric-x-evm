@@ -26,6 +26,7 @@ import (
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	sdk "github.com/hyperledger/fabric-x-sdk"
+	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
@@ -142,19 +143,25 @@ func (e EndorsementClient) ExecuteTransaction(ctx context.Context, tx *types.Tra
 // A tx excluded for a RETRYABLE reason (nonce too high, insufficient funds,
 // ...) appears in neither slice: the caller leaves it pending for a future
 // cycle instead of removing or evicting it.
-func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, []*types.Transaction, []*types.Transaction, error) {
+//
+// rws is the batch's merged read-write set for e.namespace, decoded from the
+// same signed response (see decodeMergedRWS) -- the pipelined executor
+// applies it to the cross-batch VersionedCache (ApplyWrites) BEFORE
+// submitting, so the NEXT batch's endorsers can read this batch's in-flight
+// writes without waiting for its committer tx to commit.
+func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Transaction) (sdk.Endorsement, []*types.Transaction, []*types.Transaction, blocks.ReadWriteSet, error) {
 	args := make([][]byte, 0, len(txs)+1)
 	args = append(args, []byte{byte(common.ProposalTypeEVMBatch)})
 	for _, tx := range txs {
 		b, err := tx.MarshalBinary()
 		if err != nil {
-			return sdk.Endorsement{}, nil, nil, err
+			return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, err
 		}
 		args = append(args, b)
 	}
 	inv, err := e.createInvocation(args)
 	if err != nil {
-		return sdk.Endorsement{}, nil, nil, err
+		return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, err
 	}
 
 	// Derive a cancellable context so goroutines can stop early on error
@@ -194,7 +201,7 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 	// Return first error in slice order — stable and deterministic
 	for _, err := range errs {
 		if err != nil {
-			return sdk.Endorsement{}, nil, nil, err
+			return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, err
 		}
 	}
 
@@ -210,13 +217,18 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 	}
 	included, terminal, err := classifyBatchOutcomes(signed, txs)
 	if err != nil {
-		return sdk.Endorsement{}, nil, nil, fmt.Errorf("decode included txs: %w", err)
+		return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, fmt.Errorf("decode included txs: %w", err)
+	}
+
+	mergedRWS, err := decodeMergedRWS(signed, e.namespace)
+	if err != nil {
+		return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, fmt.Errorf("decode merged read-write set: %w", err)
 	}
 
 	return sdk.Endorsement{
 		Proposal:  inv.Proposal,
 		Responses: res,
-	}, included, terminal, nil
+	}, included, terminal, mergedRWS, nil
 }
 
 // classifyBatchOutcomes decodes txs' per-sub-tx outcomes from resp (see
@@ -289,6 +301,60 @@ func decodeProposalResponseOutcomes(resp *peer.ProposalResponse) ([]execution.Pe
 		return nil, nil
 	}
 	return decodeBatchOutcomes(ptx.Metadata[1])
+}
+
+// decodeMergedRWS recovers namespace's merged read-write set from a signed
+// batch ProposalResponse's top-level Payload -- the same applicationpb.Tx
+// envelope decodeProposalResponseOutcomes reads (Metadata carries the
+// outcomes; the Namespaces carry the actual reads/writes the endorsers
+// agreed on). This is the read-write set the pipelined executor applies to
+// the cross-batch VersionedCache (see executeCycle / VersionedCache.ApplyWrites)
+// so the next batch can read this one's in-flight writes before it commits.
+//
+// Returns a zero-value ReadWriteSet — not an error — for a nil/payload-less
+// response, or when the payload has no namespace matching e.namespace, since
+// both are legitimate ("nothing to apply") rather than malformed input; only
+// an undecodable payload is an error.
+func decodeMergedRWS(resp *peer.ProposalResponse, namespace string) (blocks.ReadWriteSet, error) {
+	if resp == nil || len(resp.Payload) == 0 {
+		return blocks.ReadWriteSet{}, nil
+	}
+	var ptx applicationpb.Tx
+	if err := proto.Unmarshal(resp.Payload, &ptx); err != nil {
+		return blocks.ReadWriteSet{}, fmt.Errorf("unmarshal proposal response payload: %w", err)
+	}
+	for _, ns := range ptx.Namespaces {
+		if ns.NsId != namespace {
+			continue
+		}
+		return decodeNsRWS(ns), nil
+	}
+	return blocks.ReadWriteSet{}, nil
+}
+
+// decodeNsRWS decodes one applicationpb.TxNamespace into a blocks.ReadWriteSet,
+// mirroring blocks/fabricx.BlockParser.ParseTx's namespace decode loop exactly
+// (same field mapping, including its same non-recovery of KVWrite.IsDelete --
+// the wire format has no delete flag; see endorsement/fabricx.marshalRWSet,
+// which encodes a delete as a Write with a nil Value, indistinguishable on
+// the wire from a blind write of an empty value).
+func decodeNsRWS(ns *applicationpb.TxNamespace) blocks.ReadWriteSet {
+	rws := blocks.ReadWriteSet{
+		Reads:  make([]blocks.KVRead, 0, len(ns.ReadWrites)),
+		Writes: make([]blocks.KVWrite, 0, len(ns.BlindWrites)+len(ns.ReadWrites)),
+	}
+	for _, bw := range ns.BlindWrites {
+		rws.Writes = append(rws.Writes, blocks.KVWrite{Key: string(bw.Key), Value: bw.Value})
+	}
+	for _, rw := range ns.ReadWrites {
+		read := blocks.KVRead{Key: string(rw.Key)}
+		if rw.Version != nil {
+			read.Version = &blocks.Version{BlockNum: *rw.Version}
+		}
+		rws.Reads = append(rws.Reads, read)
+		rws.Writes = append(rws.Writes, blocks.KVWrite{Key: string(rw.Key), Value: rw.Value})
+	}
+	return rws
 }
 
 // CallContract queries a smart contract and returns the value.

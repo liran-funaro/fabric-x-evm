@@ -20,7 +20,6 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
-	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	sdk "github.com/hyperledger/fabric-x-sdk"
@@ -60,15 +59,26 @@ type Gateway struct {
 	stopOnce        sync.Once
 	endorsementChan chan sdk.Endorsement // Channel to send endorsements to BatchSubmitter
 
-	// commitWaiters correlates a submitted committer tx (by FabricTxID) with
-	// the executor goroutine awaiting its commit/abort outcome. See
-	// executor.go: registerCommitWaiter/awaitCommit/HandleTx.
-	commitMu      sync.Mutex
-	commitWaiters map[string]chan committerpb.Status
+	// Pipelined commit tracking (see executor.go). The executor submits a
+	// batch and advances immediately -- it does NOT block on commit. inflight
+	// is the ordered registry of submitted-but-unconfirmed batches (oldest
+	// first); each carries the included tx hashes and the merged RWS it wrote
+	// to the cache, so resolveInflight can finalize (commit) or roll back
+	// (abort/timeout) and a later cascade (Task 5) can rebuild the cache from
+	// the survivors. inflightSlots is a counting semaphore bounding how many
+	// batches may be outstanding (see SetMaxInflight): the executor acquires a
+	// slot before submitting and resolveInflight releases it.
+	inflightMu    sync.Mutex
+	inflight      []*inflightBatch
+	inflightSlots chan struct{}
+	maxInflight   int
 
-	// commitTimeout is the stall backstop applied by awaitCommit. Defaulted
-	// by New to commitTimeoutDefault; tests may override it to force a fast
-	// timeout. See executor.go.
+	// commitTimeout backstops each in-flight batch: if no commit/abort
+	// notification arrives within it, resolveInflight treats the batch as
+	// unconfirmed (rolled back) so a lost notification cannot wedge the
+	// in-flight window forever. Defaulted by New to commitTimeoutDefault;
+	// tests may override it. Task 6 replaces the blind rollback with a
+	// query-service status check.
 	commitTimeout time.Duration
 
 	// maxBatchSize bounds how many pending txs one drain cycle folds into a
@@ -116,10 +126,23 @@ func New(ec *EndorsementClient, batchSubmitter *BatchSubmitter, store Store, cha
 		pending:         NewPendingPool(),
 		arrivals:        make(chan struct{}, 1),
 		endorsementChan: endorsementChan,
-		commitWaiters:   make(map[string]chan committerpb.Status),
+		inflightSlots:   make(chan struct{}, defaultMaxInflight),
+		maxInflight:     defaultMaxInflight,
 		commitTimeout:   commitTimeoutDefault,
 		cache:           cache,
 	}, nil
+}
+
+// SetMaxInflight bounds how many submitted-but-unconfirmed committer txs the
+// pipelined executor keeps outstanding before it stops draining new batches.
+// n <= 0 restores the default (defaultMaxInflight). Call before Start -- it
+// re-sizes the semaphore, which is not safe once the executor is running.
+func (g *Gateway) SetMaxInflight(n int) {
+	if n <= 0 {
+		n = defaultMaxInflight
+	}
+	g.maxInflight = n
+	g.inflightSlots = make(chan struct{}, n)
 }
 
 // SetMaxBatchSize bounds how many pending txs a single drain cycle folds into

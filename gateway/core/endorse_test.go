@@ -273,7 +273,7 @@ func TestExecuteBatchBuildsMergedInvocation(t *testing.T) {
 		t.Fatalf("marshal tx2: %v", err)
 	}
 
-	end, included, terminal, err := c.ExecuteBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	end, included, terminal, rws, err := c.ExecuteBatch(context.Background(), []*types.Transaction{tx1, tx2})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -291,6 +291,10 @@ func TestExecuteBatchBuildsMergedInvocation(t *testing.T) {
 	}
 	if len(terminal) != 0 {
 		t.Errorf("terminal = %v, want [] (fallback: no decodable outcomes -> nothing terminal)", terminal)
+	}
+	// No decodable Payload -> no merged RWS.
+	if len(rws.Reads) != 0 || len(rws.Writes) != 0 {
+		t.Errorf("rws = %v, want empty (no decodable Payload)", rws)
 	}
 
 	args := stub.gotInv.Args
