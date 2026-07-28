@@ -446,7 +446,16 @@ INSERT INTO
         data
     )
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tx_hash, log_index) DO NOTHING
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tx_hash, log_index) DO UPDATE SET
+        block_number = excluded.block_number,
+        block_hash = excluded.block_hash,
+        tx_index = excluded.tx_index,
+        address = excluded.address,
+        topic0 = excluded.topic0,
+        topic1 = excluded.topic1,
+        topic2 = excluded.topic2,
+        topic3 = excluded.topic3,
+        data = excluded.data
 `
 
 type InsertLogParams struct {
@@ -496,7 +505,17 @@ INSERT INTO
         fabric_tx_status
     )
 VALUES
-    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tx_hash) DO NOTHING
+    (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (tx_hash) DO UPDATE SET
+        block_hash = excluded.block_hash,
+        block_number = excluded.block_number,
+        tx_index = excluded.tx_index,
+        raw_tx = excluded.raw_tx,
+        from_address = excluded.from_address,
+        to_address = excluded.to_address,
+        contract_address = excluded.contract_address,
+        status = excluded.status,
+        fabric_tx_id = excluded.fabric_tx_id,
+        fabric_tx_status = excluded.fabric_tx_status
 `
 
 type InsertTransactionParams struct {

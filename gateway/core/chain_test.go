@@ -75,7 +75,12 @@ func TestConvertToDomain_ValidTx(t *testing.T) {
 	assert.Equal(t, "tx-1", got.Transactions[0].FabricTxID)
 }
 
-func TestConvertToDomain_InvalidTxStatus(t *testing.T) {
+// TestConvertToDomain_SkipsCommitterInvalidTx verifies that a committer-INVALID Fabric tx
+// (tx.Valid == false -- e.g. an MVCC abort that never committed and will be re-executed in a
+// later block) produces NO domain transaction / receipt row. Emitting one would let the
+// aborted attempt's row shadow the real later commit via the tx_hash upsert. (An EVM-reverted
+// tx is DIFFERENT: it has tx.Valid == true and still gets a status-0 receipt.)
+func TestConvertToDomain_SkipsCommitterInvalidTx(t *testing.T) {
 	key, err := crypto.GenerateKey()
 	require.NoError(t, err)
 
@@ -85,15 +90,14 @@ func TestConvertToDomain_InvalidTxStatus(t *testing.T) {
 		Number: 1,
 		Transactions: []blocks.Transaction{{
 			ID:        "tx-bad",
-			Valid:     false, // invalid tx
+			Valid:     false, // committer-invalid: never committed
 			InputArgs: [][]byte{{byte(co.ProposalTypeEVMTx)}, ethb},
 		}},
 	}
 
 	got := ConvertToDomain(b)
 
-	require.Len(t, got.Transactions, 1)
-	assert.Equal(t, uint8(0), got.Transactions[0].Status)
+	require.Len(t, got.Transactions, 0, "a committer-invalid tx must produce no receipt row")
 }
 
 func TestConvertToDomain_SkipsInsufficientInputArgs(t *testing.T) {

@@ -158,11 +158,30 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 			continue
 		}
 
+		if !tx.Valid {
+			// A committer-INVALID Fabric tx (e.g. an MVCC abort under the pipelined
+			// executor's out-of-order submission) never committed: in this design the
+			// gateway cascades it back to pending and re-executes it into a LATER block,
+			// where it commits and produces its one true receipt. Emitting receipt/log
+			// rows for it here would be pinned by InsertTransaction/InsertLog's upsert and
+			// shadow that real later commit -- and it does not belong to this EVM block at
+			// all. Skip it entirely: no domain tx, no receipt, no logs, and the flat
+			// txIndex must NOT advance (mirrors the excluded-outcome skip in the batch
+			// path below). The block row itself is still inserted by Chain.Handle, so the
+			// aborted Fabric block maps to an empty EVM block, preserving chain linkage.
+			//
+			// NOTE: this gates on tx.Valid == false (committer verdict), NOT on EVM revert.
+			// An EVM-reverted tx has tx.Valid == true and still gets a status=0 receipt
+			// below (standard Ethereum semantics) -- it is unaffected by this guard.
+			continue
+		}
+
 		switch {
 		case bytes.Equal(tx.InputArgs[0], []byte{byte(fc.ProposalTypeEVMTx)}):
 			// Legacy single-tx envelope: InputArgs = [{type}, ethTxBytes].
+			// tx.Valid is guaranteed true by the guard above; only an EVM revert keeps status 0.
 			status := uint8(0)
-			if tx.Valid && !fc.IsRevertEvent(tx.Events) {
+			if !fc.IsRevertEvent(tx.Events) {
 				status = 1
 			}
 
@@ -200,8 +219,9 @@ func ConvertToDomain(b blocks.Block) domain.Block {
 					continue
 				}
 
+				// tx.Valid is guaranteed true by the guard above; per-sub-tx success drives status.
 				status := uint8(0)
-				if tx.Valid && outcome.Status == fc.StatusOK {
+				if outcome.Status == fc.StatusOK {
 					status = 1
 				}
 
