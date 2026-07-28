@@ -74,6 +74,15 @@ type Gateway struct {
 	inflightSlots chan struct{}
 	maxInflight   int
 
+	// maxInflightObserved is the peak len(inflight) ever recorded by
+	// trackInflight; pure test observability (see MaxInflightObserved). atomic so
+	// the accessor can read it without taking inflightMu.
+	maxInflightObserved atomic.Int64 // peak len(inflight); test observability (MaxInflightObserved)
+	// cascadeCount counts real rollback cascades (a suffix actually detached in
+	// cascadeFrom), not the idempotent not-found no-ops; pure test observability
+	// (see CascadeCount).
+	cascadeCount atomic.Int64 // number of real cascade events; test observability (CascadeCount)
+
 	// commitTimeout backstops each in-flight batch: if no commit/abort
 	// notification arrives within it, resolveInflight treats the batch as
 	// unconfirmed (rolled back) so a lost notification cannot wedge the
@@ -219,6 +228,24 @@ func (g *Gateway) Watch(txID string) {
 	if g.notifier != nil {
 		g.notifier.Watch(txID)
 	}
+}
+
+// MaxInflightObserved returns the peak number of simultaneously outstanding
+// (submitted-but-unresolved) committer batches seen so far. Test observability:
+// a value > 1 proves the pipelined executor submitted a later batch before an
+// earlier one was resolved (it did not serialize on commit).
+func (g *Gateway) MaxInflightObserved() int { return int(g.maxInflightObserved.Load()) }
+
+// CascadeCount returns how many rollback cascades actually detached a suffix.
+// Test observability: 0 means no in-flight batch was rolled back.
+func (g *Gateway) CascadeCount() int { return int(g.cascadeCount.Load()) }
+
+// InflightLen returns the number of currently outstanding (submitted-but-unresolved)
+// committer batches. Test observability.
+func (g *Gateway) InflightLen() int {
+	g.inflightMu.Lock()
+	defer g.inflightMu.Unlock()
+	return len(g.inflight)
 }
 
 // queryCommitStatus is the notifier's fallback: it decides whether the in-flight

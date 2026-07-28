@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,12 +128,35 @@ func (th *TestHarness) PrimeStateFromJSON(ctx context.Context, jsonFilePath stri
 // as cacheWrap to prepareHarnessConfig/buildEndorsers) -- passed straight through to
 // app.BuildGateway so the harness's one gateway and its endorsers agree on one cache.
 func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, cache *core.VersionedCache) (*TestHarness, *network.Synchronizer, error) {
-	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil, cache)
+	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil, cache, nil)
+}
+
+// NotifierControl is the test's handle on a notifier-mode local harness. The
+// gateway is NOT a block handler here; the test resolves in-flight batches by
+// calling Handler.Handle (the same path the real notification Processor uses).
+type NotifierControl struct {
+	Handler notification.TxStatusHandler // gw.SetNotifier(...) result; deliver events through it
+	mu      sync.Mutex
+	watched []string // fabric TxIDs the gateway Watch()ed, in submission order
+}
+
+// Watched returns a copy of the fabric TxIDs the gateway has registered so far,
+// in submission order. With SetMaxBatchSize(1), Watched()[k] is the k-th batch.
+func (c *NotifierControl) Watched() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.watched...)
 }
 
 // buildTestHarnessWithExtraHandler is like buildTestHarness but accepts an optional extra TxHandler
 // that will be inserted into the notification handler chain right before the cleanup handler.
-func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler, cache *core.VersionedCache) (*TestHarness, *network.Synchronizer, error) {
+//
+// notifierCtl, when non-nil (and useNotifications is false), selects notifier
+// mode: the gateway is dropped from the block-handler list (endorser DBs + chain
+// still feed state and receipts on the block stream) and gw.SetNotifier is wired
+// over a test-controlled channel, so the TEST is the sole in-flight resolver via
+// notifierCtl.Handler.Handle. nil = existing behavior.
+func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler, cache *core.VersionedCache, notifierCtl *NotifierControl) (*TestHarness, *network.Synchronizer, error) {
 	dbs := make([]storage.KVS, len(endorsers))
 	readStores := make([]execution.KVSSnapshotter, len(endorsers))
 	builders := make([]endorsement.Builder, len(endorsers))
@@ -211,7 +235,11 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 		}
 		// Add chain before gateway to ensure blocks are persisted before marking transactions complete
 		handlers = append(handlers, chain)
-		if !useNotifications {
+		// Drop gw from the block handlers in notification mode (useNotifications)
+		// and in notifier mode (notifierCtl != nil): in both, in-flight batches are
+		// resolved per-TxID instead of by the block stream. Receipts still flow
+		// through the chain + endorser DB handlers above.
+		if !useNotifications && notifierCtl == nil {
 			handlers = append(handlers, gw)
 		}
 
@@ -330,6 +358,28 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 			sync = nil
 		} else {
 			go func() error { return sync.Start(t.Context()) }()
+
+			// Notifier mode: the gateway is NOT a block handler (dropped above), so
+			// the test drives in-flight resolution by calling notifierCtl.Handler.Handle
+			// directly -- exactly what the real notification Processor does. Wire the
+			// gateway's txNotifier over a test-controlled channel and record every
+			// Watch()ed TxID (in submission order) into notifierCtl.
+			if notifierCtl != nil {
+				subscribeCh := make(chan []string, 1024)
+				notifierCtl.Handler = gw.SetNotifier(subscribeCh, cfg.Gateway.NotifyTimeout)
+				go func() {
+					for {
+						select {
+						case <-t.Context().Done():
+							return
+						case ids := <-subscribeCh:
+							notifierCtl.mu.Lock()
+							notifierCtl.watched = append(notifierCtl.watched, ids...)
+							notifierCtl.mu.Unlock()
+						}
+					}
+				}()
+			}
 		}
 	}
 
@@ -531,7 +581,19 @@ func NewLocalTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig e
 	}
 
 	if !bypass {
-		nw, err := fabrictest.Start(t.Context(), cfg.Network.Namespace, networkType, fabrictest.Config{}, endorsers[0].KVS)
+		// nil RecordGetter: the fabrictest committer validates each block's read
+		// versions against its OWN world-state DB, which commit() updates
+		// synchronously in block order before the next block is validated. This
+		// faithfully models a real fabric-x committer (block N+1 is validated only
+		// after block N's writes are applied). Passing endorsers[0].KVS instead
+		// would validate against the endorser DB, which the block synchronizer
+		// updates ASYNCHRONOUSLY -- so a pipelined dependent tx (nonce k+1 endorsed
+		// against nonce k's still-uncommitted cache write) would be validated
+		// before its predecessor's block reached the endorser DB, yielding a
+		// spurious MVCC version-mismatch conflict under -race. All committed state
+		// (including JSON priming) flows through the orderer, so the own DB is a
+		// complete, consistent validation source.
+		nw, err := fabrictest.Start(t.Context(), cfg.Network.Namespace, networkType, fabrictest.Config{}, nil)
 		if err != nil {
 			t.Fatalf("fabrictest.Start: %v", err)
 		}
@@ -546,6 +608,97 @@ func NewLocalTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig e
 	}
 
 	return th, nil
+}
+
+// NewLocalTestHarnessWithNotifier builds a local (in-process fabrictest,
+// memory-endorser) harness whose gateway is resolved by a test-driven notifier
+// instead of the block stream. The returned NotifierControl is the test's
+// control surface. configOverrides may set gateway config (e.g.
+// "Gateway.MaxInflight": 4 to bound the in-flight window before Start, or
+// "Gateway.NotifyTimeout": <dur> so the client timer fires -- Step 3 uses a
+// short value). Mirrors NewLocalTestHarnessWithFactory but drops gw from the
+// block handlers and wires gw.SetNotifier (see buildTestHarnessWithExtraHandler).
+func NewLocalTestHarnessWithNotifier(t *testing.T, logger sdk.Logger, evmConfig execution.EVMConfig, networkType string, configOverrides map[string]any) (*TestHarness, *NotifierControl, error) {
+	bypass := networkType == "bypass"
+
+	orderer := &common.Endpoint{Host: "127.0.0.1", Port: 1337}
+	peer := &common.Endpoint{Host: "127.0.0.1", Port: 1337}
+
+	// bypass mode uses Fabric block format
+	protocol := networkType
+	if bypass {
+		protocol = "fabric"
+	}
+
+	tname := strings.ReplaceAll(strings.ReplaceAll(t.Name(), "/", "_"), ".", "-")
+	dir := t.TempDir()
+	cfg := config.Config{
+		Network: common.Network{
+			Protocol:  protocol,
+			Channel:   "mychannel",
+			Namespace: "basic",
+			NsVersion: "1.0",
+			ChainID:   4011,
+		},
+		Gateway: config.Gateway{
+			Database: config.DB{
+				ConnString: filepath.Join(dir, tname+"gateway.db"),
+				TriePath:   filepath.Join(dir, tname+"triedb.db"),
+			},
+			SyncTimeout: 2 * time.Second,
+			Orderers: []common.ClientConfig{
+				{Endpoint: orderer},
+			},
+			Committer: common.ClientConfig{
+				Endpoint: peer,
+			},
+		},
+		Endorsers: []econf.Endorser{
+			{
+				Committer: common.ClientConfig{Endpoint: peer},
+				Name:      "endorser1",
+				Database: econf.DB{
+					Database:    "memory",
+					ConnString:  filepath.Join(dir, tname+"endorser1.db"),
+					HistorySize: 1,
+				},
+			},
+		},
+	}
+	// Exactly one VersionedCache for this harness's one gateway, shared by every
+	// endorser built below via cacheWrap -- see buildTestHarness's doc comment.
+	cache := core.NewVersionedCache()
+	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
+		return core.NewCachedSnapshotter(s, cache)
+	}
+
+	endorsers, err := prepareHarnessConfig(t, &cfg, &evmConfig, configOverrides, defaultEndorserFactory, cacheWrap)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !bypass {
+		// nil RecordGetter: validate against the committer's OWN synchronously-
+		// committed world state, not the async-synchronized endorser DB. Essential
+		// in notifier mode, where pipelined dependent txs commit before their
+		// predecessors' blocks reach the endorser DB. See the identical wiring in
+		// NewLocalTestHarnessWithFactory for the full rationale.
+		nw, err := fabrictest.Start(t.Context(), cfg.Network.Namespace, networkType, fabrictest.Config{}, nil)
+		if err != nil {
+			t.Fatalf("fabrictest.Start: %v", err)
+		}
+		// Don't register cleanup for nw.Stop - fabrictest.Start already registers its own cleanup internally
+		orderer.Port = nw.OrdererPort
+		peer.Port = nw.PeerPort
+	}
+
+	ctl := &NotifierControl{}
+	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, "", bypass, endorsers, false, nil, cache, ctl)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return th, ctl, nil
 }
 
 // newFileConfigHarness loads configFile (e.g. "fablo.yaml" for Fablo, "fabx.yaml" for
@@ -611,7 +764,7 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 	}
 
 	// Use buildTestHarness with useNotifications=true and extraHandler
-	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler, cache)
+	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler, cache, nil)
 	if err != nil {
 		return nil, err
 	}

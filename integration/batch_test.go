@@ -7,18 +7,24 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 package integration
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"errors"
+	"math"
 	"math/big"
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/hyperledger/fabric-x-common/api/committerpb"
+	"github.com/hyperledger/fabric-x-sdk/notification"
+	"github.com/stretchr/testify/require"
 )
 
 // newBatchSender generates a fresh EOA key for these tests.
@@ -290,6 +296,407 @@ func TestBatchMergedCommit(t *testing.T) {
 		}
 		if finalNonce != 2 {
 			t.Errorf("final nonce = %d, want 2 (two committed txs)", finalNonce)
+		}
+	})
+}
+
+// blockIndex identifies a committed tx's (block, transactionIndex) position, used
+// to assert distinct, contiguous per-block indices across a pipelined run.
+type blockIndex struct {
+	block uint64
+	index uint
+}
+
+// TestBatchPipelinedCommit exercises the pipelined executor + cross-batch cache
+// (Tasks 4-7) end-to-end through the gateway:
+//   - 1a proves N sequential-nonce txs pipeline into N committer batches that all
+//     commit with distinct, contiguous receipts (block-sync).
+//   - 1b proves DETERMINISTICALLY (notifier mode, no verdicts delivered) that the
+//     executor submits later batches before earlier ones resolve, bounded by the
+//     in-flight window -- i.e. it does not serialize on commit.
+//   - 2 proves a false-abort verdict cascades: the suffix re-executes, is absorbed
+//     as nonce-too-low, all txs stay committed, earlier batches are untouched.
+//   - 3 (+ sibling) proves a withheld notification falls back to committed via the
+//     query-service reader (client-timer branch + explicit sidecar-timeout branch).
+func TestBatchPipelinedCommit(t *testing.T) {
+	// SubmitterCount==1 gives these tests a single, ordered submission stream to the
+	// orderer. The pipelined executor endorses nonce k+1 against nonce k's still-
+	// uncommitted cache write, so the committer must validate them in nonce order
+	// (block k before block k+1) for the read-version chain to hold. The default 16
+	// BatchSubmitter workers drain the endorsement channel concurrently and can
+	// deliver dependent txs to the orderer out of nonce order, which on a real ledger
+	// self-corrects via the abort->cascade->re-execute path but makes these
+	// clean-commit assertions non-deterministic. One worker still exercises full
+	// pipelining: the executor never blocks on commit, so multiple batches remain
+	// in-flight (MaxInflightObserved > 1) regardless of the worker count.
+	orderedSubmit := map[string]any{"Gateway.SubmitterCount": 1}
+
+	// Step 1a: pipelined batches commit with distinct receipts (block-sync).
+	t.Run("pipelined_batches_commit_with_distinct_receipts", func(t *testing.T) {
+		th, err := NewLocalTestHarness(t, TestLogger{T: t}, evmConfig(""), "", "fabric-x", orderedSubmit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { th.Stop() })
+
+		node := th.Gateways[0]
+		node.SetMaxBatchSize(1) // one EVM tx per committer batch -> N txs == N batches
+		ec, err := NewNativeEthClient(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_, recipient := newBatchSender(t)
+		priv, addr := newBatchSender(t)
+		primer, err := th.NewStatePrimer()
+		if err != nil {
+			t.Fatalf("NewStatePrimer: %v", err)
+		}
+		if err := primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(t.Context(), true); err != nil {
+			t.Fatalf("fund sender: %v", err)
+		}
+
+		const n = 16
+		value := big.NewInt(1000)
+		txs := make([]*types.Transaction, n)
+		for i := 0; i < n; i++ {
+			txs[i] = signedValueTransfer(t, th.ethChainConfig, priv, uint64(i), recipient, value)
+		}
+
+		// Submit in nonce order so no drain cycle ever sees a gap.
+		for _, tx := range txs {
+			if err := ec.SendTransaction(t.Context(), tx); err != nil {
+				t.Fatalf("SendTransaction(nonce %d): %v", tx.Nonce(), err)
+			}
+		}
+		for _, tx := range txs {
+			waitForCommitT(t, ec, tx)
+		}
+
+		seen := map[blockIndex]common.Hash{}
+		byBlock := map[uint64][]uint{}
+		for _, tx := range txs {
+			receipt, err := ec.TransactionReceipt(t.Context(), tx.Hash())
+			if err != nil {
+				t.Fatalf("TransactionReceipt(%s): %v", tx.Hash(), err)
+			}
+			if receipt.Status != types.ReceiptStatusSuccessful {
+				t.Errorf("tx %s: receipt.Status = %d, want 1 (success)", tx.Hash(), receipt.Status)
+			}
+			k := blockIndex{block: receipt.BlockNumber.Uint64(), index: receipt.TransactionIndex}
+			if prev, dup := seen[k]; dup {
+				t.Fatalf("transactionIndex collision: block %d index %d used by both %s and %s",
+					k.block, k.index, prev, tx.Hash())
+			}
+			seen[k] = tx.Hash()
+			byBlock[k.block] = append(byBlock[k.block], k.index)
+		}
+		// Distinct, contiguous transactionIndex per block.
+		for block, indices := range byBlock {
+			sort.Slice(indices, func(i, j int) bool { return indices[i] < indices[j] })
+			for i := 1; i < len(indices); i++ {
+				if indices[i] != indices[i-1]+1 {
+					t.Errorf("block %d: transactionIndex values %v are not contiguous", block, indices)
+				}
+			}
+		}
+
+		finalNonce, err := ec.NonceAt(t.Context(), addr, nil)
+		if err != nil {
+			t.Fatalf("NonceAt: %v", err)
+		}
+		if finalNonce != n {
+			t.Errorf("final nonce = %d, want %d", finalNonce, n)
+		}
+
+		// Pipelining hook count: > 1 in-flight batch proves the executor did not
+		// serialize on commit. (Deterministically re-proven in 1b.)
+		if got := node.MaxInflightObserved(); got < 2 {
+			t.Errorf("MaxInflightObserved() = %d, want >= 2 (executor must not serialize on commit)", got)
+		}
+	})
+
+	// Step 1b: executor does not serialize on commit (notifier mode, deterministic).
+	t.Run("executor_does_not_serialize_on_commit", func(t *testing.T) {
+		th, ctl, err := NewLocalTestHarnessWithNotifier(t, TestLogger{T: t}, evmConfig(""), "fabric-x",
+			map[string]any{"Gateway.MaxInflight": 4, "Gateway.SubmitterCount": 1}) // bound the window + ordered submit before Start
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { th.Stop() })
+
+		node := th.Gateways[0]
+		node.SetMaxBatchSize(1)
+		ec, err := NewNativeEthClient(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+
+		_, recipient := newBatchSender(t)
+		priv, _ := newBatchSender(t)
+		primer, err := th.NewStatePrimer()
+		if err != nil {
+			t.Fatalf("NewStatePrimer: %v", err)
+		}
+		if err := primer.SetBalance(crypto.PubkeyToAddress(priv.PublicKey), big.NewInt(1_000_000_000)).Commit(ctx, true); err != nil {
+			t.Fatalf("fund sender: %v", err)
+		}
+
+		const n = 6
+		value := big.NewInt(1000)
+		txs := make([]*types.Transaction, n)
+		for i := 0; i < n; i++ {
+			txs[i] = signedValueTransfer(t, th.ethChainConfig, priv, uint64(i), recipient, value)
+			if err := ec.SendTransaction(ctx, txs[i]); err != nil {
+				t.Fatalf("SendTransaction(nonce %d): %v", i, err)
+			}
+		}
+
+		// Deliver NO verdicts: the window (4) fills, then the 5th/6th batches block
+		// on the semaphore BEFORE they can Watch, so exactly 4 TxIDs are registered.
+		require.Eventually(t, func() bool { return len(ctl.Watched()) == 4 },
+			10*time.Second, 5*time.Millisecond, "expected exactly 4 in-flight batches watched")
+		require.Equal(t, 4, node.MaxInflightObserved(), "peak in-flight must reach the window bound (4)")
+
+		// Backpressure plateau: with no verdicts delivered, no 5th batch is ever
+		// watched. A serialize-on-commit executor would submit 1 and block forever
+		// waiting for a commit that never comes (watermark would stay 1).
+		require.Never(t, func() bool { return len(ctl.Watched()) > 4 },
+			300*time.Millisecond, 20*time.Millisecond,
+			"window is full; no further batch may be submitted until a slot frees")
+
+		// Cleanup: free the window so the remaining txs drain and the registry
+		// empties (keeps the run clean under -race -- no blocked executor at exit).
+		for _, id := range ctl.Watched() {
+			require.NoError(t, ctl.Handler.Handle(ctx, []notification.TxStatusEvent{
+				{TxID: id, Status: committerpb.Status_COMMITTED},
+			}))
+		}
+		for _, tx := range txs {
+			waitForCommitT(t, ec, tx) // the freed slots admit nonce 4 & 5
+		}
+		require.Eventually(t, func() bool { return len(ctl.Watched()) == n },
+			10*time.Second, 5*time.Millisecond)
+		for _, id := range ctl.Watched() {
+			require.NoError(t, ctl.Handler.Handle(ctx, []notification.TxStatusEvent{
+				{TxID: id, Status: committerpb.Status_COMMITTED},
+			}))
+		}
+		require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+			10*time.Second, 5*time.Millisecond, "in-flight registry must drain")
+	})
+
+	// Step 2: cascade re-executes the suffix and stays consistent (notifier mode).
+	t.Run("cascade_reexecutes_suffix_and_stays_consistent", func(t *testing.T) {
+		th, ctl, err := NewLocalTestHarnessWithNotifier(t, TestLogger{T: t}, evmConfig(""), "fabric-x", orderedSubmit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { th.Stop() })
+
+		node := th.Gateways[0]
+		node.SetMaxBatchSize(1) // default (long) MaxInflight/NotifyTimeout: the test drives all resolution
+		ec, err := NewNativeEthClient(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+
+		_, recipient := newBatchSender(t)
+		priv, addr := newBatchSender(t)
+		primer, err := th.NewStatePrimer()
+		if err != nil {
+			t.Fatalf("NewStatePrimer: %v", err)
+		}
+		if err := primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(ctx, true); err != nil {
+			t.Fatalf("fund sender: %v", err)
+		}
+
+		value := big.NewInt(1000)
+		txs := make([]*types.Transaction, 3)
+		for i := range txs {
+			txs[i] = signedValueTransfer(t, th.ethChainConfig, priv, uint64(i), recipient, value)
+			if err := ec.SendTransaction(ctx, txs[i]); err != nil {
+				t.Fatalf("SendTransaction(nonce %d): %v", i, err)
+			}
+		}
+		// They commit on the in-process ledger and sync to the endorser DB
+		// regardless of notifier resolution (gateway is not the block handler).
+		for _, tx := range txs {
+			waitForCommitT(t, ec, tx)
+		}
+		require.Eventually(t, func() bool { return len(ctl.Watched()) == 3 },
+			10*time.Second, 5*time.Millisecond)
+		b := ctl.Watched() // b[0..2] == tx0..tx2 batches
+
+		// Resolve b[0] committed, then deliver a FALSE abort for the MIDDLE batch.
+		// This drives resolveInflight(b[1], false) -> cascadeFrom(b[1]): detach
+		// b[1] and b[2] (suffix), rebuild the cache from the survivor (b[0]),
+		// re-queue tx1 & tx2. Because tx1 & tx2 already committed AND synced to the
+		// endorser DB, re-execution sees their nonces bumped -> excluded as
+		// nonce-too-low -> NO new in-flight batch. (See task-8-supplement Part D.)
+		require.NoError(t, ctl.Handler.Handle(ctx, []notification.TxStatusEvent{
+			{TxID: b[0], Status: committerpb.Status_COMMITTED},
+		}))
+		require.NoError(t, ctl.Handler.Handle(ctx, []notification.TxStatusEvent{
+			{TxID: b[1], Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+		}))
+
+		require.Eventually(t, func() bool { return node.CascadeCount() == 1 },
+			10*time.Second, 5*time.Millisecond, "exactly one real cascade must fire")
+		require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+			10*time.Second, 5*time.Millisecond, "registry must drain (no re-submission, no deadlock)")
+		require.Equal(t, 1, node.CascadeCount(), "exactly one cascade")
+
+		// All three keep valid receipts (tx0 untouched; tx1/tx2 keep their original
+		// commit receipts -- the re-execution never re-committed them).
+		for _, tx := range txs {
+			receipt, err := ec.TransactionReceipt(ctx, tx.Hash())
+			if err != nil {
+				t.Fatalf("TransactionReceipt(%s): %v", tx.Hash(), err)
+			}
+			if receipt.Status != types.ReceiptStatusSuccessful {
+				t.Errorf("tx %s: receipt.Status = %d, want 1 (success)", tx.Hash(), receipt.Status)
+			}
+		}
+		finalNonce, err := ec.NonceAt(ctx, addr, nil)
+		if err != nil {
+			t.Fatalf("NonceAt: %v", err)
+		}
+		if finalNonce != 3 {
+			t.Errorf("final nonce = %d, want 3", finalNonce)
+		}
+	})
+
+	// Step 3: a dropped notification falls back to committed via the client timer.
+	t.Run("dropped_notification_falls_back_to_committed", func(t *testing.T) {
+		th, _, err := NewLocalTestHarnessWithNotifier(t, TestLogger{T: t}, evmConfig(""), "fabric-x",
+			map[string]any{"Gateway.NotifyTimeout": 300 * time.Millisecond, "Gateway.SubmitterCount": 1}) // client timer fires quickly; ordered submit
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { th.Stop() })
+
+		node := th.Gateways[0]
+		node.SetMaxBatchSize(1)
+		ec, err := NewNativeEthClient(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+
+		// Committed-version reader that reports state fully advanced (>= any spec
+		// version) so the timeout fallback resolves the batch COMMITTED, not rolled
+		// back. Set before submitting: the write happens-before the executor's
+		// Watch (which arms the timer whose fire later reads it).
+		node.SetCommittedVersionReader(func(_ context.Context, _ string) (uint64, bool, error) {
+			return math.MaxUint64, true, nil
+		})
+
+		_, recipient := newBatchSender(t)
+		priv, addr := newBatchSender(t)
+		primer, err := th.NewStatePrimer()
+		if err != nil {
+			t.Fatalf("NewStatePrimer: %v", err)
+		}
+		if err := primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(ctx, true); err != nil {
+			t.Fatalf("fund sender: %v", err)
+		}
+
+		tx0 := signedValueTransfer(t, th.ethChainConfig, priv, 0, recipient, big.NewInt(1000))
+		if err := ec.SendTransaction(ctx, tx0); err != nil {
+			t.Fatalf("SendTransaction: %v", err)
+		}
+		waitForCommitT(t, ec, tx0) // committed on the ledger
+
+		// Withhold the notification: the 300ms client timer fires -> onTimeout ->
+		// fallback (reader >= spec) -> resolveInflight(committed). No rollback.
+		require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+			10*time.Second, 5*time.Millisecond, "the fallback must resolve the batch committed")
+		require.Equal(t, 0, node.CascadeCount(), "a committed fallback must not roll back")
+
+		receipt, err := ec.TransactionReceipt(ctx, tx0.Hash())
+		if err != nil {
+			t.Fatalf("TransactionReceipt: %v", err)
+		}
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			t.Errorf("tx0 receipt.Status = %d, want 1 (success)", receipt.Status)
+		}
+		finalNonce, err := ec.NonceAt(ctx, addr, nil)
+		if err != nil {
+			t.Fatalf("NonceAt: %v", err)
+		}
+		if finalNonce != 1 {
+			t.Errorf("final nonce = %d, want 1", finalNonce)
+		}
+	})
+
+	// Step 3 sibling: an explicit STATUS_UNSPECIFIED (sidecar-timeout) event also
+	// falls back to committed -- exercising the Handle branch (vs the client-timer
+	// branch above). Long NotifyTimeout so only the explicit event resolves.
+	t.Run("sidecar_timeout_event_falls_back_to_committed", func(t *testing.T) {
+		th, ctl, err := NewLocalTestHarnessWithNotifier(t, TestLogger{T: t}, evmConfig(""), "fabric-x", orderedSubmit)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { th.Stop() })
+
+		node := th.Gateways[0]
+		node.SetMaxBatchSize(1)
+		ec, err := NewNativeEthClient(node)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx := t.Context()
+
+		node.SetCommittedVersionReader(func(_ context.Context, _ string) (uint64, bool, error) {
+			return math.MaxUint64, true, nil
+		})
+
+		_, recipient := newBatchSender(t)
+		priv, addr := newBatchSender(t)
+		primer, err := th.NewStatePrimer()
+		if err != nil {
+			t.Fatalf("NewStatePrimer: %v", err)
+		}
+		if err := primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(ctx, true); err != nil {
+			t.Fatalf("fund sender: %v", err)
+		}
+
+		tx0 := signedValueTransfer(t, th.ethChainConfig, priv, 0, recipient, big.NewInt(1000))
+		if err := ec.SendTransaction(ctx, tx0); err != nil {
+			t.Fatalf("SendTransaction: %v", err)
+		}
+		waitForCommitT(t, ec, tx0)
+
+		require.Eventually(t, func() bool { return len(ctl.Watched()) == 1 },
+			10*time.Second, 5*time.Millisecond)
+		b := ctl.Watched()
+
+		// Deliver the sidecar's own timeout sentinel -> Handle defers to the query
+		// fallback (reader >= spec) -> resolveInflight(committed).
+		require.NoError(t, ctl.Handler.Handle(ctx, []notification.TxStatusEvent{
+			{TxID: b[0], Status: committerpb.Status_STATUS_UNSPECIFIED},
+		}))
+
+		require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+			10*time.Second, 5*time.Millisecond)
+		require.Equal(t, 0, node.CascadeCount(), "a committed fallback must not roll back")
+
+		receipt, err := ec.TransactionReceipt(ctx, tx0.Hash())
+		if err != nil {
+			t.Fatalf("TransactionReceipt: %v", err)
+		}
+		if receipt.Status != types.ReceiptStatusSuccessful {
+			t.Errorf("tx0 receipt.Status = %d, want 1 (success)", receipt.Status)
+		}
+		finalNonce, err := ec.NonceAt(ctx, addr, nil)
+		if err != nil {
+			t.Fatalf("NonceAt: %v", err)
+		}
+		if finalNonce != 1 {
+			t.Errorf("final nonce = %d, want 1", finalNonce)
 		}
 	})
 }

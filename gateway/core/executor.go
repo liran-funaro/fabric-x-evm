@@ -228,6 +228,12 @@ func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws 
 	}
 	g.inflightMu.Lock()
 	g.inflight = append(g.inflight, b)
+	// Record the peak in-flight watermark (pure test observability; see
+	// MaxInflightObserved). Under inflightMu there is no writer race; atomic.Int64
+	// is used so the accessor can read it without taking the lock.
+	if n := int64(len(g.inflight)); n > g.maxInflightObserved.Load() {
+		g.maxInflightObserved.Store(n)
+	}
 	g.inflightMu.Unlock()
 
 	// Register-then-submit: with the registry entry in place, subscribe to this
@@ -325,6 +331,11 @@ func (g *Gateway) cascadeFrom(txID string) {
 	// clobbering the detached suffix we still read below.
 	suffix := g.inflight[idx:]
 	g.inflight = g.inflight[:idx:idx]
+	// Count this as one real cascade: the txID was found and a suffix is being
+	// detached (pure test observability; see CascadeCount). The idempotent
+	// not-found early return above never reaches here, so already-resolved IDs
+	// are not counted.
+	g.cascadeCount.Add(1)
 	g.inflightMu.Unlock()
 
 	for _, b := range suffix {
