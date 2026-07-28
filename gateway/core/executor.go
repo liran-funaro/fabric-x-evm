@@ -217,15 +217,25 @@ func committerTxID(prop *peer.Proposal) (string, error) {
 // below is the sole guarantee that a lost commit/abort cannot wedge the in-flight
 // window: on it, resolveInflight rolls the batch back exactly as an MVCC abort
 // would. The g.Watch call is a no-op on that path.
+//
+// Ordering: the AfterFunc backstop (unwired path) is armed AFTER the registry
+// append below, symmetric with the notifier path (which arms its own timer only
+// once Watch runs, also after the append). This closes the theoretical window
+// where the timer could fire before the entry exists (a no-op into an empty
+// registry, leaking the in-flight slot forever). The arm happens while still
+// holding inflightMu (in the same critical section as the append), NOT after
+// releasing it: cascadeFrom/resolveInflight read b.timer both under inflightMu
+// and, for an already-detached suffix, after unlocking (see cascadeFrom) --
+// either way they only ever observe b after acquiring inflightMu at least once,
+// so b.timer must be fully written before that same lock is released here, or
+// a concurrent cascade of an earlier in-flight batch (which can run on another
+// goroutine at any time once this batch is appended) could read b.timer while
+// it is being written, an unsynchronized data race. resolveInflight/cascadeFrom
+// remain idempotent regardless, so a fast commit/cascade that resolves the
+// entry the instant after this critical section releases the lock is harmless.
 func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws blocks.ReadWriteSet, specVers map[string]uint64) {
 	b := &inflightBatch{txID: txID, included: included, rws: rws, specVers: specVers}
-	if g.notifier == nil {
-		timeout := g.commitTimeout
-		if timeout <= 0 {
-			timeout = commitTimeoutDefault
-		}
-		b.timer = time.AfterFunc(timeout, func() { g.resolveInflight(txID, false) })
-	}
+
 	g.inflightMu.Lock()
 	g.inflight = append(g.inflight, b)
 	// Record the peak in-flight watermark (pure test observability; see
@@ -233,6 +243,13 @@ func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws 
 	// is used so the accessor can read it without taking the lock.
 	if n := int64(len(g.inflight)); n > g.maxInflightObserved.Load() {
 		g.maxInflightObserved.Store(n)
+	}
+	if g.notifier == nil {
+		timeout := g.commitTimeout
+		if timeout <= 0 {
+			timeout = commitTimeoutDefault
+		}
+		b.timer = time.AfterFunc(timeout, func() { g.resolveInflight(txID, false) })
 	}
 	g.inflightMu.Unlock()
 

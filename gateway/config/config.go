@@ -54,7 +54,7 @@ type Gateway struct {
 
 	SyncTimeout time.Duration `mapstructure:"sync-timeout" yaml:"sync-timeout"`
 
-	SubmitterCount      int `mapstructure:"submitter-count"       yaml:"submitter-count"`       // number of batch submitter worker goroutines; defaults to 16 if not set
+	SubmitterCount      int `mapstructure:"submitter-count"       yaml:"submitter-count"`       // number of batch submitter worker goroutines; defaults to 16 if not set. On the production pipelined gateway path (gateway/app.buildApp) orderer submission is always serialized to a single worker regardless of this value (clamped with a warning if > 1), because the pipelined executor requires committer txs to reach the orderer in submission order; this field is otherwise retained for non-production / independent-workload submitters (see core.NewBatchSubmitter, core.BuildGateway).
 	EndorsementChanSize int `mapstructure:"endorsement-chan-size" yaml:"endorsement-chan-size"` // capacity of the endorsement channel; defaults to 1000 if not set
 	MaxBatchSize        int `mapstructure:"max-batch-size"        yaml:"max-batch-size"`        // max EVM txs folded into one merged committer tx per drain cycle; 0 = unbounded drain-all (see core.Gateway.SetMaxBatchSize)
 	MaxInflight         int `mapstructure:"max-inflight"          yaml:"max-inflight"`          // max submitted-but-unconfirmed committer txs the pipelined executor keeps in flight; <=0 defaults to 16 (see core.Gateway.SetMaxInflight)

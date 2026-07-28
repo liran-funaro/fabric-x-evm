@@ -22,6 +22,25 @@ import (
 	"github.com/hyperledger/fabric-x-evm/gateway/core"
 )
 
+// orderedOrdererSubmitterCount returns the orderer-submission worker count for the
+// PRODUCTION pipelined gateway path, which supports only a SINGLE orderer
+// submitter regardless of the configured count: the pipelined executor endorses
+// batch k+1 against batch k's still-uncommitted cache writes, so the committer
+// MUST see dependent committer txs in submission order. executeCycle runs on one
+// goroutine and enqueues to endorsementChan in order, but with more than one
+// BatchSubmitter worker draining that channel, dependent committer txs can reach
+// the orderer out of order, causing an MVCC-abort cascade. Batches are already
+// serialized by the single executor, so concurrent orderer submission can only
+// reorder; it never helps. This does not affect non-production callers of
+// BuildGateway/NewBatchSubmitter (tests, independent-workload submitters), which
+// still pass and get an explicit count.
+func orderedOrdererSubmitterCount(configured int, logger sdk.Logger) int {
+	if configured > 1 {
+		logger.Warnf("submitter-count=%d ignored: orderer submission is serialized to 1 to preserve cross-batch MVCC submission order (the pipelined executor endorses batch k+1 against batch k's uncommitted writes)", configured)
+	}
+	return 1
+}
+
 // NewNetworkSubmitters creates one network submitter per parallel-submission worker for
 // the given protocol. count <= 0 defaults to core.DefaultNumWorkers. This is the wiring
 // shared between a real backend (connecting to real orderers) and an in-process test

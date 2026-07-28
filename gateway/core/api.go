@@ -257,6 +257,15 @@ func (g *Gateway) InflightLen() int {
 // committed version >= the spec version means this (earliest-uncommitted) writer's
 // write landed. On any read error, a missing key, an unknown txID, or a nil reader
 // it returns false (conservative rollback -> cascade -> MVCC self-corrects).
+//
+// Note on spec == 0: a first-write-of-an-absent-key has spec version 0, so
+// committedVersion >= 0 is trivially true for that key and cannot by itself
+// distinguish committed from uncommitted. This is acceptable only under the RMW
+// invariant that every written key is also read first and the sender's nonce
+// write is always present with spec > 0 -- so a batch's commit decision never
+// rests on a spec==0 key alone. spec==0 keys are intentionally NOT rejected
+// here: doing so would force a rollback for every batch that creates a new key,
+// which is over-conservative.
 func (g *Gateway) queryCommitStatus(txID string) bool {
 	// Copy the batch's spec versions out under the lock; the batch's specVers map
 	// is never mutated after trackInflight records it, but copy anyway so we never
@@ -282,8 +291,26 @@ func (g *Gateway) queryCommitStatus(txID string) bool {
 	if g.committedVersion == nil {
 		return false // no live query service -> conservative rollback
 	}
+	if len(specVers) == 0 {
+		// Defensive: an empty spec set makes the loop below vacuously "committed",
+		// which would drop the batch's txs without a cascade -- the unrecoverable
+		// direction. Roll back conservatively instead. Unreachable in the EVM
+		// workload (every tx bumps the sender nonce, so specVers is non-empty), but
+		// fallback safety must not silently depend on that.
+		return false
+	}
 
-	ctx := context.Background()
+	// queryCommitStatus runs synchronously inside txNotifier.Handle, which the
+	// notification Processor invokes SERIALLY -- a hung query call would stall
+	// the entire notification stream. Bound it to the gateway's existing
+	// commit-timeout backstop so it can never block longer than a batch's
+	// stall backstop.
+	timeout := g.commitTimeout
+	if timeout <= 0 {
+		timeout = commitTimeoutDefault
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
 	for key, spec := range specVers {
 		v, ok, err := g.committedVersion(ctx, key)
 		if err != nil || !ok || v < spec {

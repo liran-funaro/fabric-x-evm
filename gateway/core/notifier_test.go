@@ -245,6 +245,27 @@ func TestQueryCommitStatus(t *testing.T) {
 		}
 		require.False(t, g.queryCommitStatus("no-such-tx"))
 	})
+
+	t.Run("empty specVers -> not committed (conservative, even if reader says committed)", func(t *testing.T) {
+		g := &Gateway{}
+		g.inflight = append(g.inflight, &inflightBatch{txID: txID, specVers: map[string]uint64{}})
+		g.committedVersion = func(_ context.Context, key string) (uint64, bool, error) {
+			return 0, true, nil // would say "committed" for any key, if the loop ran
+		}
+		require.False(t, g.queryCommitStatus(txID),
+			"an empty spec set must not be treated as vacuously committed")
+	})
+
+	t.Run("query context is bounded by commitTimeout", func(t *testing.T) {
+		g := newGatewayWithBatch()
+		g.commitTimeout = time.Minute
+		g.committedVersion = func(ctx context.Context, key string) (uint64, bool, error) {
+			_, ok := ctx.Deadline()
+			require.True(t, ok, "fallback query context must carry a deadline")
+			return specVers[key], true, nil
+		}
+		require.True(t, g.queryCommitStatus(txID))
+	})
 }
 
 // compile-time guard: txNotifier must satisfy notification.TxStatusHandler.

@@ -138,8 +138,13 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 		orderers[i] = o.ToOrdererConf()
 	}
 
-	// Create multiple submitter instances for parallel submission (one per worker)
-	submitters, err := NewNetworkSubmitters(ctx, cfg.Network.Protocol, orderers, gwSigner, cfg.Gateway.SubmitterCount, logger)
+	// PRODUCTION path: orderer submission is serialized to a single worker,
+	// regardless of cfg.Gateway.SubmitterCount, to preserve cross-batch MVCC
+	// submission order for the pipelined executor (see
+	// orderedOrdererSubmitterCount). Computed once and reused below so a
+	// misconfigured count only warns once per buildApp call.
+	submitterCount := orderedOrdererSubmitterCount(cfg.Gateway.SubmitterCount, logger)
+	submitters, err := NewNetworkSubmitters(ctx, cfg.Network.Protocol, orderers, gwSigner, submitterCount, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -149,8 +154,9 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 		return nil, fmt.Errorf("failed to create chain: %w", err)
 	}
 
-	// Gateway owns the BatchSubmitter and will handle its lifecycle
-	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cache)
+	// Gateway owns the BatchSubmitter and will handle its lifecycle. Reuse the
+	// same clamped submitterCount computed above (see orderedOrdererSubmitterCount).
+	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, submitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cache)
 	if err != nil {
 		return nil, err
 	}

@@ -40,6 +40,16 @@ var SetBatchSubmitterQueueSizeMetric func(size int)
 // Each worker has its own submitter instance for better performance.
 // Rate limiting is optionally applied across all workers to ensure aggregate submission rate
 // does not exceed the configured limit.
+//
+// Ordering invariant: when the producer feeding inputChan emits order-dependent
+// committer txs -- the pipelined gateway does, since it endorses batch k+1
+// against batch k's still-uncommitted cache writes and therefore requires the
+// committer to see them in submission order -- numWorkers MUST be 1. With more
+// than one worker, parallel delivery to the orderer can reorder those dependent
+// txs and break cross-batch MVCC validation (see
+// gateway/app.orderedOrdererSubmitterCount, which enforces this on the
+// production path). Non-production callers with independent (order-insensitive)
+// workloads may still pass numWorkers > 1.
 type BatchSubmitter struct {
 	submitters  []Submitter // One submitter per worker for parallel submission
 	inputChan   chan sdk.Endorsement
