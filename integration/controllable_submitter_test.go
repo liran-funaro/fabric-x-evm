@@ -196,8 +196,14 @@ func NewLocalTestHarnessWithSubmitterControl(t *testing.T, logger sdk.Logger, ev
 	}
 
 	ctl := &SubmitterControl{holdN: holdN}
+	// INVARIANT: this closure assumes exactly one submitter (cfg.Gateway.SubmitterCount
+	// forced to 1 above). It records each wrapped submitter as the SINGLE ctl.inner, so
+	// with SubmitterCount > 1 every controllableSubmitter would share one ctl and only the
+	// last-wrapped submitter's inner would be reachable -- ReleaseReversed/passthrough would
+	// then forward to the wrong submitter. Do not relax the SubmitterCount==1 clamp without
+	// making ctl hold a per-submitter inner.
 	wrap := func(s core.Submitter) core.Submitter {
-		ctl.inner = s // SubmitterCount==1: exactly one submitter is wrapped
+		ctl.inner = s
 		return &controllableSubmitter{ctl: ctl}
 	}
 	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, "", bypass, endorsers, false, nil, cache, nil, wrap)
