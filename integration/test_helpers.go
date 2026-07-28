@@ -128,7 +128,7 @@ func (th *TestHarness) PrimeStateFromJSON(ctx context.Context, jsonFilePath stri
 // as cacheWrap to prepareHarnessConfig/buildEndorsers) -- passed straight through to
 // app.BuildGateway so the harness's one gateway and its endorsers agree on one cache.
 func buildTestHarness(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, cache *core.VersionedCache) (*TestHarness, *network.Synchronizer, error) {
-	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil, cache, nil)
+	return buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDBPath, bypass, endorsers, useNotifications, nil, cache, nil, nil)
 }
 
 // NotifierControl is the test's handle on a notifier-mode local harness. The
@@ -156,7 +156,11 @@ func (c *NotifierControl) Watched() []string {
 // still feed state and receipts on the block stream) and gw.SetNotifier is wired
 // over a test-controlled channel, so the TEST is the sole in-flight resolver via
 // notifierCtl.Handler.Handle. nil = existing behavior.
-func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler, cache *core.VersionedCache, notifierCtl *NotifierControl) (*TestHarness, *network.Synchronizer, error) {
+//
+// submitterWrap, when non-nil, wraps each freshly-built network/local submitter
+// before the gateway's BatchSubmitter is constructed, letting a test intercept
+// orderer submission (order/buffering). nil = existing behavior.
+func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg config.Config, evmConfig execution.EVMConfig, primeDBPath string, bypass bool, endorsers []EndorserComponents, useNotifications bool, extraHandler common.TxHandler, cache *core.VersionedCache, notifierCtl *NotifierControl, submitterWrap func(core.Submitter) core.Submitter) (*TestHarness, *network.Synchronizer, error) {
 	dbs := make([]storage.KVS, len(endorsers))
 	readStores := make([]execution.KVSSnapshotter, len(endorsers))
 	builders := make([]endorsement.Builder, len(endorsers))
@@ -210,6 +214,12 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 		submitters, err = app.NewNetworkSubmitters(t.Context(), cfg.Network.Protocol, orderers, gwSigner, submitterCount, logger)
 		if err != nil {
 			return nil, nil, err
+		}
+	}
+
+	if submitterWrap != nil {
+		for i := range submitters {
+			submitters[i] = submitterWrap(submitters[i])
 		}
 	}
 
@@ -693,7 +703,7 @@ func NewLocalTestHarnessWithNotifier(t *testing.T, logger sdk.Logger, evmConfig 
 	}
 
 	ctl := &NotifierControl{}
-	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, "", bypass, endorsers, false, nil, cache, ctl)
+	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, "", bypass, endorsers, false, nil, cache, ctl, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -764,7 +774,7 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 	}
 
 	// Use buildTestHarness with useNotifications=true and extraHandler
-	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler, cache, nil)
+	th, _, err := buildTestHarnessWithExtraHandler(t, logger, cfg, evmConfig, primeDbPath, false, endorsers, true, extraHandler, cache, nil, nil)
 	if err != nil {
 		return nil, err
 	}

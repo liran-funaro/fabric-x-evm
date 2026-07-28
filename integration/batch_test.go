@@ -700,3 +700,85 @@ func TestBatchPipelinedCommit(t *testing.T) {
 		}
 	})
 }
+
+// TestBatchGenuineAbort proves the pipelined executor RECOVERS from a genuine
+// committer MVCC abort caused by out-of-order orderer submission: batch k+1 (endorsed
+// against k's uncommitted cache write) is submitted to the orderer BEFORE k, so the
+// committer aborts k+1; the gateway cascades k+1 back to pending, k commits, k+1
+// re-executes against committed state into a NEW committer batch, and that re-commits.
+// Both txs end committed exactly once; exactly one cascade fires. (Distinct from
+// TestBatchPipelinedCommit's FALSE-abort case, where re-execution is absorbed as
+// nonce-too-low and produces no new batch.) Also regression-guards the production
+// SubmitterCount=1 clamp by injecting the exact reordering it prevents.
+func TestBatchGenuineAbort(t *testing.T) {
+	th, ctl, err := NewLocalTestHarnessWithSubmitterControl(t, TestLogger{T: t}, evmConfig(""), "fabric-x", 2, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { th.Stop() })
+
+	node := th.Gateways[0]
+	node.SetMaxBatchSize(1) // one EVM tx per committer batch
+	ec, err := NewNativeEthClient(node)
+	require.NoError(t, err)
+	ctx := t.Context()
+
+	_, recipient := newBatchSender(t)
+	priv, addr := newBatchSender(t)
+	primer, err := th.NewStatePrimer()
+	require.NoError(t, err)
+	// Pre-commit the sender's account so its keys exist at a committed version
+	// (removes the fresh-absent-key MVCC ambiguity -- the read-version mismatch on
+	// reorder is then unambiguous).
+	require.NoError(t, primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(ctx, true))
+
+	// Arm the controllable submitter only now: priming's own Commit(ctx, true) call
+	// above submits through this same wrapped submitter (see SubmitterControl's doc
+	// comment), and unarmed Submit calls pass straight through so that blocking commit
+	// wait can actually complete.
+	ctl.Arm()
+
+	value := big.NewInt(1000)
+	tx0 := signedValueTransfer(t, th.ethChainConfig, priv, 0, recipient, value)
+	tx1 := signedValueTransfer(t, th.ethChainConfig, priv, 1, recipient, value)
+
+	// Submit in nonce order so the executor drains tx0 (batch k) then tx1 (batch k+1),
+	// endorsing k+1 against k's cache write. Both are buffered by the controllable
+	// submitter (Submit returns nil), so both register in-flight without reaching the
+	// orderer yet.
+	require.NoError(t, ec.SendTransaction(ctx, tx0))
+	require.NoError(t, ec.SendTransaction(ctx, tx1))
+
+	require.Eventually(t, func() bool { return ctl.BufferedLen() == 2 },
+		10*time.Second, 5*time.Millisecond, "both batches must be buffered before release")
+
+	// Forward k+1 BEFORE k -> committer MVCC-aborts k+1 -> cascade -> k commits ->
+	// tx1 re-executes into k+1' -> passes through the submitter -> re-commits.
+	require.NoError(t, ctl.ReleaseReversed(ctx))
+
+	// Both txs end committed (tx1 via its re-execution).
+	waitForCommitT(t, ec, tx0)
+	waitForCommitT(t, ec, tx1)
+
+	// Exactly one cascade fired (k+1's genuine abort); the re-execution commits cleanly.
+	require.Eventually(t, func() bool { return node.CascadeCount() == 1 },
+		10*time.Second, 5*time.Millisecond, "exactly one genuine cascade must fire")
+	require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+		10*time.Second, 5*time.Millisecond, "in-flight registry must drain")
+	require.Equal(t, 1, node.CascadeCount(), "exactly one cascade")
+
+	// Both receipts successful; each applied EXACTLY once despite the abort+re-exec.
+	for _, tx := range []*types.Transaction{tx0, tx1} {
+		receipt, err := ec.TransactionReceipt(ctx, tx.Hash())
+		require.NoErrorf(t, err, "TransactionReceipt(%s)", tx.Hash())
+		require.Equalf(t, types.ReceiptStatusSuccessful, receipt.Status, "tx %s status", tx.Hash())
+	}
+
+	finalNonce, err := ec.NonceAt(ctx, addr, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), finalNonce, "sender nonce = 2 (both txs applied once)")
+
+	// Recipient received exactly 2*value -- proves tx1's transfer applied ONCE (the
+	// aborted attempt k+1 left no committed effect; the re-execution k+1' applied it).
+	recipientBal, err := ec.BalanceAt(ctx, recipient, nil)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(0).Mul(value, big.NewInt(2)), recipientBal, "recipient got exactly 2*value")
+}
