@@ -242,14 +242,18 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 			chain.Close()
 			logger.Infof("Synchronizer stopped cleanly")
 
-			// Set up AllTxStreamer notification system
-			txHandlers := make([]common.TxHandler, 0, len(dbs)+2)
+			// The AllTxStreamer keeps feeding the ENDORSER DBs their committed
+			// state (in "memory" mode this is how the in-process KVS learns
+			// committed state). The gateway is NO LONGER on this broadcast
+			// stream: it is now resolved per-TxID by the Notifier wired below,
+			// which additionally sees aborts + sidecar timeouts the all-tx stream
+			// cannot deliver, plus the query-service fallback for a timeout.
+			txHandlers := make([]common.TxHandler, 0, len(dbs)+1)
 			for _, db := range dbs {
 				if db != nil {
 					txHandlers = append(txHandlers, db.(common.TxHandler))
 				}
 			}
-			txHandlers = append(txHandlers, gw)
 			if extraHandler != nil {
 				txHandlers = append(txHandlers, extraHandler)
 			}
@@ -272,7 +276,55 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 						logger.Errorf("AllTxStreamer error: %v", err)
 					}
 				}()
-				logger.Infof("AllTxStreamer active")
+				logger.Infof("AllTxStreamer active (endorser DBs)")
+
+				// Per-TxID Notifier: resolves the gateway's in-flight batches by
+				// their real commit/abort/timeout status. The gateway's Watch
+				// pushes each submitted TxID onto subscribeCh before submit
+				// (register-then-submit); the Subscribe loop below forwards them
+				// to the sidecar's notification stream and routes verdicts back
+				// through the gateway's txNotifier handler.
+				subscribeCh := make(chan []string, 1024)
+
+				// Query-service fallback for a sidecar timeout (STATUS_UNSPECIFIED):
+				// read a key's committed version from the endorser's query view.
+				// Wired only in query-service mode; left nil in "memory" mode so a
+				// timeout stays a conservative rollback (never reads the in-process
+				// KVS -- out of scope). The endorser ReadStore is the raw query
+				// Store (uncached), so this observes real committed state.
+				if len(cfg.Endorsers) > 0 && cfg.Endorsers[0].Database.Database == "query-service" && endorsers[0].ReadStore != nil {
+					reader := endorsers[0].ReadStore
+					ns := cfg.Network.Namespace
+					gw.SetCommittedVersionReader(func(_ context.Context, key string) (uint64, bool, error) {
+						view, err := reader.NewSnapshot(0)
+						if err != nil {
+							return 0, false, err
+						}
+						defer view.Close()
+						rec, err := view.Get(ns, key)
+						if err != nil {
+							return 0, false, err
+						}
+						if rec == nil {
+							return 0, false, nil
+						}
+						return rec.Version, true, nil
+					})
+				}
+
+				handler := gw.SetNotifier(subscribeCh, 0) // 0 -> gateway commitTimeout client backstop
+				processor := notification.NewProcessor([]notification.TxStatusHandler{handler}, logger)
+				notifier := notification.NewNotifier(peer, processor)
+				// Sidecar-side per-request timeout: kept below the client-side
+				// backstop so a genuine stall surfaces as STATUS_UNSPECIFIED ->
+				// query fallback before the client timer blindly rolls back.
+				notifier.SetDefaultTimeout(30 * time.Second)
+				go func() {
+					if err := notifier.Subscribe(t.Context(), subscribeCh); err != nil && t.Context().Err() == nil {
+						logger.Errorf("Notifier error: %v", err)
+					}
+				}()
+				logger.Infof("per-TxID Notifier active (gateway)")
 			}
 
 			sync = nil

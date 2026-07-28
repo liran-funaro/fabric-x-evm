@@ -48,12 +48,17 @@ const defaultMaxInflight = 16
 // pending at submit time (so the next cycle does not re-drain them) and
 // re-added on rollback; rws is the merged read-write set applied to the cache
 // (retained so a cascade can rebuild the cache from surviving batches -- Task
-// 5); timer is the per-batch backstop that rolls the batch back if no
-// commit/abort notification arrives in time.
+// 5); specVers maps each written key to the spec version the cache assigned it
+// at submit time (captured immediately after ApplyWrites, when this batch is the
+// latest writer of all its keys), used by queryCommitStatus to adjudicate a
+// sidecar timeout against committed versions; timer is the per-batch backstop
+// that rolls the batch back if no commit/abort notification arrives in time --
+// nil when a per-TxID notifier owns the timeout (see trackInflight).
 type inflightBatch struct {
 	txID     string
 	included []*types.Transaction
 	rws      blocks.ReadWriteSet
+	specVers map[string]uint64
 	timer    *time.Timer
 }
 
@@ -138,6 +143,19 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 	// the next cycle's endorsement reads them without waiting for the commit.
 	g.cache.ApplyWrites(fabricTxID, rws)
 
+	// Capture the spec version the cache just assigned each written key. This is
+	// race-free: the executor goroutine is the ONLY writer of the cache, so
+	// between ApplyWrites and this readback no other write intervenes, and this
+	// batch is the latest writer of each of its keys -- so the readback yields
+	// exactly this batch's spec versions. queryCommitStatus later compares these
+	// against committed versions to adjudicate a sidecar timeout.
+	specVers := make(map[string]uint64, len(rws.Writes))
+	for _, w := range rws.Writes {
+		if rec, ok := g.cache.Read(w.Key); ok {
+			specVers[w.Key] = rec.Version
+		}
+	}
+
 	// Backpressure: block until an in-flight slot is free (resolveInflight
 	// frees one on each commit/abort/timeout). On shutdown just return; the
 	// cache is discarded with the gateway.
@@ -147,10 +165,11 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
-	// Record in-flight (with the timeout backstop) and remove the included txs
-	// from pending BEFORE submit, so the next cycle cannot re-drain them and a
-	// commit notification cannot race ahead of the registry entry.
-	g.trackInflight(fabricTxID, included, rws)
+	// Record in-flight (with the timeout backstop or, when a notifier is wired,
+	// its per-TxID subscription via g.Watch) and remove the included txs from
+	// pending BEFORE submit, so the next cycle cannot re-drain them and a commit
+	// notification cannot race ahead of the registry entry.
+	g.trackInflight(fabricTxID, included, rws, specVers)
 	g.pending.Remove(hashesOf(included))
 
 	if err := g.SubmitFabricTx(ctx, end); err != nil {
@@ -185,22 +204,37 @@ func committerTxID(prop *peer.Proposal) (string, error) {
 }
 
 // trackInflight records a submitted batch in the in-flight registry (oldest
-// first) and arms its timeout backstop. Called from executeCycle after a slot
-// is acquired and before SubmitFabricTx, so a commit notification can never
-// arrive before the entry exists.
-func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws blocks.ReadWriteSet) {
-	timeout := g.commitTimeout
-	if timeout <= 0 {
-		timeout = commitTimeoutDefault
+// first), arms its timeout backstop, and registers it for per-TxID commit
+// notification. Called from executeCycle after a slot is acquired and before
+// SubmitFabricTx, so a commit notification can never arrive before the entry
+// exists.
+//
+// Timer ownership: when a per-TxID notifier is wired (g.notifier != nil) it owns
+// the timeout -- txNotifier.Watch arms its own client-side backstop, and its
+// onTimeout defers to the query-service fallback (queryCommitStatus) rather than
+// blindly rolling back -- so no AfterFunc is armed here (b.timer stays nil).
+// When no notifier is wired (block-sync / unwired path), the AfterFunc backstop
+// below is the sole guarantee that a lost commit/abort cannot wedge the in-flight
+// window: on it, resolveInflight rolls the batch back exactly as an MVCC abort
+// would. The g.Watch call is a no-op on that path.
+func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws blocks.ReadWriteSet, specVers map[string]uint64) {
+	b := &inflightBatch{txID: txID, included: included, rws: rws, specVers: specVers}
+	if g.notifier == nil {
+		timeout := g.commitTimeout
+		if timeout <= 0 {
+			timeout = commitTimeoutDefault
+		}
+		b.timer = time.AfterFunc(timeout, func() { g.resolveInflight(txID, false) })
 	}
-	b := &inflightBatch{txID: txID, included: included, rws: rws}
-	// No commit/abort heard in time -> roll back, so a lost notification cannot
-	// wedge the in-flight window. (Task 6 replaces this blind rollback with a
-	// query-service status check.)
-	b.timer = time.AfterFunc(timeout, func() { g.resolveInflight(txID, false) })
 	g.inflightMu.Lock()
 	g.inflight = append(g.inflight, b)
 	g.inflightMu.Unlock()
+
+	// Register-then-submit: with the registry entry in place, subscribe to this
+	// TxID's commit status (and arm the notifier's timer) before the caller
+	// submits, so a fast commit notification always finds the entry. No-op when
+	// the notifier is unwired.
+	g.Watch(txID)
 }
 
 // resolveInflight finalizes (committed) or rolls back (aborted / timed out) the
@@ -237,7 +271,9 @@ func (g *Gateway) resolveInflight(txID string, committed bool) {
 		return // already resolved (timer/notification race) -- idempotent
 	}
 	b := g.inflight[idx]
-	b.timer.Stop()
+	if b.timer != nil { // nil when the notifier owns the timeout (see trackInflight)
+		b.timer.Stop()
+	}
 	g.inflight = append(g.inflight[:idx], g.inflight[idx+1:]...)
 	g.inflightMu.Unlock()
 
@@ -292,7 +328,9 @@ func (g *Gateway) cascadeFrom(txID string) {
 	g.inflightMu.Unlock()
 
 	for _, b := range suffix {
-		b.timer.Stop()
+		if b.timer != nil { // nil when the notifier owns the timeout (see trackInflight)
+			b.timer.Stop()
+		}
 		g.cache.NoteInvalidated(b.txID)
 		for _, tx := range b.included {
 			g.pending.Add(tx) // return to pending to retry

@@ -23,6 +23,7 @@ import (
 	cmn "github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
 	sdk "github.com/hyperledger/fabric-x-sdk"
+	"github.com/hyperledger/fabric-x-sdk/notification"
 )
 
 type Signer interface {
@@ -77,9 +78,27 @@ type Gateway struct {
 	// notification arrives within it, resolveInflight treats the batch as
 	// unconfirmed (rolled back) so a lost notification cannot wedge the
 	// in-flight window forever. Defaulted by New to commitTimeoutDefault;
-	// tests may override it. Task 6 replaces the blind rollback with a
-	// query-service status check.
+	// tests may override it. When a per-TxID notifier is wired (see notifier),
+	// the notifier owns the timeout and this AfterFunc backstop is not armed
+	// (see trackInflight); it remains the sole backstop on the unwired path.
 	commitTimeout time.Duration
+
+	// notifier, when non-nil, resolves each in-flight batch by its real per-TxID
+	// commit/abort/timeout status from the Fabric-X sidecar notification stream
+	// (register-then-submit; see txNotifier and SetNotifier). Watch(txID) feeds
+	// it. nil on the block-sync / unwired path (and in core unit tests), where
+	// Watch is a no-op and the trackInflight AfterFunc is the backstop.
+	notifier *txNotifier
+
+	// committedVersion reads a key's committed monotonic version from the source
+	// of truth the endorsers read (the query-service view in query-service mode).
+	// ok is false if the key has no committed value. It backs queryCommitStatus,
+	// the notifier's sidecar-timeout fallback. nil ⇒ the fallback is unavailable
+	// and every timeout is treated as "not committed" (conservative rollback ->
+	// cascade -> MVCC self-corrects). Set once at wiring time (see
+	// SetCommittedVersionReader), before Start, so it is never written
+	// concurrently with the executor goroutine's reads.
+	committedVersion func(ctx context.Context, key string) (version uint64, ok bool, err error)
 
 	// maxBatchSize bounds how many pending txs one drain cycle folds into a
 	// single merged committer tx (see executeCycle / PendingPool.DrainUpTo).
@@ -151,6 +170,88 @@ func (g *Gateway) SetMaxInflight(n int) {
 // drain cycle. See the maxBatchSize field and executeCycle.
 func (g *Gateway) SetMaxBatchSize(n int) {
 	g.maxBatchSize.Store(int64(n))
+}
+
+// SetNotifier wires per-TxID commit resolution. It builds the gateway's
+// txNotifier over subscribe (the register channel the notification Subscribe
+// loop reads) with the query-service fallback (queryCommitStatus) and
+// resolveInflight, stores it so Watch(txID) registers each submitted batch
+// before submit, and returns it as the notification.TxStatusHandler the caller
+// feeds to notification.NewProcessor. timeout is the client-side backstop for a
+// dead stream; timeout <= 0 uses commitTimeout. Call before Start.
+func (g *Gateway) SetNotifier(subscribe chan<- []string, timeout time.Duration) notification.TxStatusHandler {
+	if timeout <= 0 {
+		timeout = g.commitTimeout
+	}
+	if timeout <= 0 {
+		timeout = commitTimeoutDefault
+	}
+	g.notifier = newTxNotifier(subscribe, timeout, g.queryCommitStatus, g.resolveInflight)
+	return g.notifier
+}
+
+// SetCommittedVersionReader injects the committed-version reader backing the
+// notifier's sidecar-timeout fallback (see the committedVersion field and
+// queryCommitStatus). Wired only in query-service mode; left unset (nil)
+// elsewhere, which makes the fallback a conservative rollback. Call before Start.
+func (g *Gateway) SetCommittedVersionReader(fn func(ctx context.Context, key string) (version uint64, ok bool, err error)) {
+	g.committedVersion = fn
+}
+
+// Watch registers txID with the per-TxID notifier so its real commit/abort/timeout
+// outcome resolves the in-flight batch (register-then-submit -- called from
+// executeCycle before SubmitFabricTx). No-op when no notifier is wired (block-sync
+// / unwired path and core unit tests), where the trackInflight timeout backstop
+// resolves the batch instead.
+func (g *Gateway) Watch(txID string) {
+	if g.notifier != nil {
+		g.notifier.Watch(txID)
+	}
+}
+
+// queryCommitStatus is the notifier's fallback: it decides whether the in-flight
+// batch for txID has committed by comparing its written keys' committed versions
+// (from the injected committedVersion reader) against the spec versions the cache
+// predicted at submit time. The batch committed iff EVERY written key reached its
+// spec version (committedVersion >= specVersion): all keys of a batch commit
+// atomically in one Fabric tx, and Fabric-X versions are per-key monotonic, so a
+// committed version >= the spec version means this (earliest-uncommitted) writer's
+// write landed. On any read error, a missing key, an unknown txID, or a nil reader
+// it returns false (conservative rollback -> cascade -> MVCC self-corrects).
+func (g *Gateway) queryCommitStatus(txID string) bool {
+	// Copy the batch's spec versions out under the lock; the batch's specVers map
+	// is never mutated after trackInflight records it, but copy anyway so we never
+	// touch registry-owned memory once the lock is released.
+	g.inflightMu.Lock()
+	var specVers map[string]uint64
+	found := false
+	for _, b := range g.inflight {
+		if b.txID == txID {
+			specVers = make(map[string]uint64, len(b.specVers))
+			for k, v := range b.specVers {
+				specVers[k] = v
+			}
+			found = true
+			break
+		}
+	}
+	g.inflightMu.Unlock()
+
+	if !found {
+		return false // already resolved / not one of our batches
+	}
+	if g.committedVersion == nil {
+		return false // no live query service -> conservative rollback
+	}
+
+	ctx := context.Background()
+	for key, spec := range specVers {
+		v, ok, err := g.committedVersion(ctx, key)
+		if err != nil || !ok || v < spec {
+			return false
+		}
+	}
+	return true
 }
 
 // Start launches the single drain-all executor goroutine (see executor.go).
