@@ -164,6 +164,18 @@ func (g *Gateway) SetMaxInflight(n int) {
 	g.inflightSlots = make(chan struct{}, n)
 }
 
+// SetCommitTimeout sets the per-in-flight-batch backstop: how long trackInflight
+// waits for a commit/abort before resolving the batch (rollback in the unwired
+// path, or the notifier's fallback in query-service mode -- SetNotifier(...,0)
+// derives its client backstop from this value). d <= 0 restores commitTimeoutDefault.
+// Call before Start.
+func (g *Gateway) SetCommitTimeout(d time.Duration) {
+	if d <= 0 {
+		d = commitTimeoutDefault
+	}
+	g.commitTimeout = d
+}
+
 // SetMaxBatchSize bounds how many pending txs a single drain cycle folds into
 // one merged committer tx. n <= 0 restores the unbounded drain-all default.
 // Safe to call at any time (the field is atomic); it takes effect on the next

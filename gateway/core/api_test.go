@@ -10,6 +10,7 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/hyperledger/fabric-x-evm/gateway/domain"
@@ -66,4 +67,17 @@ func TestGateway_StateReadersDelegate(t *testing.T) {
 	code, err := g.CodeAt(ctx, addr, nil)
 	require.NoError(t, err)
 	assert.Equal(t, stub.code, code)
+}
+
+func TestSetCommitTimeout(t *testing.T) {
+	g := &Gateway{}
+
+	g.SetCommitTimeout(0)
+	assert.Equal(t, commitTimeoutDefault, g.commitTimeout)
+
+	g.SetCommitTimeout(30 * time.Second)
+	assert.Equal(t, 30*time.Second, g.commitTimeout)
+
+	g.SetCommitTimeout(-5 * time.Second)
+	assert.Equal(t, commitTimeoutDefault, g.commitTimeout)
 }

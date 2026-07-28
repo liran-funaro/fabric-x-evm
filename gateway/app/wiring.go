@@ -76,7 +76,7 @@ func NewGatewaySynchronizer(protocol string, db network.BlockHeightReader, chann
 // exactly one *core.VersionedCache per gateway and pass the SAME pointer both here and to
 // the cacheWrap given to the endorser factory (see endorser/app.NewEndorserCore), or
 // pipelined reads silently diverge between the gateway's writes and the endorsers' reads.
-func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int, maxInflight int, cache *core.VersionedCache) (*core.Gateway, error) {
+func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int, maxInflight int, notifyTimeout time.Duration, cache *core.VersionedCache) (*core.Gateway, error) {
 	ec, err := core.NewEndorsementClient(endorsers, gwSigner, netCfg.Channel, netCfg.Namespace, netCfg.NsVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorsement client: %w", err)
@@ -98,6 +98,7 @@ func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Si
 	// caller starts the gateway after BuildGateway returns.
 	gw.SetMaxBatchSize(maxBatchSize)
 	gw.SetMaxInflight(maxInflight)
+	gw.SetCommitTimeout(notifyTimeout)
 
 	return gw, nil
 }

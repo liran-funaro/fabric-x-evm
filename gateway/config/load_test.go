@@ -7,7 +7,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 package config_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hyperledger/fabric-x-evm/gateway/config"
 )
@@ -41,5 +44,29 @@ func TestLoadFabricSamplesSampleConfig(t *testing.T) {
 	}
 	if len(cfg.Endorsers) != 2 {
 		t.Errorf("expected 2 endorsers, got %d", len(cfg.Endorsers))
+	}
+}
+
+func TestLoadNotifyTimeout(t *testing.T) {
+	yaml := `
+network:
+  channel: mychannel
+  namespace: basic
+
+gateway:
+  listen: "0.0.0.0:8545"
+  notify-timeout: 30s
+`
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write temp config: %v", err)
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Gateway.NotifyTimeout != 30*time.Second {
+		t.Errorf("expected notify-timeout 30s, got %s", cfg.Gateway.NotifyTimeout)
 	}
 }
