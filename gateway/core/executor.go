@@ -83,8 +83,17 @@ func (g *Gateway) runExecutor(ctx context.Context) {
 func (g *Gateway) executeCycle(ctx context.Context) {
 	// Batch boundary: apply queued commit/abort evictions to the cache before
 	// executing, so the cache reflects confirmed outcomes exactly once per
-	// cycle and never mutates mid-execution.
-	g.cache.DrainEvictions()
+	// cycle and never mutates mid-execution. If any INVALIDATION was applied, a
+	// dropped later writer may have erased a key a surviving earlier in-flight
+	// batch also wrote (VersionedCache keeps only the latest writer per key), so
+	// rebuild the cache from the survivors to restore their speculative writes.
+	// Commits never need this: they resolve earliest-first, so a committed key a
+	// later survivor also wrote already carries the survivor's writerTx and is
+	// left untouched by the committed-drop. Both happen here, on the executor
+	// goroutine at the boundary -- the cache is never mutated mid-batch.
+	if _, invalidated := g.cache.DrainEvictions(); len(invalidated) > 0 {
+		g.rebuildCacheFromInflight()
+	}
 
 	// DrainUpTo is non-destructive: included txs are removed below at submit
 	// time (so the next cycle can't re-drain and double-submit them) while
@@ -201,12 +210,20 @@ func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws 
 //
 // On commit the batch's writes are confirmed (NoteCommitted queues their cache
 // eviction for the next batch boundary) and its included txs, already removed
-// from pending at submit, stay gone. On rollback the writes are invalidated
-// (NoteInvalidated) and the included txs return to pending to retry.
+// from pending at submit, stay gone.
 //
-// TODO(Task 5): a rollback must also CASCADE -- re-execute every LATER
-// in-flight batch, since it may have read this batch's now-invalidated writes.
+// On NOT-committed (MVCC abort / timeout / submit failure) it delegates entirely
+// to cascadeFrom: a later in-flight batch may have executed against this batch's
+// now-invalidated speculative writes, so the whole registry suffix from txID
+// onward must be invalidated and re-queued. The not-committed path does NO
+// locking of its own -- cascadeFrom takes inflightMu -- so resolveInflight never
+// holds inflightMu when it calls cascadeFrom (guards against a double lock).
 func (g *Gateway) resolveInflight(txID string, committed bool) {
+	if !committed {
+		g.cascadeFrom(txID)
+		return
+	}
+
 	g.inflightMu.Lock()
 	idx := -1
 	for i, b := range g.inflight {
@@ -226,22 +243,84 @@ func (g *Gateway) resolveInflight(txID string, committed bool) {
 
 	<-g.inflightSlots // free the in-flight slot
 
-	if committed {
-		g.cache.NoteCommitted(txID)
-	} else {
-		g.cache.NoteInvalidated(txID)
-		for _, tx := range b.included {
-			g.pending.Add(tx) // return to pending to retry
-		}
-	}
+	g.cache.NoteCommitted(txID)
 
 	// Wake the executor if idle: a commit may unblock retryable-excluded txs
-	// whose predecessor just committed, and a rollback just re-queued work.
-	// Non-blocking, mirroring AddPending.
+	// whose predecessor just committed. Non-blocking, mirroring AddPending.
 	select {
 	case g.arrivals <- struct{}{}:
 	default:
 	}
+}
+
+// cascadeFrom rolls back the in-flight batch for txID AND every LATER batch --
+// the contiguous registry suffix [idx:end]. A later batch may have executed
+// against txID's now-invalidated speculative writes (the cache served them
+// before the commit), so it cannot be trusted and must re-execute; the batches
+// earlier than txID are a prefix of survivors and are untouched here.
+//
+// It runs on the timer/notification goroutine, so it must NOT mutate the cache
+// entries directly (invariant 1: cache entries change only at a batch boundary
+// on the executor goroutine). It only QUEUES work: NoteInvalidated for each
+// departed batch (the boundary DrainEvictions drops their entries and then
+// rebuildCacheFromInflight repairs any key a surviving earlier batch also
+// wrote), re-adds their txs to pending, and releases their slots.
+//
+// Idempotency (invariants 3 & 4): detaching the suffix from g.inflight under
+// inflightMu in one critical section makes the FIRST caller win. Concurrent
+// timers/notifications for batches in the same suffix then find nothing (the
+// entries are already gone) and are no-ops, so each batch's slot is released and
+// its timer stopped exactly once -- by whichever caller detached it.
+func (g *Gateway) cascadeFrom(txID string) {
+	g.inflightMu.Lock()
+	idx := -1
+	for i, b := range g.inflight {
+		if b.txID == txID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		g.inflightMu.Unlock()
+		return // already resolved/cascaded -- idempotent
+	}
+	// Detach the suffix. The three-index slice (cap-limited to idx) ensures a
+	// later append to g.inflight allocates a fresh backing array instead of
+	// clobbering the detached suffix we still read below.
+	suffix := g.inflight[idx:]
+	g.inflight = g.inflight[:idx:idx]
+	g.inflightMu.Unlock()
+
+	for _, b := range suffix {
+		b.timer.Stop()
+		g.cache.NoteInvalidated(b.txID)
+		for _, tx := range b.included {
+			g.pending.Add(tx) // return to pending to retry
+		}
+		<-g.inflightSlots // release its slot (exactly once: we detached it)
+	}
+
+	// Wake the executor if idle: the cascade just re-queued work. Non-blocking,
+	// mirroring AddPending.
+	select {
+	case g.arrivals <- struct{}{}:
+	default:
+	}
+}
+
+// rebuildCacheFromInflight snapshots the surviving in-flight registry into an
+// ordered []ReapplySpec (oldest first) and rebuilds the cache from it. Called at
+// the batch boundary in executeCycle after a drain that applied invalidations.
+// Snapshot-then-call so inflightMu and the cache lock are never held together
+// (invariant: never hold both at once -- avoids a lock-order coupling).
+func (g *Gateway) rebuildCacheFromInflight() {
+	g.inflightMu.Lock()
+	specs := make([]ReapplySpec, len(g.inflight))
+	for i, b := range g.inflight {
+		specs[i] = ReapplySpec{TxID: b.txID, RWS: b.rws}
+	}
+	g.inflightMu.Unlock()
+	g.cache.Rebuild(specs)
 }
 
 // waitForWork blocks until either ctx is done or new work arrives (see

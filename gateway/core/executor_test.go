@@ -534,6 +534,252 @@ func TestExecutorInflightWindowBlocks(t *testing.T) {
 	require.Equal(t, 1, g.inflightCount())
 }
 
+// runOneBatchInFlight drives a single cycle for one seeded tx and returns the
+// committer TxID of the batch it left in flight. Helper for the cascade tests,
+// which need several distinct batches in flight with a known TxID each.
+func runOneBatchInFlight(t *testing.T, g *Gateway) string {
+	t.Helper()
+	end, done := runCycleAndCapture(t, g)
+	<-done
+	id, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+	return id
+}
+
+// containsAll reports whether got contains every element of want.
+func containsAll(got, want []string) bool {
+	set := make(map[string]struct{}, len(got))
+	for _, g := range got {
+		set[g] = struct{}{}
+	}
+	for _, w := range want {
+		if _, ok := set[w]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// TestExecutorCascadeInvalidatesSuffix (brief 1b): three batches in flight;
+// invalidating the FIRST cascades all three -- every batch's included txs go
+// back to pending, all three are NoteInvalidated (observed via the queued
+// eviction set), and all three in-flight slots are released. This is the suffix
+// cascade: a later batch may have read the invalidated batch's speculative
+// writes, so the whole suffix must re-execute.
+func TestExecutorCascadeInvalidatesSuffix(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1) // one tx per batch, so three cycles => three batches
+	txs := addThreeTxs(g)
+
+	idA := runOneBatchInFlight(t, g)
+	idB := runOneBatchInFlight(t, g)
+	idC := runOneBatchInFlight(t, g)
+	require.Equal(t, 3, g.inflightCount())
+	require.Equal(t, 0, g.pending.Len())
+
+	// Invalidate the FIRST (idA) -- must cascade the whole suffix {A,B,C}.
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: idA, Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+	}))
+
+	// All three slots released, all three batches gone from the registry.
+	require.Equal(t, 0, g.inflightCount())
+	// All three batches' txs are back in pending.
+	require.Equal(t, 3, g.pending.Len())
+	for _, tx := range txs {
+		require.True(t, g.pending.Has(tx.Hash()), "cascaded tx must return to pending")
+	}
+	// All three batches were NoteInvalidated (observe the queued eviction set at
+	// a batch boundary).
+	_, invalidated := g.cache.DrainEvictions()
+	require.True(t, containsAll(invalidated, []string{idA, idB, idC}),
+		"all three cascaded batches must be NoteInvalidated, got %v", invalidated)
+}
+
+// TestExecutorCascadeRebuildRepairsOverwrite is THE ⚠️ regression test. Two
+// batches are in flight, BOTH writing key K (A writes va, B overwrites with vb),
+// so the cache ends with K=vb attributed to B. Invalidating ONLY the later batch
+// B drops B's cache entry -- which, under a naive suffix-drop, also erases K
+// entirely even though the SURVIVING earlier batch A still holds a valid
+// speculative write of K. The batch-boundary rebuild must restore K=va,
+// re-attributed to A, at A's original spec version. Fails under a naive
+// suffix-drop (K absent); passes once the boundary rebuilds from the survivors.
+func TestExecutorCascadeRebuildRepairsOverwrite(t *testing.T) {
+	stub := &stubEndorser{}
+	g := newExecutorTestGateway(stub)
+
+	// Batch A writes K=va.
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("va")})
+	g.pending.Add(txWithNonce(1))
+	idA := runOneBatchInFlight(t, g)
+
+	// Batch B overwrites K=vb -> cache holds K=vb, writerTx=B, spec 1.
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("vb")})
+	g.pending.Add(txWithNonce(2))
+	idB := runOneBatchInFlight(t, g)
+
+	require.Equal(t, 2, g.inflightCount())
+	rec, ok := g.cache.Read("K")
+	require.True(t, ok)
+	require.Equal(t, []byte("vb"), rec.Value, "precondition: B's write is the latest")
+
+	// Invalidate ONLY the later batch B (suffix = {B}); A survives.
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: idB, Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+	}))
+	require.Equal(t, 1, g.inflightCount(), "A must survive; only B cascaded")
+
+	// Hit the batch boundary: drain the queued invalidation, then rebuild the
+	// cache from the surviving in-flight batches -- exactly what executeCycle
+	// does at a cycle boundary when the drain reported an invalidation.
+	_, invalidated := g.cache.DrainEvictions()
+	require.Contains(t, invalidated, idB)
+	g.rebuildCacheFromInflight()
+
+	// A's speculative write of K must be RESTORED (not absent, not vb), attributed
+	// back to A at A's original spec version (0: a first blind write of an absent
+	// key, re-applied from empty).
+	rec, ok = g.cache.Read("K")
+	require.True(t, ok, "K erased by naive suffix-drop -- surviving batch A's write was lost")
+	require.Equal(t, []byte("va"), rec.Value, "K must be A's va, not B's vb")
+	require.Equal(t, uint64(0), rec.Version, "A's spec version must be reproduced exactly by the rebuild")
+	e, ok := g.cache.readEntry("K")
+	require.True(t, ok)
+	require.Equal(t, idA, e.writerTx, "K must be re-attributed to surviving batch A")
+	require.Equal(t, 1, g.cache.Len(), "only A's single key remains")
+	require.NotEqual(t, idA, idB)
+}
+
+// TestExecutorCascadeRebuildClearsWhenAllWritersDepart is the mirror of the
+// repair test: when the EARLIER batch A is invalidated the cascade suffix is
+// {A,B} -- both writers of K depart -- so after the boundary rebuild from an
+// empty survivor set K must be absent and the cache empty.
+func TestExecutorCascadeRebuildClearsWhenAllWritersDepart(t *testing.T) {
+	stub := &stubEndorser{}
+	g := newExecutorTestGateway(stub)
+
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("va")})
+	g.pending.Add(txWithNonce(1))
+	idA := runOneBatchInFlight(t, g)
+
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("vb")})
+	g.pending.Add(txWithNonce(2))
+	_ = runOneBatchInFlight(t, g)
+	require.Equal(t, 2, g.inflightCount())
+
+	// Invalidate the EARLIER batch A -> cascade {A,B}: both writers of K gone.
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: idA, Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+	}))
+	require.Equal(t, 0, g.inflightCount())
+
+	_, invalidated := g.cache.DrainEvictions()
+	require.NotEmpty(t, invalidated)
+	g.rebuildCacheFromInflight()
+
+	_, ok := g.cache.Read("K")
+	require.False(t, ok, "K must be absent: both of its writers were invalidated")
+	require.Equal(t, 0, g.cache.Len())
+}
+
+// TestExecutorCascadeRebuildRunsViaExecuteCycle proves the rebuild is actually
+// wired into the executeCycle batch boundary (not only reachable by calling the
+// helper directly). After invalidating the later of two K-writers, the next full
+// executeCycle -- whose re-executed tx writes nothing that could clobber K --
+// must, at its boundary, drain the invalidation and rebuild K=va from the
+// surviving batch A.
+func TestExecutorCascadeRebuildRunsViaExecuteCycle(t *testing.T) {
+	stub := &stubEndorser{}
+	g := newExecutorTestGateway(stub)
+
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("va")})
+	g.pending.Add(txWithNonce(1))
+	idA := runOneBatchInFlight(t, g)
+
+	stub.execResp = batchResponseWithWrites(t, map[string][]byte{"K": []byte("vb")})
+	g.pending.Add(txWithNonce(2))
+	idB := runOneBatchInFlight(t, g)
+	require.Equal(t, 2, g.inflightCount())
+
+	// Invalidate only B; A survives, tx2 returns to pending, invalidation queued.
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: idB, Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+	}))
+	require.Equal(t, 1, g.inflightCount())
+
+	// The next cycle re-executes the returned tx2 writing NOTHING (so it cannot
+	// clobber K); its boundary must drain B's invalidation and rebuild K=va.
+	stub.execResp = okBatchResponse()
+	idC := runOneBatchInFlight(t, g)
+
+	rec, ok := g.cache.Read("K")
+	require.True(t, ok, "executeCycle's boundary did not rebuild the cache from survivors")
+	require.Equal(t, []byte("va"), rec.Value)
+	e, _ := g.cache.readEntry("K")
+	require.Equal(t, idA, e.writerTx)
+
+	// Stop the surviving batches' backstop timers by committing them (keeps the
+	// test from leaking AfterFunc goroutines to the default 60s timeout).
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: idA, Status: committerpb.Status_COMMITTED},
+		{FabricTxID: idC, Status: committerpb.Status_COMMITTED},
+	}))
+}
+
+// TestExecutorConcurrentCascadeIsIdempotent (-race): two batches in flight; an
+// MVCC-abort for batch A and both batches' short-timeout backstops race to
+// cascade the same suffix. The registry-removal-under-lock is the idempotency
+// gate: whichever caller removes a batch releases its slot exactly once, and any
+// later cascade for an already-removed TxID is a no-op. Asserts no panic, the
+// registry drains to empty, both txs are back in pending exactly once, and --
+// the key check that no slot was double-released -- a subsequent cycle can still
+// acquire a slot and submit.
+func TestExecutorConcurrentCascadeIsIdempotent(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1)
+	g.SetMaxInflight(2)
+	g.commitTimeout = 15 * time.Millisecond // arm short backstops that race the abort
+
+	tx1, tx2 := txWithNonce(1), txWithNonce(2)
+	g.pending.Add(tx1)
+	g.pending.Add(tx2)
+	idA := runOneBatchInFlight(t, g)
+	_ = runOneBatchInFlight(t, g)
+	require.Equal(t, 2, g.inflightCount())
+
+	// Race an explicit MVCC-abort of A against the two backstops firing.
+	go func() {
+		_ = g.HandleTx(context.Background(), []common.TxNotification{
+			{FabricTxID: idA, Status: committerpb.Status_ABORTED_MVCC_CONFLICT},
+		})
+	}()
+
+	// The union of the racing cascades must settle to: nothing in flight, both
+	// txs back in pending -- exactly once each.
+	require.Eventually(t, func() bool {
+		return g.inflightCount() == 0 && g.pending.Len() == 2
+	}, 2*time.Second, 5*time.Millisecond)
+	require.True(t, g.pending.Has(tx1.Hash()))
+	require.True(t, g.pending.Has(tx2.Hash()))
+
+	// No slot was double-released: a subsequent cycle can still acquire a slot and
+	// submit. (A double `<-inflightSlots` would have left a goroutine blocked and
+	// the semaphore corrupt.) Use a long timeout so this batch's own backstop
+	// does not race the assertion.
+	g.commitTimeout = commitTimeoutDefault
+	end, done := runCycleAndCapture(t, g)
+	<-done
+	require.Equal(t, 1, g.inflightCount())
+	// Drain the backstop for the batch we just submitted.
+	id, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+	require.NoError(t, g.HandleTx(context.Background(), []common.TxNotification{
+		{FabricTxID: id, Status: committerpb.Status_COMMITTED},
+	}))
+}
+
 // TestGatewayHandleCommitsOnValidBlockTx: same drain-cycle setup as
 // TestExecutorDrainCycle, but the commit outcome is delivered via Handle (the
 // block-sync topology's blocks.BlockHandler path) instead of HandleTx (the

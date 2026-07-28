@@ -18,6 +18,17 @@ func rws(reads []blocks.KVRead, writes []blocks.KVWrite) blocks.ReadWriteSet {
 	return blocks.ReadWriteSet{Reads: reads, Writes: writes}
 }
 
+// readEntry exposes a cached key's full entry (value + spec version + the
+// committer-TxID it is attributed to) for tests that must assert WHICH in-flight
+// batch owns a key's cache entry -- Read only returns the WriteRecord, not the
+// writerTx. Same-package test-only helper.
+func (c *VersionedCache) readEntry(key string) (entry, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.entries[key]
+	return e, ok
+}
+
 // First in-flight write of an ABSENT key (no read version) -> spec version 0.
 func TestVersionedCache_FirstWriteAbsentKeyIsVersion0(t *testing.T) {
 	c := NewVersionedCache()
@@ -122,6 +133,74 @@ func TestVersionedCache_Delete(t *testing.T) {
 	rec, ok := c.Read("k")
 	if !ok || !rec.IsDelete {
 		t.Fatalf("want delete record, got %+v ok=%v", rec, ok)
+	}
+}
+
+// Rebuild atomically replaces the cache with only the given survivor batches,
+// re-applying their writes from EMPTY in submission order using the same
+// spec-version math as ApplyWrites. This is the ⚠️ repair at the cache layer:
+// batch A writes K=va, batch B overwrites K=vb (so K currently carries B); after
+// B is invalidated, rebuilding from just {A} must restore K=va attributed to A
+// with A's original spec version -- exactly the state A would have had if B had
+// never applied. Keys that only B wrote must be gone.
+func TestVersionedCache_RebuildFromSurvivorsRestoresOverwrittenKey(t *testing.T) {
+	c := NewVersionedCache()
+	// A writes K (read at committed v3 -> spec 4) and J; B overwrites K (spec 5)
+	// and writes its own key M.
+	aRWS := rws(
+		[]blocks.KVRead{{Key: "K", Version: &blocks.Version{BlockNum: 3}}},
+		[]blocks.KVWrite{{Key: "K", Value: []byte("va")}, {Key: "J", Value: []byte("ja")}},
+	)
+	bRWS := rws(nil, []blocks.KVWrite{{Key: "K", Value: []byte("vb")}, {Key: "M", Value: []byte("mb")}})
+	c.ApplyWrites("A", aRWS)
+	c.ApplyWrites("B", bRWS)
+
+	// Record A's original spec version of K for the deterministic-version check.
+	aEntry, ok := c.readEntry("K")
+	if !ok || aEntry.writerTx != "B" {
+		t.Fatalf("precondition: after both applies K must carry B, got %+v ok=%v", aEntry, ok)
+	}
+	// Rebuild from survivors = {A} only (B invalidated).
+	c.Rebuild([]ReapplySpec{{TxID: "A", RWS: aRWS}})
+
+	rec, ok := c.Read("K")
+	if !ok {
+		t.Fatal("K absent after rebuild from survivor A -- A's write was lost (naive suffix-drop bug)")
+	}
+	if string(rec.Value) != "va" {
+		t.Fatalf("K value = %q, want va (A's write restored, not B's vb)", rec.Value)
+	}
+	if rec.Version != 4 {
+		t.Fatalf("K spec version = %d, want 4 (A re-applied from empty: read-base 3 + 1)", rec.Version)
+	}
+	e, _ := c.readEntry("K")
+	if e.writerTx != "A" {
+		t.Fatalf("K writerTx = %q, want A after rebuild from {A}", e.writerTx)
+	}
+	// M was only B's write -> gone. J was A's -> present.
+	if _, ok := c.Read("M"); ok {
+		t.Fatal("M must be gone (only invalidated B wrote it)")
+	}
+	if _, ok := c.Read("J"); !ok {
+		t.Fatal("J must survive (A wrote it)")
+	}
+	if got := c.Len(); got != 2 {
+		t.Fatalf("Len()=%d, want 2 (K,J)", got)
+	}
+}
+
+// Rebuild from an empty survivor set clears the cache entirely (both writers of
+// K departed): the mirror of the repair above.
+func TestVersionedCache_RebuildFromNoneClearsCache(t *testing.T) {
+	c := NewVersionedCache()
+	c.ApplyWrites("A", rws(nil, []blocks.KVWrite{{Key: "K", Value: []byte("va")}}))
+	c.ApplyWrites("B", rws(nil, []blocks.KVWrite{{Key: "K", Value: []byte("vb")}}))
+	c.Rebuild(nil)
+	if _, ok := c.Read("K"); ok {
+		t.Fatal("K must be absent after rebuild from empty survivor set")
+	}
+	if got := c.Len(); got != 0 {
+		t.Fatalf("Len()=%d, want 0", got)
 	}
 }
 
