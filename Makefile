@@ -12,6 +12,19 @@ export GID
 DOCKER  ?= docker
 COMPOSE ?= docker compose
 
+# Full-stack data storage location (start-full / stop-full / perf runs).
+#   HOST_DATA unset/0 (default): committer + orderer state lives in container-local
+#     docker named volumes inside the VM, keeping every ledger/DB write OFF colima's
+#     sshfs host mount, which otherwise caps write throughput.
+#   HOST_DATA=1: overlay compose.fabric-x.hostdata.yaml to bind those same volumes
+#     to ./data on the host, so a developer/agent can inspect persisted state.
+HOST_DATA ?=
+COMPOSE_FULL_FILES := -f compose.fabric-x.full.yaml
+ifeq ($(HOST_DATA),1)
+COMPOSE_FULL_FILES += -f compose.fabric-x.hostdata.yaml
+export DATA_ROOT := $(CURDIR)/data
+endif
+
 .PHONY: build
 build:
 	go build -o bin/fxevm ./cmd/fxevm
@@ -174,7 +187,7 @@ clean-fablo:
 .PHONY: start-full
 start-full:
 	@if nc -z localhost 7050 2>/dev/null; then echo "Error: port 7050 is already in use — stop any running Fabric orderer before starting."; exit 1; fi
-	@mkdir -p \
+	@if [ "$(HOST_DATA)" = "1" ]; then mkdir -p \
 		data/orderers/party1-router data/orderers/party1-batcher \
 		data/orderers/party1-consenter data/orderers/party1-assembler \
 		data/orderers/party2-router data/orderers/party2-batcher \
@@ -183,8 +196,18 @@ start-full:
 		data/orderers/party3-consenter data/orderers/party3-assembler \
 		data/orderers/party4-router data/orderers/party4-batcher \
 		data/orderers/party4-consenter data/orderers/party4-assembler \
-		data/committer-org1/db data/committer-org1/sidecar-ledger
-	@$(COMPOSE) -f compose.fabric-x.full.yaml up -d
+		data/committer-org1/db data/committer-org1/sidecar-ledger; fi
+	@# Container-local mode: docker creates named volumes owned by root, but every
+	@# service runs as $(UID):$(GID) (see `user:` in compose), so pre-create the
+	@# volumes and chown them to that user before the DB/orderers initialize.
+	@if [ "$(HOST_DATA)" != "1" ]; then \
+		echo "Preparing container-local volumes (chown to $(UID):$(GID))..."; \
+		$(COMPOSE) $(COMPOSE_FULL_FILES) create >/dev/null; \
+		for v in $$($(DOCKER) volume ls -q -f label=com.docker.compose.project=fabric-x); do \
+			$(DOCKER) run --rm -v "$$v":/v busybox chown -R $(UID):$(GID) /v; \
+		done; \
+	fi
+	@$(COMPOSE) $(COMPOSE_FULL_FILES) up -d
 	@echo "Waiting for committer to be ready..."
 	@while ! nc -z localhost 7001 2>/dev/null; do sleep 1; done
 	@echo "Waiting for committer sidecar to be ready..."
@@ -218,7 +241,7 @@ start-full:
 
 .PHONY: stop-full
 stop-full:
-	@$(COMPOSE) -f compose.fabric-x.full.yaml down
+	@$(COMPOSE) $(COMPOSE_FULL_FILES) down -v
 	@rm -rf data/
 
 .PHONY: test-local

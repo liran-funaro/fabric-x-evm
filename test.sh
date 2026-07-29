@@ -2,6 +2,11 @@
 
 export FABRIC_LOGGING_SPEC="info:grpc=error"
 
+# Data storage (default: container-local, off colima's sshfs mount, which caps
+# throughput). Set HOST_DATA=1 to persist committer + orderer state under ./data
+# on the host for inspection:  HOST_DATA=1 ./test.sh
+export HOST_DATA="${HOST_DATA:-0}"
+
 # Start system
 make clean-x init-x start-full
 

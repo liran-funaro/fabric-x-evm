@@ -29,7 +29,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/msp/tlscacerts/tlsca.orderer-org-1-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party1-router:/data:Z
+      - orderer-party1-router:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -57,7 +57,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/orderers/party1/batcher1.orderer-org-1/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/msp/tlscacerts/tlsca.orderer-org-1-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party1-batcher:/data:Z
+      - orderer-party1-batcher:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -91,7 +91,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/orderers/party1/consenter.orderer-org-1/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/msp/tlscacerts/tlsca.orderer-org-1-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party1-consenter:/data:Z
+      - orderer-party1-consenter:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -117,7 +117,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-1/msp/tlscacerts/tlsca.orderer-org-1-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party1-assembler:/data:Z
+      - orderer-party1-assembler:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -148,7 +148,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/msp/tlscacerts/tlsca.orderer-org-2-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party2-router:/data:Z
+      - orderer-party2-router:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -176,7 +176,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/orderers/party2/batcher1.orderer-org-2/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/msp/tlscacerts/tlsca.orderer-org-2-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party2-batcher:/data:Z
+      - orderer-party2-batcher:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -210,7 +210,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/orderers/party2/consenter.orderer-org-2/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/msp/tlscacerts/tlsca.orderer-org-2-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party2-consenter:/data:Z
+      - orderer-party2-consenter:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -236,7 +236,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-2/msp/tlscacerts/tlsca.orderer-org-2-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party2-assembler:/data:Z
+      - orderer-party2-assembler:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -267,7 +267,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/msp/tlscacerts/tlsca.orderer-org-3-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party3-router:/data:Z
+      - orderer-party3-router:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -295,7 +295,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/orderers/party3/batcher1.orderer-org-3/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/msp/tlscacerts/tlsca.orderer-org-3-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party3-batcher:/data:Z
+      - orderer-party3-batcher:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -329,7 +329,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/orderers/party3/consenter.orderer-org-3/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/msp/tlscacerts/tlsca.orderer-org-3-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party3-consenter:/data:Z
+      - orderer-party3-consenter:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -355,7 +355,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-3/msp/tlscacerts/tlsca.orderer-org-3-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party3-assembler:/data:Z
+      - orderer-party3-assembler:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -386,7 +386,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/msp/tlscacerts/tlsca.orderer-org-4-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party4-router:/data:Z
+      - orderer-party4-router:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -414,7 +414,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/orderers/party4/batcher1.orderer-org-4/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/msp/tlscacerts/tlsca.orderer-org-4-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party4-batcher:/data:Z
+      - orderer-party4-batcher:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -448,7 +448,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/orderers/party4/consenter.orderer-org-4/msp:/node-msp:ro,Z
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/msp/tlscacerts/tlsca.orderer-org-4-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party4-consenter:/data:Z
+      - orderer-party4-consenter:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -474,7 +474,7 @@ services:
       - ./testdata/crypto/ordererOrganizations/orderer-org-4/msp/tlscacerts/tlsca.orderer-org-4-cert.pem:/org-tls-ca.pem:ro,Z
       - ./testdata/crypto/client-tls-ca.pem:/client-tls-ca.pem:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/orderers/party4-assembler:/data:Z
+      - orderer-party4-assembler:/data
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9443/metrics"]
       interval: 5s
@@ -500,7 +500,7 @@ services:
       POSTGRES_PASSWORD: sc_secret_pwd
       PGDATA: /var/lib/postgresql/data
     volumes:
-      - ./data/committer-org1/db:/var/lib/postgresql/data:Z
+      - committer-db:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U sc_user -d sc_db"]
       interval: 5s
@@ -574,7 +574,7 @@ services:
       - ./testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp:/msp:ro,Z
       - ./testdata/crypto/ordererOrganizations:/orderer-cas:ro,Z
       - ./testdata/crypto/config-block.pb.bin:/bootstrap/genesis.block:ro,Z
-      - ./data/committer-org1/sidecar-ledger:/ledger:Z
+      - committer-sidecar-ledger:/ledger
     depends_on:
       committer-coordinator:
         condition: service_started
@@ -658,3 +658,27 @@ services:
       - prometheus
     networks:
       - fabric-x
+
+# Committer + orderer state. Named volumes keep this data container-local
+# (inside the VM), off colima's sshfs host mount which caps write throughput.
+# `make start-full HOST_DATA=1` overlays compose.fabric-x.hostdata.yaml to
+# instead bind these to ./data on the host for investigating persisted state.
+volumes:
+  orderer-party1-router:
+  orderer-party1-batcher:
+  orderer-party1-consenter:
+  orderer-party1-assembler:
+  orderer-party2-router:
+  orderer-party2-batcher:
+  orderer-party2-consenter:
+  orderer-party2-assembler:
+  orderer-party3-router:
+  orderer-party3-batcher:
+  orderer-party3-consenter:
+  orderer-party3-assembler:
+  orderer-party4-router:
+  orderer-party4-batcher:
+  orderer-party4-consenter:
+  orderer-party4-assembler:
+  committer-db:
+  committer-sidecar-ledger:

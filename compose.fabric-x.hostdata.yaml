@@ -1,0 +1,123 @@
+# Copyright IBM Corp. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# HOST DATA OVERRIDE (opt-in): rebinds the committer + orderer named volumes
+# declared in compose.fabric-x.full.yaml to ./data on the host, so persisted
+# state can be inspected from the host after a run. This routes every ledger/DB
+# write back through colima's sshfs mount, which caps throughput -- use it only
+# to investigate data, NOT for performance runs.
+#
+# Enabled by `make start-full HOST_DATA=1` (and stop-full/perf equivalents),
+# which overlays this file and exports DATA_ROOT=<repo>/data (absolute path
+# required by the local bind driver). Service definitions are untouched here:
+# only the backing of each already-declared named volume changes.
+---
+volumes:
+  orderer-party1-router:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party1-router
+  orderer-party1-batcher:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party1-batcher
+  orderer-party1-consenter:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party1-consenter
+  orderer-party1-assembler:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party1-assembler
+  orderer-party2-router:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party2-router
+  orderer-party2-batcher:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party2-batcher
+  orderer-party2-consenter:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party2-consenter
+  orderer-party2-assembler:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party2-assembler
+  orderer-party3-router:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party3-router
+  orderer-party3-batcher:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party3-batcher
+  orderer-party3-consenter:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party3-consenter
+  orderer-party3-assembler:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party3-assembler
+  orderer-party4-router:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party4-router
+  orderer-party4-batcher:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party4-batcher
+  orderer-party4-consenter:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party4-consenter
+  orderer-party4-assembler:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/orderers/party4-assembler
+  committer-db:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/committer-org1/db
+  committer-sidecar-ledger:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${DATA_ROOT:-./data}/committer-org1/sidecar-ledger
