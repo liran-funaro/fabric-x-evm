@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/holiman/uint256"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
 
@@ -140,5 +141,113 @@ func TestResult_ExistingReadIsNotOverwrittenOrRefetched(t *testing.T) {
 	}
 	if got := reader.calls[key]; got != 1 {
 		t.Errorf("expected exactly 1 store fetch for already-read key %q (no backfill re-fetch), got %d", key, got)
+	}
+}
+
+// TestReadCache_RepeatedReadsHitStoreOnce verifies the per-tx read cache: a key
+// read many times within one transaction issues exactly ONE backing-store Get.
+// Repeated reads are the norm in EVM execution -- Exist() reads bal/nonce/code,
+// GetCodeHash calls Exist()+GetCode, a transfer touches each balance several
+// times -- and the pinned view is immutable for the tx's lifetime, so every
+// re-read of a key must be served from memory rather than a fresh ~3ms round-trip.
+func TestReadCache_RepeatedReadsHitStoreOnce(t *testing.T) {
+	addr := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	slot := common.HexToHash("0x01")
+	skey := storeKey(addr, slot)
+	bkey := accKey(addr, "bal")
+	absent := storeKey(addr, common.HexToHash("0x02"))
+
+	reader := newMapReader(map[string]*blocks.WriteRecord{
+		skey: {Namespace: Namespace, Key: skey, Version: 5, Value: common.HexToHash("0xAAAA").Bytes()},
+		bkey: {Namespace: Namespace, Key: bkey, Version: 3, Value: uint256ToBytes(uint256.NewInt(42))},
+	})
+	db, err := NewStateDB(t.Context(), reader, Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 5; i++ {
+		if got := db.GetState(addr, slot); got != common.HexToHash("0xAAAA") {
+			t.Fatalf("read %d: storage got %v", i, got)
+		}
+		if got := db.GetBalance(addr); got.Uint64() != 42 {
+			t.Fatalf("read %d: balance got %v", i, got)
+		}
+		if got := db.GetState(addr, common.HexToHash("0x02")); got != (common.Hash{}) {
+			t.Fatalf("read %d: absent slot got %v", i, got)
+		}
+	}
+	if reader.calls[skey] != 1 {
+		t.Errorf("storage slot: expected 1 store Get, got %d", reader.calls[skey])
+	}
+	if reader.calls[bkey] != 1 {
+		t.Errorf("balance: expected 1 store Get, got %d", reader.calls[bkey])
+	}
+	// An absent key must also be memoized -- otherwise every re-read of a
+	// not-yet-existing account/slot (common: recipient of a first transfer)
+	// pays a full round-trip to learn "still absent".
+	if reader.calls[absent] != 1 {
+		t.Errorf("absent slot: expected 1 store Get, got %d", reader.calls[absent])
+	}
+}
+
+// TestReadCache_WriteShadowsCache verifies a write is still observed after a
+// prior cached read, and that neither the write's prev-value lookup nor the
+// post-write read issues an extra store Get.
+func TestReadCache_WriteShadowsCache(t *testing.T) {
+	addr := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	slot := common.HexToHash("0x01")
+	skey := storeKey(addr, slot)
+
+	reader := newMapReader(map[string]*blocks.WriteRecord{
+		skey: {Namespace: Namespace, Key: skey, Version: 1, Value: common.HexToHash("0x0001").Bytes()},
+	})
+	db, err := NewStateDB(t.Context(), reader, Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := db.GetState(addr, slot); got != common.HexToHash("0x0001") {
+		t.Fatalf("committed read got %v", got)
+	}
+	db.SetState(addr, slot, common.HexToHash("0x0099")) // prev-value lookup served from cache
+	if got := db.GetState(addr, slot); got != common.HexToHash("0x0099") {
+		t.Fatalf("post-write read got %v (journal must shadow the cache)", got)
+	}
+	if reader.calls[skey] != 1 {
+		t.Errorf("expected exactly 1 store Get (only the first read), got %d", reader.calls[skey])
+	}
+}
+
+// TestReadCache_SurvivesRevert verifies the cache holds committed values across
+// a snapshot/revert: after reverting a write, the key reads back its committed
+// value with no additional store Get (the pinned view's value never changed).
+func TestReadCache_SurvivesRevert(t *testing.T) {
+	addr := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	slot := common.HexToHash("0x01")
+	skey := storeKey(addr, slot)
+
+	reader := newMapReader(map[string]*blocks.WriteRecord{
+		skey: {Namespace: Namespace, Key: skey, Version: 7, Value: common.HexToHash("0x0001").Bytes()},
+	})
+	db, err := NewStateDB(t.Context(), reader, Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := db.GetState(addr, slot); got != common.HexToHash("0x0001") {
+		t.Fatalf("committed read got %v", got)
+	}
+	id := db.Snapshot()
+	db.SetState(addr, slot, common.HexToHash("0x0099"))
+	if got := db.GetState(addr, slot); got != common.HexToHash("0x0099") {
+		t.Fatalf("in-snapshot read got %v", got)
+	}
+	db.RevertToSnapshot(id)
+	if got := db.GetState(addr, slot); got != common.HexToHash("0x0001") {
+		t.Fatalf("post-revert read got %v (must restore committed value)", got)
+	}
+	if reader.calls[skey] != 1 {
+		t.Errorf("expected exactly 1 store Get across revert, got %d", reader.calls[skey])
 	}
 }

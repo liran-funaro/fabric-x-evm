@@ -204,6 +204,14 @@ type readRec struct {
 	hasVersion bool
 }
 
+// cachedRead is one memoized store.Get result held in StateDB.readCache. rec is
+// the record the pinned view returned for the key and may be nil (key absent in
+// the view); presence of the entry in the map -- not rec != nil -- is what marks
+// the key as already read. See the readCache field for the full rationale.
+type cachedRead struct {
+	rec *blocks.WriteRecord
+}
+
 // writeRec is one journaled write or delete.
 type writeRec struct {
 	key      string
@@ -227,6 +235,25 @@ type StateDB struct {
 	store             ReadStore
 	logs              []Log
 	monotonicVersions bool // if true, KVRead.Version is built from WriteRecord.Version (fabric-x MVCC semantics)
+
+	// readCache memoizes store.Get results for the lifetime of one transaction
+	// (one reset cycle). The backing snapshot is a single pinned point-in-time
+	// view, so a key's committed record is immutable for the whole tx: the first
+	// read is authoritative and every repeat must be served from here rather than
+	// re-issuing a ~3ms backend round-trip. EVM execution re-reads the same keys
+	// constantly -- Exist() reads bal/nonce/code, GetCodeHash calls Exist()+GetCode,
+	// a transfer touches each balance several times -- so this collapses a tx's
+	// serial read chain (the dominant cost of the concurrent warm pass) from tens
+	// of round-trips down to its distinct-key count. Each StateDB is owned by a
+	// single goroutine (per-worker in the warm pass, serial in the authoritative
+	// pass), so no locking is needed. It is NOT the MVCC read-set: getStateFromStore
+	// still journals every logical read into s.reads, so read dependencies and
+	// snapshot/revert truncation are byte-for-byte unchanged -- only the redundant
+	// backend fetches disappear. A cached entry may hold a nil record (key absent
+	// in the view); presence in the map is what distinguishes "known absent" from
+	// "not yet read". Read errors are never cached. Lazily allocated; cleared (not
+	// freed) by reset for reuse across txs on a pooled StateDB.
+	readCache map[string]cachedRead
 
 	// EVM-specific runtime state
 	refund           uint64
@@ -287,6 +314,7 @@ func (s *StateDB) reset(store ReadStore) {
 	clear(s.selfDestructed)
 	clear(s.newContracts)
 	clear(s.transientStorage)
+	clear(s.readCache) // per-tx: a new tx sees a fresh (possibly newer) view
 	s.accessList.reset()
 }
 
@@ -391,10 +419,34 @@ func (s *StateDB) getStateFromJournal(key string) ([]byte, bool) {
 	return nil, false
 }
 
-// getStateFromStore reads from the underlying ReadStore and journals the read.
-// This creates an MVCC read dependency.
+// viewGet returns the pinned view's record for key, memoized for this tx (see
+// the readCache field). The view is immutable for the tx's lifetime, so the
+// first read's result is authoritative and reused for every repeat -- this is
+// where the redundant backend round-trips are eliminated. It does NOT touch the
+// MVCC read-set (s.reads); callers that create a read dependency journal the
+// read themselves (see getStateFromStore). Read errors are propagated, never
+// cached, so a transient failure can be retried by a later read.
+func (s *StateDB) viewGet(key string) (*blocks.WriteRecord, error) {
+	if c, ok := s.readCache[key]; ok {
+		return c.rec, nil
+	}
+	rec, err := s.store.Get(s.namespace, key)
+	if err != nil {
+		return nil, err
+	}
+	if s.readCache == nil {
+		s.readCache = make(map[string]cachedRead)
+	}
+	s.readCache[key] = cachedRead{rec: rec}
+	return rec, nil
+}
+
+// getStateFromStore reads from the underlying ReadStore (via the per-tx read
+// cache) and journals the read. This creates an MVCC read dependency: every
+// call appends to s.reads exactly as before, so read-set contents and
+// snapshot/revert semantics are unchanged whether or not the value was cached.
 func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
-	record, err := s.store.Get(s.namespace, key)
+	record, err := s.viewGet(key)
 	if err != nil {
 		return nil, err
 	}
@@ -617,8 +669,12 @@ func (s *StateDB) SetState(addr common.Address, slot common.Hash, value common.H
 			prev = common.BytesToHash(prevVal)
 		}
 	} else {
-		// Not in journal, read directly from store WITHOUT creating a read dependency
-		record, err := s.store.Get(s.namespace, key)
+		// Not in journal, read directly from store WITHOUT creating a read
+		// dependency. Served from the per-tx read cache (viewGet) when the key
+		// was already read -- so the SLOAD that typically precedes an SSTORE
+		// isn't paid twice -- and viewGet deliberately leaves s.reads untouched,
+		// preserving the "blind write" no-dependency contract.
+		record, err := s.viewGet(key)
 		if err != nil {
 			// Record the read failure and proceed with a zero previous value;
 			// the Executor aborts the tx on Error() so this write is discarded.
