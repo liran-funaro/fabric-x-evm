@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/holiman/uint256"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
@@ -249,5 +250,190 @@ func TestReadCache_SurvivesRevert(t *testing.T) {
 	}
 	if reader.calls[skey] != 1 {
 		t.Errorf("expected exactly 1 store Get across revert, got %d", reader.calls[skey])
+	}
+}
+
+// readSetVersions projects Result().Reads to a key->version map (version encoded
+// as a comparable string, "nil" for an absent key) so two read-sets can be
+// compared regardless of slice order.
+func readSetVersions(reads []blocks.KVRead) map[string]string {
+	m := make(map[string]string, len(reads))
+	for i := range reads {
+		v := "nil"
+		if reads[i].Version != nil {
+			v = string(rune(reads[i].Version.BlockNum)) + ":" + string(rune(reads[i].Version.TxNum))
+		}
+		m[reads[i].Key] = v
+	}
+	return m
+}
+
+func sameReadSet(a, b []blocks.KVRead) bool {
+	ma, mb := readSetVersions(a), readSetVersions(b)
+	if len(ma) != len(mb) {
+		return false
+	}
+	for k, v := range ma {
+		if mb[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// codeContractReader returns a mapReader for an account that exists (nonce=1)
+// and carries committed code at the given store version, but has no balance key
+// (so Exist reads bal-absent then nonce, mirroring a real contract).
+func codeContractReader(addr common.Address, code []byte, codeVersion uint64) *mapReader {
+	nonceKey := accKey(addr, "nonce")
+	codeKey := accKey(addr, "code")
+	return newMapReader(map[string]*blocks.WriteRecord{
+		nonceKey: {Namespace: Namespace, Key: nonceKey, Version: 7, Value: uint64ToBytes(1)},
+		codeKey:  {Namespace: Namespace, Key: codeKey, Version: codeVersion, Value: code},
+	})
+}
+
+// TestGetCodeHash_CacheMatchesUncachedAndReadSet is the core equivalence test:
+// attaching the engine's code-hash cache must not change GetCodeHash's result
+// NOR its MVCC read-set. The cache only elides the redundant keccak256 of
+// immutable committed code; the journaled reads (bal-absent, nonce, code) must
+// be byte-for-byte identical to the uncached path.
+func TestGetCodeHash_CacheMatchesUncachedAndReadSet(t *testing.T) {
+	addr := common.HexToAddress("0xC0DE000000000000000000000000000000000001")
+	code := []byte{0x60, 0x00, 0x60, 0x00, 0xf3}
+	wantHash := crypto.Keccak256Hash(code)
+	codeKey := accKey(addr, "code")
+
+	// Uncached baseline.
+	plain, err := NewStateDB(t.Context(), codeContractReader(addr, code, 9), Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := plain.GetCodeHash(addr); got != wantHash {
+		t.Fatalf("uncached GetCodeHash = %s, want %s", got, wantHash)
+	}
+	plainReads := plain.Result().Reads
+
+	// With cache attached.
+	cached, err := NewStateDB(t.Context(), codeContractReader(addr, code, 9), Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached.codeHashCache = newCodeHashCache()
+	if got := cached.GetCodeHash(addr); got != wantHash {
+		t.Fatalf("cached GetCodeHash = %s, want %s", got, wantHash)
+	}
+	cachedReads := cached.Result().Reads
+
+	if !sameReadSet(plainReads, cachedReads) {
+		t.Fatalf("read-set changed by cache:\n uncached=%v\n cached=%v", plainReads, cachedReads)
+	}
+	if r := findRead(cachedReads, codeKey); r == nil || r.Version == nil || r.Version.BlockNum != 9 {
+		t.Fatalf("expected the code read journaled at version 9, got %v", r)
+	}
+}
+
+// TestGetCodeHash_ServesFromCacheOnVersionMatch proves the cache is actually
+// consulted: a poisoned entry stored under the version the reader will report is
+// returned verbatim (a real recompute would yield the true hash). It also proves
+// a cache HIT still journals the MVCC read -- read-set correctness must not
+// depend on cache state.
+func TestGetCodeHash_ServesFromCacheOnVersionMatch(t *testing.T) {
+	addr := common.HexToAddress("0xC0DE000000000000000000000000000000000002")
+	code := []byte{0x60, 0x2a, 0x60, 0x00, 0x52}
+	codeKey := accKey(addr, "code")
+
+	chc := newCodeHashCache()
+	bogus := common.HexToHash("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+	chc.m[addr] = codeHashEntry{version: blocks.Version{BlockNum: 9}, hash: bogus}
+
+	db, err := NewStateDB(t.Context(), codeContractReader(addr, code, 9), Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.codeHashCache = chc
+
+	if got := db.GetCodeHash(addr); got != bogus {
+		t.Fatalf("expected poisoned cache value %s (cache not consulted), got %s", bogus, got)
+	}
+	if r := findRead(db.Result().Reads, codeKey); r == nil || r.Version == nil || r.Version.BlockNum != 9 {
+		t.Fatalf("a cache hit must still journal the code read at version 9, got %v", r)
+	}
+}
+
+// TestGetCodeHash_RecomputesOnVersionMismatch verifies self-invalidation: a
+// stale entry (older version) is ignored, the true hash is recomputed, and the
+// entry is refreshed to the current version.
+func TestGetCodeHash_RecomputesOnVersionMismatch(t *testing.T) {
+	addr := common.HexToAddress("0xC0DE000000000000000000000000000000000003")
+	code := []byte{0x60, 0x01, 0x60, 0x02, 0x01}
+	want := crypto.Keccak256Hash(code)
+
+	chc := newCodeHashCache()
+	chc.m[addr] = codeHashEntry{version: blocks.Version{BlockNum: 8}, hash: common.HexToHash("0x01")}
+
+	db, err := NewStateDB(t.Context(), codeContractReader(addr, code, 9), Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.codeHashCache = chc
+
+	if got := db.GetCodeHash(addr); got != want {
+		t.Fatalf("stale entry must be recomputed: got %s, want %s", got, want)
+	}
+	if e := chc.m[addr]; e.version.BlockNum != 9 || e.hash != want {
+		t.Fatalf("cache not refreshed to current version: %+v", e)
+	}
+}
+
+// TestGetCodeHash_InTxWrittenCodeNotCached covers the journal branch: code
+// written earlier in the same tx (contract creation) is hashed directly from the
+// pending value and must NOT populate the committed-code cache.
+func TestGetCodeHash_InTxWrittenCodeNotCached(t *testing.T) {
+	addr := common.HexToAddress("0xC0DE000000000000000000000000000000000004")
+	nonceKey := accKey(addr, "nonce")
+	reader := newMapReader(map[string]*blocks.WriteRecord{
+		nonceKey: {Namespace: Namespace, Key: nonceKey, Version: 7, Value: uint64ToBytes(1)},
+	})
+	chc := newCodeHashCache()
+	db, err := NewStateDB(t.Context(), reader, Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.codeHashCache = chc
+
+	newCode := []byte{0x01, 0x02, 0x03, 0x04}
+	db.putState(accKey(addr, "code"), newCode) // in-tx code write, no read
+	want := crypto.Keccak256Hash(newCode)
+	if got := db.GetCodeHash(addr); got != want {
+		t.Fatalf("in-tx code hash = %s, want %s", got, want)
+	}
+	if _, ok := chc.m[addr]; ok {
+		t.Fatalf("in-tx written code must not populate the committed-code cache")
+	}
+}
+
+// TestGetCodeHash_EOAReturnsEmptyCodeHash: an account that exists via balance but
+// has no code key returns the empty-code hash and is never cached (absent code
+// key => no version to validate against).
+func TestGetCodeHash_EOAReturnsEmptyCodeHash(t *testing.T) {
+	addr := common.HexToAddress("0xEEE0000000000000000000000000000000000005")
+	balKey := accKey(addr, "bal")
+	reader := newMapReader(map[string]*blocks.WriteRecord{
+		balKey: {Namespace: Namespace, Key: balKey, Version: 3, Value: uint256ToBytes(uint256.NewInt(100))},
+	})
+	chc := newCodeHashCache()
+	db, err := NewStateDB(t.Context(), reader, Namespace, 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.codeHashCache = chc
+
+	want := crypto.Keccak256Hash(nil) // empty-code hash
+	if got := db.GetCodeHash(addr); got != want {
+		t.Fatalf("EOA GetCodeHash = %s, want empty-code hash %s", got, want)
+	}
+	if _, ok := chc.m[addr]; ok {
+		t.Fatalf("EOA (absent code key) must not be cached")
 	}
 }

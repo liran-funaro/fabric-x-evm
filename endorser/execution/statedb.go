@@ -39,6 +39,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/big"
+	"sync"
 	"unsafe"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -228,6 +229,56 @@ type effectRec struct {
 	prevRefund uint64         // effRefund: previous refund counter
 }
 
+// codeHashCache memoizes keccak256(contract code) across an engine's warm-pass
+// workers and its serial authoritative pass (and across every batch of a run),
+// keyed by address and validated by the code key's committed store version.
+// resolveCodeHash calls StateDB.GetCodeHash on essentially every CALL/DELEGATECALL,
+// which re-hashes the target's full bytecode -- for the ~15 KB USDC implementation
+// (a DELEGATECALL target hit twice per transfer) that keccak dominated the auth
+// pass's serial CPU. Contract code is immutable once committed (EIP-6780 forbids
+// redeploying live contract code), so a stored entry whose version matches the
+// freshly read record is authoritative; a mismatch -- only reachable if the code
+// key were rewritten -- recomputes and refreshes the entry, keeping the cache
+// self-correcting. It never affects the MVCC read-set: GetCodeHash still journals
+// the code read exactly as GetCode did (see journalRead), so only the redundant
+// hashing disappears. Safe for concurrent use by the warm pass's per-worker
+// StateDBs, which all share one instance owned by the EVMEngine.
+type codeHashCache struct {
+	mu sync.RWMutex
+	m  map[common.Address]codeHashEntry
+}
+
+// codeHashEntry is one memoized code hash and the store version it was computed
+// under; a read whose version differs invalidates it (see codeHashCache).
+type codeHashEntry struct {
+	version blocks.Version
+	hash    common.Hash
+}
+
+func newCodeHashCache() *codeHashCache {
+	return &codeHashCache{m: make(map[common.Address]codeHashEntry)}
+}
+
+// get returns the memoized keccak256(code) for addr when the stored entry was
+// computed under the same version; otherwise it hashes code once, caches it
+// under version, and returns it. code MUST be the committed code bytes read
+// under version. Concurrency-safe: readers take the RLock (the steady state
+// once the handful of contract hashes are warm), the rare miss upgrades to the
+// write lock to install the entry.
+func (c *codeHashCache) get(addr common.Address, version blocks.Version, code []byte) common.Hash {
+	c.mu.RLock()
+	e, ok := c.m[addr]
+	c.mu.RUnlock()
+	if ok && e.version == version {
+		return e.hash
+	}
+	h := crypto.Keccak256Hash(code)
+	c.mu.Lock()
+	c.m[addr] = codeHashEntry{version: version, hash: h}
+	c.mu.Unlock()
+	return h
+}
+
 // StateDB implements ExtendedStateDB by combining ledger state management
 // with EVM-specific state tracking using a single unified journal.
 type StateDB struct {
@@ -269,6 +320,14 @@ type StateDB struct {
 	effects        []effectRec
 	validRevisions []revision
 	nextRevisionId int
+
+	// codeHashCache memoizes keccak256(contract code) across the engine (nil in
+	// unit tests that build a StateDB directly, which then hash on every call).
+	// Shared by every StateDB an EVMEngine constructs -- the warm pass's
+	// per-worker DBs and the serial auth pass alike -- so it must be
+	// concurrency-safe; see the codeHashCache type. Not cleared by reset: the
+	// cache spans txs and batches by design (committed code is immutable).
+	codeHashCache *codeHashCache
 
 	// dbErr records the first backing-store read error seen during execution.
 	// The go-ethereum vm.StateDB accessors (GetState, GetBalance, GetNonce, ...)
@@ -441,16 +500,13 @@ func (s *StateDB) viewGet(key string) (*blocks.WriteRecord, error) {
 	return rec, nil
 }
 
-// getStateFromStore reads from the underlying ReadStore (via the per-tx read
-// cache) and journals the read. This creates an MVCC read dependency: every
-// call appends to s.reads exactly as before, so read-set contents and
-// snapshot/revert semantics are unchanged whether or not the value was cached.
-func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
-	record, err := s.viewGet(key)
-	if err != nil {
-		return nil, err
-	}
-
+// journalRead records an MVCC read dependency on key for the pinned view's
+// record (nil when the key is absent in the view) and returns the record's
+// value together with the readRec it appended. It is the single place that maps
+// a WriteRecord's version onto the read-set's Version, so getStateFromStore and
+// GetCodeHash journal reads identically -- the latter also needs the returned
+// readRec's version to key its code-hash cache without recomputing it.
+func (s *StateDB) journalRead(key string, record *blocks.WriteRecord) ([]byte, readRec) {
 	var val []byte
 	r := readRec{key: key}
 	if record != nil {
@@ -475,6 +531,19 @@ func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
 
 	// Journal the read - this creates an MVCC dependency
 	s.reads = append(s.reads, r)
+	return val, r
+}
+
+// getStateFromStore reads from the underlying ReadStore (via the per-tx read
+// cache) and journals the read. This creates an MVCC read dependency: every
+// call appends to s.reads exactly as before, so read-set contents and
+// snapshot/revert semantics are unchanged whether or not the value was cached.
+func (s *StateDB) getStateFromStore(key string) ([]byte, error) {
+	record, err := s.viewGet(key)
+	if err != nil {
+		return nil, err
+	}
+	val, _ := s.journalRead(key, record)
 	return val, nil
 }
 
@@ -591,7 +660,32 @@ func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
 	if !s.Exist(addr) {
 		return common.Hash{}
 	}
-	code := s.GetCode(addr)
+	codeKey := accKey(addr, "code")
+
+	// Code written earlier in this tx (contract creation): hash the pending
+	// value directly, journaling no read -- exactly as the old Exist()+GetCode()
+	// path did, where GetCode's getState found the write in the journal.
+	if val, found := s.getStateFromJournal(codeKey); found {
+		return crypto.Keccak256Hash(val)
+	}
+
+	// Committed code. Read it through the pinned view and journal the read via
+	// journalRead, so the MVCC read-set is byte-for-byte identical to the old
+	// GetCode path (same key, same version). The only change is that the
+	// keccak256 of immutable contract code is memoized in the engine-shared
+	// cache -- keyed by address, validated by the read's version -- rather than
+	// recomputed on every call. EOAs and accounts with no code have an absent
+	// code key (record == nil => !hasVersion), so they skip the cache and hash
+	// nil, yielding the empty-code hash just as before.
+	record, err := s.viewGet(codeKey)
+	if err != nil {
+		s.setError(fmt.Errorf("GetCodeHash failed: %w", err))
+		return common.Hash{}
+	}
+	code, r := s.journalRead(codeKey, record)
+	if s.codeHashCache != nil && r.hasVersion {
+		return s.codeHashCache.get(addr, r.version, code)
+	}
 	return crypto.Keccak256Hash(code)
 }
 

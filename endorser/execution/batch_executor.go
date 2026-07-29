@@ -288,6 +288,7 @@ func (e *EVMEngine) newReusableExecutor(store ReadStore) (*StateDB, *Executor, e
 	if err != nil {
 		return nil, nil, err
 	}
+	sdb.codeHashCache = e.codeHashCache
 	ex, err := NewExecutor(sdb, noopCloser{}, nil, e.evmConfig)
 	if err != nil {
 		return nil, nil, err
@@ -336,6 +337,7 @@ func (e *EVMEngine) newState(reader ReadStore) (ExtendedStateDB, error) {
 	if err != nil {
 		return nil, err
 	}
+	stateDB.codeHashCache = e.codeHashCache
 	if e.evmConfig.DebugLogs {
 		return NewStateDBLogger(stateDB), nil
 	}

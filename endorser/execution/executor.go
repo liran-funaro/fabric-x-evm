@@ -78,6 +78,14 @@ type EVMEngine struct {
 	// under concurrent Execute calls: each caller gets its own instance. Only
 	// used on the fast path (no decorator, no debug logging).
 	execPool sync.Pool
+
+	// codeHashCache memoizes keccak256(contract code) across every StateDB this
+	// engine builds -- the warm pass's per-worker DBs and the serial auth pass
+	// alike -- so an immutable contract's code hash is computed once per run
+	// instead of on every CALL/DELEGATECALL. Concurrency-safe; see the
+	// codeHashCache type in statedb.go. One per engine so namespaces stay
+	// isolated (each engine serves a single namespace).
+	codeHashCache *codeHashCache
 }
 
 // reusableExec bundles a StateDB with the Executor (and primed EVM) bound to it,
@@ -94,6 +102,7 @@ func NewEVMEngine(namespace string, kvs KVSSnapshotter, evmConfig EVMConfig, mon
 		kvs:               kvs,
 		monotonicVersions: monotonicVersions,
 		evmConfig:         evmConfig,
+		codeHashCache:     newCodeHashCache(),
 	}
 }
 
@@ -339,6 +348,7 @@ func (e *EVMEngine) newExecutor(blockNumber *big.Int) (*Executor, error) {
 		reader.Close()
 		return nil, err
 	}
+	stateDB.codeHashCache = e.codeHashCache
 	var state ExtendedStateDB = stateDB
 	if e.evmConfig.DebugLogs {
 		state = NewStateDBLogger(stateDB)
@@ -372,6 +382,7 @@ func (e *EVMEngine) newSnapshotAt(blockNumber *big.Int) (ExtendedStateDB, ReadSt
 		reader.Close()
 		return nil, nil, err
 	}
+	stateDB.codeHashCache = e.codeHashCache
 	return stateDB, reader, nil
 }
 
