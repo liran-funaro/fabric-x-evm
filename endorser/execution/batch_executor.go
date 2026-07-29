@@ -11,13 +11,25 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
+	"go.uber.org/zap/zapcore"
 )
+
+// batchLogger carries the per-batch endorse-phase timing (ENDORSE-TIMING lines).
+// It is diagnostic instrumentation for the two-phase execution bottleneck hunt:
+// which phase (concurrent warm vs serial authoritative) dominates, and whether
+// that phase's cost is backend read I/O or CPU. The timing is emitted at DEBUG
+// and gated on IsEnabledFor(debug): at the default info level ExecuteBatch does
+// not wrap the view at all, so production pays nothing (no per-read atomics, no
+// formatting). Enable with `logging.logSpec: evm.batch=debug`.
+var batchLogger = flogging.MustGetLogger("evm.batch")
 
 // ExecuteBatch runs an ordered batch of transactions under a single view.
 //
@@ -43,11 +55,13 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 
 	// One snapshot (one view) for the whole batch: every tx, in both passes,
 	// simulates against the same consistent point-in-time state.
+	snapStart := time.Now()
 	reader, err := e.kvs.NewSnapshot(0)
 	if err != nil {
 		return nil, err
 	}
 	defer reader.Close()
+	snapDur := time.Since(snapStart)
 
 	if len(txs) == 1 {
 		var res endorsement.ExecutionResult
@@ -71,6 +85,21 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 			return nil, err
 		}
 		return []endorsement.ExecutionResult{res}, nil
+	}
+
+	// When evm.batch is at debug level, wrap the batch view to measure the read
+	// load each phase places on the backend: how many under.Get calls it makes
+	// and their cumulative wall-time. Instrumentation only -- Get is a
+	// pass-through. Shared by both passes; its atomic counters are snapshotted at
+	// the warm/auth boundary to attribute reads (and read I/O time) to each phase
+	// (see the ENDORSE-TIMING log below). At the default info level the view is
+	// used unwrapped, so no per-read atomics run on the hot path.
+	timing := batchLogger.IsEnabledFor(zapcore.DebugLevel)
+	readSrc := reader
+	var counted *countingReader
+	if timing {
+		counted = &countingReader{under: reader}
+		readSrc = counted
 	}
 
 	// The fast path (production: no per-tx decorator, no debug logging) reuses
@@ -106,6 +135,7 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	if warmWorkers <= 0 || warmWorkers > len(txs) {
 		warmWorkers = len(txs)
 	}
+	warmStart := time.Now()
 	var next atomic.Int64
 	var wg sync.WaitGroup
 	for range warmWorkers {
@@ -119,7 +149,7 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 			var ex *Executor
 			if fast {
 				var err error
-				if sdb, ex, err = e.newReusableExecutor(reader); err != nil {
+				if sdb, ex, err = e.newReusableExecutor(readSrc); err != nil {
 					return
 				}
 			}
@@ -134,11 +164,11 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 				func(tx *types.Transaction) {
 					defer func() { _ = recover() }()
 					if fast {
-						sdb.reset(reader)
+						sdb.reset(readSrc)
 						_, _ = e.classify(ex, sdb, tx) // warm only; ignore result/error.
 						return
 					}
-					if s, err := e.newState(reader); err == nil {
+					if s, err := e.newState(readSrc); err == nil {
 						_, _ = e.runOn(s, tx) // warm only; ignore result/error.
 					}
 				}(txs[i])
@@ -146,10 +176,16 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}()
 	}
 	wg.Wait()
+	warmDur := time.Since(warmStart)
+	var warmReads, warmReadNanos int64
+	if timing {
+		warmReads, warmReadNanos = counted.n.Load(), counted.nanos.Load()
+	}
 
 	// Authoritative pass: sequential, each tx against the snapshot plus an
 	// overlay carrying every earlier tx's writes from this batch.
-	overlay := &overlayReader{under: reader, writes: map[string]*blocks.WriteRecord{}}
+	authStart := time.Now()
+	overlay := &overlayReader{under: readSrc, writes: map[string]*blocks.WriteRecord{}}
 	out := make([]endorsement.ExecutionResult, 0, len(txs))
 	// Fast path: one reused StateDB+Executor for the whole (serial) pass, reset
 	// against the overlay before each tx.
@@ -196,6 +232,24 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}
 		overlay.apply(res.RWS)
 		out = append(out, res)
+	}
+	authDur := time.Since(authStart)
+
+	// warm reads run concurrently (readtime is the SUM across workers, so it can
+	// exceed warm wall-time); auth reads are serial (readtime <= auth wall-time,
+	// and auth-wall minus auth-readtime is the serial CPU/EVM cost). This is the
+	// single line that says which phase dominates and why. Guarded by `timing`:
+	// only reached when evm.batch is at debug level (counted is non-nil).
+	if timing {
+		authReads := counted.n.Load() - warmReads
+		authReadNanos := counted.nanos.Load() - warmReadNanos
+		batchLogger.Debugf("ENDORSE-TIMING n=%d snapshot=%s warm=%s{reads=%d readtime=%s} auth=%s{reads=%d readtime=%s cpu=%s}",
+			len(txs),
+			snapDur.Round(time.Microsecond),
+			warmDur.Round(time.Microsecond), warmReads, time.Duration(warmReadNanos).Round(time.Microsecond),
+			authDur.Round(time.Microsecond), authReads, time.Duration(authReadNanos).Round(time.Microsecond),
+			(authDur - time.Duration(authReadNanos)).Round(time.Microsecond),
+		)
 	}
 	return out, nil
 }
@@ -350,3 +404,32 @@ func (o *overlayReader) apply(rws blocks.ReadWriteSet) {
 }
 
 var _ ReadStore = (*overlayReader)(nil)
+
+// countingReader is a pass-through ReadStore that counts Get calls and the
+// cumulative wall-time spent inside the wrapped store's Get. It exists to
+// attribute ExecuteBatch's backend read load to the warm vs authoritative
+// phase (see the ENDORSE-TIMING log): counters are atomic so the concurrent
+// warm pass and the serial authoritative pass can share one instance and be
+// read at the phase boundary. Get adds only two atomic increments and a
+// time.Now/Since pair per call -- negligible against a gRPC read -- and it is
+// only wired in when evm.batch is at debug level, so production never allocates
+// or touches it.
+type countingReader struct {
+	under ReadStore
+	n     atomic.Int64 // number of Get calls
+	nanos atomic.Int64 // cumulative wall-time spent inside under.Get, in ns
+}
+
+func (c *countingReader) Get(ns, key string) (*blocks.WriteRecord, error) {
+	start := time.Now()
+	rec, err := c.under.Get(ns, key)
+	c.nanos.Add(int64(time.Since(start)))
+	c.n.Add(1)
+	return rec, err
+}
+
+// Close is a no-op: the wrapped snapshot's lifecycle is owned by ExecuteBatch
+// (which closes `reader` directly), not by this instrumentation wrapper.
+func (c *countingReader) Close() error { return nil }
+
+var _ ReadStore = (*countingReader)(nil)
