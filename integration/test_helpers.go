@@ -581,6 +581,7 @@ func NewLocalTestHarnessWithFactory(t *testing.T, logger sdk.Logger, evmConfig e
 	// endorser built below via cacheWrap -- see buildTestHarness's doc comment
 	// and the THE CRITICAL INVARIANT note on gateway/core.Gateway.cache.
 	cache := core.NewVersionedCache()
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}
@@ -678,6 +679,7 @@ func NewLocalTestHarnessWithNotifier(t *testing.T, logger sdk.Logger, evmConfig 
 	// Exactly one VersionedCache for this harness's one gateway, shared by every
 	// endorser built below via cacheWrap -- see buildTestHarness's doc comment.
 	cache := core.NewVersionedCache()
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}
@@ -722,6 +724,7 @@ func newFileConfigHarness(t *testing.T, logger sdk.Logger, evmConfig execution.E
 
 	// Exactly one VersionedCache for this harness's one gateway -- see above.
 	cache := core.NewVersionedCache()
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}
@@ -764,6 +767,7 @@ func NewFabricXTestHarnessWithNotifications(t *testing.T, logger sdk.Logger, evm
 
 	// Exactly one VersionedCache for this harness's one gateway -- see above.
 	cache := core.NewVersionedCache()
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}

@@ -100,6 +100,13 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		g.rebuildCacheFromInflight()
 	}
 
+	// Same boundary, same goroutine: run the read-only cache's maintenance
+	// (evict this gateway's freshly-written keys, admit hot staged candidates,
+	// enforce MFU capacity). No-op unless a read-only cache was enabled. Kept
+	// here so read-only entries, like write-cache entries, only ever change
+	// between batches -- never mid-execution while warm workers are reading.
+	g.cache.MaintainReadOnly()
+
 	// DrainUpTo is non-destructive: included txs are removed below at submit
 	// time (so the next cycle can't re-drain and double-submit them) while
 	// retryable-excluded (nonce-too-high) txs stay pending to retry later.

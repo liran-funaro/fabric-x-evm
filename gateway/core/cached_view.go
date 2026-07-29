@@ -18,7 +18,8 @@ type cachedSnapshotter struct {
 
 // NewCachedSnapshotter layers the cross-batch VersionedCache over an underlying
 // snapshotter (the query-service Store). Reads hit in-flight writes first, then
-// the per-batch committed view. Used as the endorser engine's KVSSnapshotter.
+// the optional cross-batch read-only cache (hot rarely-written keys), then the
+// per-batch committed view. Used as the endorser engine's KVSSnapshotter.
 func NewCachedSnapshotter(under execution.KVSSnapshotter, cache *VersionedCache) execution.KVSSnapshotter {
 	return &cachedSnapshotter{under: under, cache: cache}
 }
@@ -38,9 +39,20 @@ type cachedView struct {
 
 func (v *cachedView) Get(namespace, key string) (*blocks.WriteRecord, error) {
 	if rec, ok := v.cache.Read(key); ok {
-		return rec, nil
+		return rec, nil // in-flight write cache
 	}
-	return v.under.Get(namespace, key)
+	if rec, ok := v.cache.readOnlyGet(key); ok {
+		return rec, nil // hot rarely-written committed record
+	}
+	rec, err := v.under.Get(namespace, key)
+	// Offer only present, non-delete records as read-only-cache candidates:
+	// absent keys read as (nil, nil), and caching a delete tombstone adds edge
+	// cases (nil read-set version) for no benefit on this workload. The stale
+	// window is closed by write-driven eviction (see VersionedCache.ApplyWrites).
+	if err == nil && rec != nil && !rec.IsDelete {
+		v.cache.readOnlyStage(key, rec)
+	}
+	return rec, err
 }
 
 func (v *cachedView) Close() error { return v.under.Close() }

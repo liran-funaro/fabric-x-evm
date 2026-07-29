@@ -87,6 +87,11 @@ func newApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, enableT
 	// gateway itself (passed to BuildGateway below) -- see the cache field doc on
 	// gateway/core.Gateway. Diverging instances would silently break pipelining.
 	cache := core.NewVersionedCache()
+	// Layer a small cross-batch read-only cache under the in-flight write cache:
+	// a handful of hot, never-written keys (token metadata, proxy/impl code,
+	// EIP-1967 slots) dominate store-read traffic, so caching them across batches
+	// cuts query-service round-trips on the serial re-execution path.
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}

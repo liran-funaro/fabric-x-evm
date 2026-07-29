@@ -32,10 +32,31 @@ type VersionedCache struct {
 	evictMu     sync.Mutex
 	committed   []string
 	invalidated []string
+
+	// ro is the optional cross-batch read-only cache for hot, rarely-written
+	// committed records (nil unless EnableReadOnlyCache was called). It sits
+	// BELOW this in-flight write cache in the read path (write-cache ->
+	// read-only-cache -> query view) and is maintained at the same batch
+	// boundary. roEvictPending accumulates the keys this gateway writes each
+	// cycle (recorded in ApplyWrites, under c.mu) so MaintainReadOnly can evict
+	// their now-stale read-only entries at the next boundary. roEvictPending is
+	// touched only on the executor goroutine (ApplyWrites and MaintainReadOnly
+	// both run there) but is guarded by c.mu to stay robust to future callers.
+	ro             *ReadOnlyCache
+	roEvictPending []string
 }
 
 func NewVersionedCache() *VersionedCache {
 	return &VersionedCache{entries: make(map[string]entry)}
+}
+
+// EnableReadOnlyCache attaches a cross-batch read-only cache with the given
+// capacity and admission threshold. Call once, before the executor starts, on
+// the same VersionedCache handed to both the cached snapshotter (read path) and
+// the Gateway (boundary maintenance). A capacity/threshold of 0 falls back to
+// the package defaults.
+func (c *VersionedCache) EnableReadOnlyCache(capacity int, threshold uint64) {
+	c.ro = newReadOnlyCache(capacity, threshold)
 }
 
 func (c *VersionedCache) Read(key string) (*blocks.WriteRecord, bool) {
@@ -58,6 +79,52 @@ func (c *VersionedCache) ApplyWrites(txID string, r blocks.ReadWriteSet) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.applyLocked(txID, r)
+	// Queue this batch's written keys for read-only-cache eviction at the next
+	// boundary: once these commit, their committed version advances, so any
+	// read-only entry for them would be stale. Evicting one boundary after the
+	// write (well before the commit) only widens the safe margin -- while the
+	// write is in-flight it lives in c.entries above and shadows the read-only
+	// cache anyway. Over-eviction (e.g. if the batch later aborts) is harmless:
+	// it just forces a re-fetch and re-admission.
+	if c.ro != nil {
+		for _, w := range r.Writes {
+			c.roEvictPending = append(c.roEvictPending, w.Key)
+		}
+	}
+}
+
+// readOnlyGet consults the read-only cache (nil-safe). Called on the read path
+// AFTER an in-flight write-cache miss and BEFORE the query view.
+func (c *VersionedCache) readOnlyGet(key string) (*blocks.WriteRecord, bool) {
+	if c.ro == nil {
+		return nil, false
+	}
+	return c.ro.get(key)
+}
+
+// readOnlyStage offers a present, non-delete record just read from the query
+// view as a read-only-cache admission candidate (nil-safe). Called on the read
+// path after a query-view hit, concurrently by warm-pass workers.
+func (c *VersionedCache) readOnlyStage(key string, rec *blocks.WriteRecord) {
+	if c.ro == nil {
+		return
+	}
+	c.ro.stage(key, rec)
+}
+
+// MaintainReadOnly runs the read-only cache's batch-boundary maintenance
+// (evict this gateway's freshly-written keys, admit staged candidates, enforce
+// MFU capacity). Called once per cycle at the boundary on the executor
+// goroutine, so it never overlaps concurrent get/stage. Nil-safe.
+func (c *VersionedCache) MaintainReadOnly() {
+	if c.ro == nil {
+		return
+	}
+	c.mu.Lock()
+	evict := c.roEvictPending
+	c.roEvictPending = nil
+	c.mu.Unlock()
+	c.ro.maintain(evict)
 }
 
 // applyLocked records tx's writes into c.entries at deterministic spec versions.

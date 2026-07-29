@@ -73,6 +73,9 @@ func NewTestNode(ctx context.Context, tcfg TestNodeConfig) (*App, error) {
 	// gateway itself (passed to buildApp below) -- see newApp's identical wiring
 	// and the cache field doc on gateway/core.Gateway.
 	cache := core.NewVersionedCache()
+	// Mirror newApp: enable the cross-batch read-only cache (hot rarely-written
+	// keys) so the test node exercises the same read path as production.
+	cache.EnableReadOnlyCache(core.DefaultReadOnlyCacheCapacity, core.DefaultReadOnlyAdmitThreshold)
 	cacheWrap := func(s execution.KVSSnapshotter) execution.KVSSnapshotter {
 		return core.NewCachedSnapshotter(s, cache)
 	}
