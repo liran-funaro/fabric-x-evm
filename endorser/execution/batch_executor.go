@@ -9,7 +9,6 @@ package execution
 import (
 	"context"
 	"errors"
-	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -87,15 +86,24 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	// pass below, which is what surfaces real results and errors. A tx that would
 	// fail here (e.g. against pre-batch state) is not a bug.
 	//
-	// A BOUNDED worker pool -- not one goroutine per tx -- pulls txs via an atomic
-	// index: spawning a goroutine per tx made scheduler park/unpark churn (usleep,
-	// cond_wait/signal) dominate batch CPU in profiling. Each worker gets its own
-	// per-tx state so concurrent execution never shares a journal.
+	// Concurrency = batch size (design RQ1: "one goroutine per transaction in the
+	// batch"). The warm pass exists to fill the query-service view's read cache, and
+	// each warm read BLOCKS on a gRPC round-trip to the query service -- it is
+	// I/O-bound, not CPU-bound, so the worker count is NOT tied to GOMAXPROCS. The
+	// query service coalesces concurrent single-key reads into one DB call
+	// (min-batch-keys / max-batch-wait); firing all of a batch's reads at once fills
+	// that window, instead of leaving the server's max-batch-wait exposed on every
+	// small wave. Blocked workers are parked on I/O (not busy-waiting), so a large
+	// count is cheap -- the Go scheduler handles it fine.
+	//
+	// A work-stealing atomic-index pool -- not a raw goroutine-per-tx spawn -- lets a
+	// free worker pick up a slow worker's remaining txs; with the default count ==
+	// len(txs) it is effectively one worker per tx. Each worker owns its per-tx state
+	// so concurrent execution never shares a journal. An explicit WarmWorkers override
+	// caps concurrency for a fast, non-blocking backend (e.g. an in-memory KVS) where
+	// unbounded warm goroutines would add scheduler churn with no I/O to overlap.
 	warmWorkers := e.evmConfig.WarmWorkers
-	if warmWorkers <= 0 {
-		warmWorkers = runtime.GOMAXPROCS(0)
-	}
-	if warmWorkers > len(txs) {
+	if warmWorkers <= 0 || warmWorkers > len(txs) {
 		warmWorkers = len(txs)
 	}
 	var next atomic.Int64

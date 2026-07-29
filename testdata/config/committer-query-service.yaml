@@ -32,8 +32,13 @@ database:
     max-interval: 60s
     max-elapsed-time: 15m
 
-min-batch-keys: 1024
-max-batch-wait: 100ms
+# A single gateway drives all reads through one view: its warm pass fires a whole
+# batch's reads concurrently (concurrency = batch size), so a wave arrives at the
+# server within microseconds. Flush that wave immediately on key-count, and cap the
+# tail wait low, instead of the bulk-read default (1024 keys / 100ms) that never
+# fills from one client and leaves ~100ms exposed on every small wave.
+min-batch-keys: 256
+max-batch-wait: 5ms
 view-aggregation-window: 100ms
 max-aggregated-views: 1024
 max-view-timeout: 10s

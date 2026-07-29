@@ -35,11 +35,13 @@ type EVMConfig struct {
 	MaxTxGas uint64
 	// DebugLogs wraps the per-tx StateDB in StateDBLogger when true.
 	DebugLogs bool
-	// WarmWorkers bounds the concurrency of ExecuteBatch's warm pass. 0 means
-	// runtime.GOMAXPROCS. A bounded pool avoids the scheduler churn of spawning
-	// one goroutine per tx (profiling showed that churn dominated batch CPU);
-	// deployments with high query-service read latency may raise it to overlap
-	// more concurrent reads.
+	// WarmWorkers caps the concurrency of ExecuteBatch's warm pass. 0 (the default)
+	// means one worker per transaction in the batch (design RQ1: concurrency = batch
+	// size): warm reads block on the query service (I/O-bound, not CPU-bound), so
+	// issuing them all at once fills the query service's read-batch window rather than
+	// leaving its max-batch-wait exposed on each small wave. Set a positive value only
+	// to cap concurrency for a fast, non-blocking backend (e.g. an in-memory KVS),
+	// where unbounded warm goroutines would add scheduler churn with no I/O to overlap.
 	WarmWorkers int
 }
 
