@@ -226,6 +226,61 @@ func writeHeapProfile(filename string) {
 	}
 }
 
+// startProfiling arms CPU, mutex, and block profiling for the measurement
+// window when PERF_PROFILE_DIR is set, and returns a stop function that writes
+// cpu.prof / mutex.prof / block.prof into that directory. When the env var is
+// unset it is a no-op returning an empty stop function, so callers can always
+// defer the result unconditionally. This is a measurement-only hook: it is used
+// to quantify time spent in the per-read cache locks (VersionedCache.Read,
+// ReadOnlyCache.get) and the serial-auth overlayReader lock before deciding
+// whether those locks can be removed. Fraction/rate of 1 samples every event
+// -- this is a bench run, not production, so we want the full contention graph.
+func startProfiling() func() {
+	dir := os.Getenv("PERF_PROFILE_DIR")
+	if dir == "" {
+		return func() {}
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		panic(err)
+	}
+
+	runtime.SetMutexProfileFraction(1)
+	runtime.SetBlockProfileRate(1)
+
+	cpuFile, err := os.Create(filepath.Join(dir, "cpu.prof"))
+	if err != nil {
+		panic(err)
+	}
+	if err := pprof.StartCPUProfile(cpuFile); err != nil {
+		panic(err)
+	}
+
+	return func() {
+		pprof.StopCPUProfile()
+		cpuFile.Close()
+
+		writeLookupProfile(filepath.Join(dir, "mutex.prof"), "mutex")
+		writeLookupProfile(filepath.Join(dir, "block.prof"), "block")
+
+		// Reset so any later run in the same process starts clean.
+		runtime.SetMutexProfileFraction(0)
+		runtime.SetBlockProfileRate(0)
+	}
+}
+
+// writeLookupProfile snapshots a named runtime profile (e.g. "mutex", "block")
+// to filename in the default (proto) format go tool pprof reads.
+func writeLookupProfile(filename, name string) {
+	f, err := os.Create(filename)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	if err := pprof.Lookup(name).WriteTo(f, 0); err != nil {
+		panic(err)
+	}
+}
+
 // runReplayTest fires every transfer in the (optionally wrapped) window at the
 // gateway as fast as submittingWorkerCount goroutines can, with no outstanding-tx
 // cap, then measures how fast the drain-all executor commits them. Throughput is
@@ -401,6 +456,12 @@ func runReplayTest(
 
 	ctx, cancel := context.WithTimeout(t.Context(), 4*time.Hour)
 	defer cancel()
+
+	// Profile only the measurement window (submit + drain), never the gzip
+	// dataset load above -- otherwise decode noise pollutes the CPU profile.
+	// No-op unless PERF_PROFILE_DIR is set. Stopped after the drain completes,
+	// below, before the final stats are computed.
+	stopProfiling := startProfiling()
 
 	startTime := time.Now()
 
@@ -613,6 +674,9 @@ wait:
 	feederWg.Wait()
 	close(stopLogging)
 	loggingWg.Wait()
+
+	// Drain finished: write the CPU/mutex/block profiles for the window.
+	stopProfiling()
 
 	finalCommitted := atomic.LoadInt64(&committedEVM)
 	finalSubmitFailed := atomic.LoadInt64(&submitFailed)
