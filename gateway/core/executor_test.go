@@ -9,6 +9,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -50,6 +51,18 @@ func (g *Gateway) inflightCount() int {
 	g.inflightMu.Lock()
 	defer g.inflightMu.Unlock()
 	return len(g.inflight)
+}
+
+// reservedLen returns how many pending txs are currently reserved
+// (drained-but-not-yet-resolved by the pipelined executor). Test-only helper
+// (same package) for asserting the reservation lifecycle: a batch is reserved
+// from its DrainUpToReserved until the boundary Releases it (or Remove clears it
+// at submit). A reservation that outlives a batch's handling is a leak that
+// would make DrainUpToReserved skip those txs forever.
+func (p *PendingPool) reservedLen() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.reserved)
 }
 
 func okBatchResponse() *peer.ProposalResponse {
@@ -876,5 +889,270 @@ func TestGatewayHandleIgnoresUnrelatedTx(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond)
 	for _, tx := range txs {
 		require.True(t, g.pending.Has(tx.Hash()))
+	}
+}
+
+// --- Pipelined executor (warm(N+1) || auth(N)) single-cycle tests ---------
+//
+// These drive drainAndWarm / pipelineIteration directly (deterministic, no real
+// network) to prove the b-c-d-e-f-g ordering and, above all, the reservation
+// lifecycle: every batch a pipeline iteration touches must end either submitted
+// (its txs Removed) or released (its reservation cleared) -- never stuck
+// reserved, which would make DrainUpToReserved skip those txs forever.
+
+// TestPipelineHappyPathSubmitsAndPrefetchesNext: the defining overlap. With one
+// tx per batch and two txs, drainAndWarm establishes the invariant (batch 1
+// warmed + reserved); one pipelineIteration then auths+submits batch 1 WHILE
+// warming batch 2, and carries batch 2 (warmed + still reserved) forward. A
+// final iteration over batch 2 finds nothing left to prefetch, submits batch 2,
+// and returns nil so the caller re-establishes the invariant.
+func TestPipelineHappyPathSubmitsAndPrefetchesNext(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1) // one tx per batch -> two batches from two txs
+	tx1, tx2 := txWithNonce(1), txWithNonce(2)
+	g.pending.Add(tx1)
+	g.pending.Add(tx2)
+	ctx := context.Background()
+
+	// Establish the invariant: drain + warm batch 1 (tx1); tx1 is now reserved.
+	warmed := g.drainAndWarm(ctx)
+	require.NotNil(t, warmed)
+	require.Equal(t, []*types.Transaction{tx1}, warmed.Txs())
+	require.Equal(t, 1, g.pending.reservedLen(), "batch 1 reserved after drainAndWarm")
+
+	// One overlapped iteration: auth+submit batch 1, warm batch 2, carry it.
+	next := g.pipelineIteration(ctx, warmed)
+	end1 := <-g.endorsementChan // batch 1 was submitted during the iteration
+
+	require.NotNil(t, next)
+	require.Equal(t, []*types.Transaction{tx2}, next.Txs(), "batch 2 (tx2) prefetched + carried")
+	require.Equal(t, 1, g.inflightCount(), "batch 1 in flight")
+	require.False(t, g.pending.Has(tx1.Hash()), "batch 1's tx removed at submit")
+	require.True(t, g.pending.Has(tx2.Hash()), "batch 2's tx still pending (reserved)")
+	require.Equal(t, 1, g.pending.reservedLen(), "only batch 2 reserved now (batch 1 removed)")
+
+	// Commit batch 1.
+	id1, err := committerTxID(end1.Proposal)
+	require.NoError(t, err)
+	require.NoError(t, g.HandleTx(ctx, []common.TxNotification{
+		{FabricTxID: id1, Status: committerpb.Status_COMMITTED},
+	}))
+	require.Equal(t, 0, g.inflightCount())
+
+	// Final iteration over batch 2: the next drain is empty (tx2 is the only tx and
+	// is reserved), so it submits batch 2 and returns nil.
+	last := g.pipelineIteration(ctx, next)
+	end2 := <-g.endorsementChan
+	require.Nil(t, last, "no next batch to carry -> nil (caller re-establishes the invariant)")
+	require.Equal(t, 1, g.inflightCount())
+	require.False(t, g.pending.Has(tx2.Hash()), "batch 2's tx removed at submit")
+	require.Equal(t, 0, g.pending.reservedLen(), "no reservation survives once batch 2 is submitted")
+
+	id2, err := committerTxID(end2.Proposal)
+	require.NoError(t, err)
+	require.NotEqual(t, id1, id2, "each batch is a distinct committer tx")
+	require.NoError(t, g.HandleTx(ctx, []common.TxNotification{
+		{FabricTxID: id2, Status: committerpb.Status_COMMITTED},
+	}))
+	require.Equal(t, 0, g.inflightCount())
+}
+
+// TestPipelineEmptyNextReturnsNil: with a single tx there is nothing to
+// prefetch, so a pipelineIteration must NOT launch a warm pass, must still
+// submit the batch it holds, and must return nil (no next batch). No
+// reservation may survive.
+func TestPipelineEmptyNextReturnsNil(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	tx1 := txWithNonce(1)
+	g.pending.Add(tx1)
+	ctx := context.Background()
+
+	warmed := g.drainAndWarm(ctx)
+	require.NotNil(t, warmed)
+	require.Equal(t, 1, g.pending.reservedLen())
+
+	next := g.pipelineIteration(ctx, warmed)
+	end := <-g.endorsementChan
+	require.Nil(t, next, "empty next drain -> nil")
+	require.Equal(t, 1, g.inflightCount(), "the held batch is still submitted")
+	require.False(t, g.pending.Has(tx1.Hash()), "batch removed at submit")
+	require.Equal(t, 0, g.pending.reservedLen(), "batch's reservation cleared at submit")
+
+	id, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+	require.NoError(t, g.HandleTx(ctx, []common.TxNotification{
+		{FabricTxID: id, Status: committerpb.Status_COMMITTED},
+	}))
+	require.Equal(t, 0, g.inflightCount())
+}
+
+// TestPipelineAuthErrorReleasesBatchAndClosesNext: when the authoritative pass
+// of batch N fails (a non-OK batch response), the iteration must submit NOTHING,
+// release BOTH batch N (so it re-drains) AND the batch N+1 it had already warmed
+// (else its reservation leaks and its snapshot leaks), close the N+1 snapshot,
+// and return nil. Both batches must be re-drawable afterwards.
+func TestPipelineAuthErrorReleasesBatchAndClosesNext(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1)
+	tx1, tx2 := txWithNonce(1), txWithNonce(2)
+	g.pending.Add(tx1)
+	g.pending.Add(tx2)
+	ctx := context.Background()
+
+	// Warm batch 1 while the response is still OK (WarmBatch never reads execResp).
+	warmed := g.drainAndWarm(ctx)
+	require.NotNil(t, warmed)
+
+	// Now make the authoritative pass fail: a non-OK status is an auth error
+	// (mirrors TestAuthBatchNonOKStatusErrors). Set before pipelineIteration so
+	// the concurrent warm(N+1) goroutine never races this write.
+	stub.execResp = &peer.ProposalResponse{
+		Response: &peer.Response{Status: common.StatusServerError, Message: "auth pass: backend gone"},
+	}
+
+	next := g.pipelineIteration(ctx, warmed)
+
+	require.Nil(t, next, "auth error -> no next batch carried forward")
+	select {
+	case <-g.endorsementChan:
+		t.Fatal("auth error must not submit a committer tx")
+	default:
+	}
+	require.Equal(t, 0, g.inflightCount(), "nothing in flight after an auth error")
+	require.True(t, g.pending.Has(tx1.Hash()), "batch N stays pending")
+	require.True(t, g.pending.Has(tx2.Hash()), "prefetched batch N+1 stays pending")
+	require.Equal(t, 0, g.pending.reservedLen(), "auth error released BOTH batch N and prefetched N+1")
+	require.Equal(t, 2, stub.warmClosed,
+		"batch N closed by AuthBatch (1) + prefetched N+1 closed explicitly (1)")
+	require.Len(t, g.pending.DrainUpToReserved(0), 2, "both batches are re-drawable")
+}
+
+// TestPipelineWarmErrorStillSubmitsAndReleasesNext: when warming batch N+1 fails
+// but batch N's authoritative pass succeeds, batch N must still be submitted
+// (the warm failure only concerns the prefetch), the failed N+1 reservation must
+// be released so its txs re-draw, and the iteration returns nil (no next batch).
+func TestPipelineWarmErrorStillSubmitsAndReleasesNext(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1)
+	tx1, tx2 := txWithNonce(1), txWithNonce(2)
+	g.pending.Add(tx1)
+	g.pending.Add(tx2)
+	ctx := context.Background()
+
+	warmed := g.drainAndWarm(ctx) // batch 1 warmed OK
+	require.NotNil(t, warmed)
+
+	// Make the NEXT warm (batch 2) fail; batch 1's auth still succeeds (execResp OK).
+	stub.warmErr = errors.New("open snapshot: db unavailable")
+
+	next := g.pipelineIteration(ctx, warmed)
+	end := <-g.endorsementChan // batch 1 still submitted
+
+	require.Nil(t, next, "warm(N+1) error -> no next batch carried forward")
+	require.Equal(t, 1, g.inflightCount(), "batch 1 submitted despite warm(N+1) failing")
+	require.False(t, g.pending.Has(tx1.Hash()), "batch 1 removed at submit")
+	require.True(t, g.pending.Has(tx2.Hash()), "batch 2 stays pending")
+	require.Equal(t, 0, g.pending.reservedLen(), "batch 2's failed reservation released; batch 1 removed")
+	require.Len(t, g.pending.DrainUpToReserved(0), 1, "only batch 2 remains, re-drawable")
+
+	id, err := committerTxID(end.Proposal)
+	require.NoError(t, err)
+	require.NoError(t, g.HandleTx(ctx, []common.TxNotification{
+		{FabricTxID: id, Status: committerpb.Status_COMMITTED},
+	}))
+	require.Equal(t, 0, g.inflightCount())
+}
+
+// TestPipelineDrainAndWarmEmptyWaitsForWork: on an empty pool, drainAndWarm must
+// BLOCK in waitForWork (leaving the invariant unestablished) rather than
+// busy-return nil in a tight loop; a ctx cancel unblocks it and it returns nil.
+func TestPipelineDrainAndWarmEmptyWaitsForWork(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan *WarmedBatch, 1)
+	go func() { done <- g.drainAndWarm(ctx) }()
+
+	select {
+	case <-done:
+		t.Fatal("drainAndWarm returned on an empty pool instead of waiting for work")
+	case <-time.After(150 * time.Millisecond):
+		// still blocked in waitForWork, as expected
+	}
+
+	cancel() // shutdown unblocks waitForWork
+	select {
+	case w := <-done:
+		require.Nil(t, w, "empty drain -> nil warmed batch")
+	case <-time.After(2 * time.Second):
+		t.Fatal("drainAndWarm did not return after ctx cancel")
+	}
+}
+
+// TestRunExecutorPipelinedEndToEnd drives the whole pipelined loop with a
+// background auto-committer, proving the loop drains a burst of txs to
+// completion and shuts down cleanly on ctx cancel with NOTHING left reserved --
+// the end-to-end reservation-lifecycle guarantee (every tx either committed or
+// re-drawable, none stuck).
+func TestRunExecutorPipelinedEndToEnd(t *testing.T) {
+	stub := &stubEndorser{execResp: okBatchResponse()}
+	g := newExecutorTestGateway(stub)
+	g.SetMaxBatchSize(1) // one tx per batch -> many small batches through the loop
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Auto-commit every submitted batch so the in-flight window never wedges and
+	// the pipeline keeps flowing. The reader touches only the endorsement it reads
+	// off the channel (never the stub), so it never races the pipeline's goroutines.
+	go func() {
+		for {
+			select {
+			case end := <-g.endorsementChan:
+				id, err := committerTxID(end.Proposal)
+				if err != nil {
+					continue
+				}
+				_ = g.HandleTx(context.Background(), []common.TxNotification{
+					{FabricTxID: id, Status: committerpb.Status_COMMITTED},
+				})
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	const n = 5
+	txs := make([]*types.Transaction, n)
+	for i := range n {
+		txs[i] = txWithNonce(uint64(i + 1))
+		g.pending.Add(txs[i])
+	}
+
+	loopDone := make(chan struct{})
+	go func() { g.runExecutorPipelined(ctx); close(loopDone) }()
+
+	// The whole burst drains and every batch commits: the system goes quiescent
+	// (nothing pending, nothing in flight). Waiting for BOTH ensures no batch's
+	// 60s backstop timer is still armed when we cancel.
+	require.Eventually(t, func() bool {
+		return g.pending.Len() == 0 && g.inflightCount() == 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runExecutorPipelined did not return after ctx cancel")
+	}
+
+	// Clean shutdown: no reservation may survive, and the pool is fully drained.
+	require.Equal(t, 0, g.pending.Len(), "every tx committed")
+	require.Equal(t, 0, g.pending.reservedLen(), "no reservation may survive shutdown")
+	for _, tx := range txs {
+		require.False(t, g.pending.Has(tx.Hash()))
 	}
 }

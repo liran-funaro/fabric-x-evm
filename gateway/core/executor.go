@@ -17,6 +17,7 @@ import (
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
+	sdk "github.com/hyperledger/fabric-x-sdk"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"go.uber.org/zap/zapcore"
 )
@@ -70,17 +71,26 @@ type inflightBatch struct {
 	submittedAt time.Time
 }
 
-// runExecutor is the pipelined drain loop. Each cycle drains up to
-// maxBatchSize txs, two-phase-executes + merges them into one committer tx,
-// applies that tx's writes to the cross-batch cache, records it in-flight,
-// submits it, and returns IMMEDIATELY -- it does NOT wait for the commit. The
-// next cycle runs at once, executing against the cache (which now carries the
-// prior in-flight batch's writes). Backpressure comes from the in-flight
-// window (inflightSlots): once maxInflight batches are outstanding, the next
-// acquire blocks until one is confirmed. Commit/abort outcomes are resolved
-// asynchronously by resolveInflight (driven by HandleTx/Handle).
+// runExecutor is the drain loop. Each cycle drains up to maxBatchSize txs,
+// two-phase-executes + merges them into one committer tx, applies that tx's
+// writes to the cross-batch cache, records it in-flight, submits it, and
+// returns IMMEDIATELY -- it does NOT wait for the commit. The next cycle runs at
+// once, executing against the cache (which now carries the prior in-flight
+// batch's writes). Backpressure comes from the in-flight window (inflightSlots):
+// once maxInflight batches are outstanding, the next acquire blocks until one is
+// confirmed. Commit/abort outcomes are resolved asynchronously by
+// resolveInflight (driven by HandleTx/Handle).
+//
+// When g.pipelined is set (see SetPipelined) it runs the pipelined loop instead,
+// overlapping the concurrent warm pass of batch N+1 with the serial
+// authoritative pass of batch N; the serial and pipelined paths share the submit
+// boundary (submitBatch), so a batch commits identically either way.
 func (g *Gateway) runExecutor(ctx context.Context) {
 	defer g.wg.Done()
+	if g.pipelined {
+		g.runExecutorPipelined(ctx)
+		return
+	}
 	for ctx.Err() == nil {
 		g.executeCycle(ctx)
 	}
@@ -131,27 +141,61 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
+	// Hand the result to the shared submit boundary. On batchExcluded (every
+	// drained tx was excluded -- e.g. a lone nonce-gap tx with no filler yet)
+	// wait for new work rather than busy-re-draining the same excluded txs; a
+	// predecessor's commit also signals arrivals (see resolveInflight), so a
+	// gap-filling commit re-wakes us. batchSubmitted / batchFailed just return
+	// (the loop re-drains immediately or after submitBatch's own backoff).
+	if g.submitBatch(ctx, batch, included, terminal, end, rws) == batchExcluded {
+		g.waitForWork(ctx)
+	}
+	// No await-commit: return so the next cycle runs immediately. resolveInflight
+	// (driven by HandleTx/Handle or the timeout) finalizes or rolls back later.
+}
+
+// batchResult is submitBatch's outcome, so its callers (serial executeCycle and
+// pipelined pipelineIteration) can distinguish the three post-submit control
+// flows: a submitted in-flight batch, a fully-excluded batch (caller may wait
+// for work), and a failed submit/decode (submitBatch already backed off).
+type batchResult int
+
+const (
+	batchSubmitted batchResult = iota // a committer tx was submitted; it is in flight
+	batchExcluded                     // included == 0: nothing to submit, no error
+	batchFailed                       // committer-TxID/submit/shutdown failure (already backed off)
+)
+
+// submitBatch is the shared submit boundary of both executor loops: given a
+// batch's authoritative-pass result (end, included, terminal, rws), it evicts
+// terminally-excluded txs, and -- if any tx was included -- extracts the
+// committer TxID, applies the batch's writes to the cross-batch cache, captures
+// the spec versions, acquires an in-flight slot, records the batch in flight,
+// removes the included txs from pending, and submits. It returns IMMEDIATELY
+// after submit, WITHOUT awaiting the commit (resolveInflight finalizes async).
+//
+// It must run on the executor goroutine: it mutates the cross-batch cache
+// (ApplyWrites) and reads it back (spec versions), which is only safe when no
+// warm reads are in flight. The pipelined caller therefore invokes it only
+// after its warm barrier (see pipelineIteration). Serial and pipelined execution
+// share this method verbatim, so a batch commits byte-identically either way.
+func (g *Gateway) submitBatch(ctx context.Context, batch, included, terminal []*types.Transaction, end sdk.Endorsement, rws blocks.ReadWriteSet) batchResult {
 	// Evict terminally-excluded txs (nonce too low, ...) unconditionally: the
-	// exclusion reflects ledger state from before this cycle, so it holds
+	// exclusion reflects ledger state from before this batch ran, so it holds
 	// regardless of this batch's outcome; left pending they would leak.
 	if len(terminal) > 0 {
 		g.pending.Remove(hashesOf(terminal))
 	}
 
 	if len(included) == 0 {
-		// Every drained tx was excluded (e.g. a lone nonce-gap tx with no
-		// filler yet). Nothing to submit; wait for new work. A predecessor's
-		// commit also signals arrivals (see resolveInflight), so a gap-filling
-		// commit re-wakes us to retry the excluded txs.
-		g.waitForWork(ctx)
-		return
+		return batchExcluded
 	}
 
 	fabricTxID, err := committerTxID(end.Proposal)
 	if err != nil {
 		logger.Errorf("extract committer tx id (%d txs): %v", len(batch), err)
 		g.backoff(ctx) // txs stay pending; re-drained next cycle
-		return
+		return batchFailed
 	}
 
 	// Apply this batch's writes to the cross-batch cache BEFORE submitting, so
@@ -177,7 +221,7 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 	select {
 	case g.inflightSlots <- struct{}{}:
 	case <-ctx.Done():
-		return
+		return batchFailed
 	}
 
 	// Record in-flight (with the timeout backstop or, when a notifier is wired,
@@ -191,10 +235,169 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		logger.Errorf("batch submit failed (tx %s, %d txs): %v", fabricTxID, len(batch), err)
 		g.resolveInflight(fabricTxID, false) // roll back: re-add included, evict, free the slot
 		g.backoff(ctx)
-		return
+		return batchFailed
 	}
-	// No await-commit: return so the next cycle runs immediately. resolveInflight
-	// (driven by HandleTx/Handle or the timeout) finalizes or rolls back later.
+	return batchSubmitted
+}
+
+// warmResult carries a background warm goroutine's outcome back to the
+// pipeline's barrier join (a value type so the barrier is a single channel
+// receive). Exactly one of wb / err is meaningful.
+type warmResult struct {
+	wb  *WarmedBatch
+	err error
+}
+
+// runExecutorPipelined is the pipelined drain loop (selected by SetPipelined). It
+// overlaps the I/O-bound concurrent WARM pass of batch N+1 with the CPU-bound
+// serial AUTHORITATIVE pass of batch N, collapsing the per-batch wall from
+// warm+auth to max(warm,auth)+boundary. It carries ONE warmed batch across
+// iterations (prefetch depth 1: auth is the serial floor, so a deeper prefetch
+// buys nothing -- see the warm-auth-pipelining design). The submit boundary is
+// shared verbatim with the serial path (submitBatch), so a batch commits
+// byte-identically either way.
+//
+// It does NOT call g.wg.Done -- runExecutor already defers it; this method is
+// invoked in that same goroutine.
+//
+// warmed is the batch whose warm pass is complete and whose authoritative pass
+// runs next; it is always a batch that has been warmed and RESERVED in the
+// pending pool but not yet authorized. nil means the invariant is not
+// established (startup, an empty drain, or an error) and drainAndWarm must
+// (re-)establish it before an iteration can run.
+func (g *Gateway) runExecutorPipelined(ctx context.Context) {
+	var warmed *WarmedBatch
+	// On shutdown (or any exit) with a batch warmed but never authorized, release
+	// its pending reservation so its txs are re-drawable, and close its snapshot
+	// so no query-service view leaks. pipelineIteration hands ownership of the
+	// prior `warmed` off (auth consumes+closes it) before returning the next one,
+	// so at any exit `warmed` is exactly the one un-authorized batch to clean up.
+	defer func() {
+		if warmed != nil {
+			g.pending.Release(hashesOf(warmed.Txs()))
+			_ = warmed.Close()
+		}
+	}()
+	for ctx.Err() == nil {
+		if warmed == nil {
+			warmed = g.drainAndWarm(ctx) // (re-)establish the invariant
+			continue
+		}
+		warmed = g.pipelineIteration(ctx, warmed)
+	}
+}
+
+// drainAndWarm establishes the pipeline invariant: it drains (reserving) the
+// next batch and runs its warm pass, returning the warmed handle. It returns nil
+// -- leaving the invariant unestablished for the caller to retry -- when the
+// pending pool is empty (after waiting for work) or the warm pass fails (after
+// releasing the batch's reservation and backing off). Used for the first
+// iteration and to recover after any iteration that could not carry a next
+// batch forward.
+func (g *Gateway) drainAndWarm(ctx context.Context) *WarmedBatch {
+	txs := g.pending.DrainUpToReserved(int(g.maxBatchSize.Load()))
+	if len(txs) == 0 {
+		g.waitForWork(ctx)
+		return nil
+	}
+	warmed, err := g.endorsers.WarmBatch(ctx, txs)
+	if err != nil {
+		logger.Errorf("pipelined warm failed (%d txs): %v", len(txs), err)
+		g.pending.Release(hashesOf(txs)) // un-reserve so the txs are re-drawable
+		g.backoff(ctx)
+		return nil
+	}
+	return warmed
+}
+
+// pipelineIteration runs one overlapped iteration over an already-warmed batch N
+// and returns the batch it warmed for the next iteration (N+1), or nil when it
+// could not carry one forward (empty next drain, warm error, or auth error) --
+// in which case the caller re-establishes the invariant via drainAndWarm.
+//
+// Ordering (see the design's loop a-g): boundary prep (evictions + RO
+// maintenance) runs FIRST, on the executor goroutine with NO warm reads in
+// flight (the previous iteration joined its warm at the barrier; this
+// iteration's warm has not launched yet) -- equivalent to the serial cycle's top
+// and to the design's step f of the prior iteration, but placed here so it runs
+// on every path including a freshly re-established invariant. Then: (a) drain +
+// reserve N+1; (b) launch warm(N+1); (c) auth(N) -- overlaps (b); (d) barrier
+// join; (e) release N + shared submit boundary; (g) carry N+1 forward.
+func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *WarmedBatch {
+	// Boundary prep: apply queued commit/abort evictions (rebuilding the cache
+	// from survivors if any invalidation dropped a key an earlier survivor also
+	// wrote) and run the read-only cache's MFU maintenance, exactly as the serial
+	// cycle does at its top. Safe here: no warm reads are in flight, so these
+	// structural cache mutations never race a concurrent warm.
+	if _, invalidated := g.cache.DrainEvictions(); len(invalidated) > 0 {
+		g.rebuildCacheFromInflight()
+	}
+	g.cache.MaintainReadOnly()
+
+	// (a) Drain batch N+1, RESERVING the returned hashes so this non-destructive
+	// peek cannot re-draw batch N (still pending until step e) nor the batch
+	// already held as `warmed`.
+	txsNext := g.pending.DrainUpToReserved(int(g.maxBatchSize.Load()))
+
+	// (b) Launch the concurrent warm pass of batch N+1 so it overlaps auth(N). It
+	// reads the LIVE cross-batch caches read-only (results discarded -- warm only
+	// primes the per-view query-service read cache). Skipped on an empty drain.
+	var warmFut chan warmResult
+	if len(txsNext) > 0 {
+		warmFut = make(chan warmResult, 1)
+		go func() {
+			wb, err := g.endorsers.WarmBatch(ctx, txsNext)
+			warmFut <- warmResult{wb: wb, err: err}
+		}()
+	}
+
+	// (c) Authoritative pass of batch N over its already-warmed snapshot,
+	// concurrent with warm(N+1). It reads the LIVE caches read-only and writes
+	// only its own batch overlay; AuthBatch consumes and closes batch N's
+	// snapshot. This is the serial CPU floor the warm pass hides behind.
+	end, included, terminal, rws, authErr := g.endorsers.AuthBatch(ctx, warmed)
+
+	// (d) BARRIER: join warm(N+1). After this receive no warm reads are in flight,
+	// so the boundary mutations below (step e's ApplyWrites, next iteration's
+	// eviction drain) are safe. On a warm error, un-reserve batch N+1 so its txs
+	// are re-drawable; warmedNext stays nil (re-established next iteration).
+	var warmedNext *WarmedBatch
+	if warmFut != nil {
+		wr := <-warmFut
+		if wr.err != nil {
+			logger.Errorf("pipelined warm failed (%d txs): %v", len(txsNext), wr.err)
+			g.pending.Release(hashesOf(txsNext))
+		} else {
+			warmedNext = wr.wb
+		}
+	}
+
+	// (e) Boundary (executor goroutine, no warm reads in flight): clear batch N's
+	// reservation, then hand its authoritative result to the shared submit
+	// boundary exactly as the serial path does.
+	g.pending.Release(hashesOf(warmed.Txs()))
+
+	if authErr != nil {
+		logger.Errorf("pipelined batch auth failed (%d txs): %v", len(warmed.Txs()), authErr)
+		g.backoff(ctx)
+		// Drop the batch we warmed but will not authorize this round: close its
+		// snapshot AND un-reserve it so it is re-drawn (not skipped) next
+		// iteration. Batch N's txs stay pending (released above) to be re-drawn.
+		if warmedNext != nil {
+			g.pending.Release(hashesOf(warmedNext.Txs()))
+			_ = warmedNext.Close()
+		}
+		return nil
+	}
+
+	// batchExcluded (every tx excluded) is NOT a wait-for-work signal here as it
+	// is in the serial cycle: the pipeline already has batch N+1 warmed and ready,
+	// so it proceeds. batchFailed already backed off inside submitBatch.
+	g.submitBatch(ctx, warmed.Txs(), included, terminal, end, rws)
+
+	// (g) Carry batch N+1 forward as the next iteration's warmed batch (nil on an
+	// empty drain -> the caller's drainAndWarm waits for work and re-establishes).
+	return warmedNext
 }
 
 // committerTxID recovers the Fabric TxID of the committer transaction that

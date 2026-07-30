@@ -129,6 +129,15 @@ type Gateway struct {
 	// tx that exceeds the orderer's max message size). Atomic so it can be set
 	// safely while the executor goroutine is running.
 	maxBatchSize atomic.Int64
+
+	// pipelined selects the warm(N+1) ‖ auth(N) pipelined executor loop
+	// (runExecutorPipelined) over the serial one (runExecutor's default). It
+	// overlaps the I/O-bound concurrent warm pass of the next batch with the
+	// CPU-bound serial authoritative pass of the current one, collapsing the
+	// per-batch wall from warm+auth to max(warm,auth)+boundary. Default false
+	// (serial); set via SetPipelined before Start. Read once at Start, so it is
+	// never written concurrently with the executor goroutine.
+	pipelined bool
 }
 
 type Store interface {
@@ -202,6 +211,16 @@ func (g *Gateway) SetCommitTimeout(d time.Duration) {
 // drain cycle. See the maxBatchSize field and executeCycle.
 func (g *Gateway) SetMaxBatchSize(n int) {
 	g.maxBatchSize.Store(int64(n))
+}
+
+// SetPipelined selects the pipelined executor loop (warm(N+1) overlapped with
+// auth(N)) when p is true, or the serial loop (default) when false. Call before
+// Start -- the flag is read once when the executor goroutine launches and must
+// not change while it runs. Opt-in until the rig validates it (see the
+// warm-auth-pipelining design); the serial path is byte-identical either way at
+// the submit boundary (both go through submitBatch).
+func (g *Gateway) SetPipelined(p bool) {
+	g.pipelined = p
 }
 
 // SetNotifier wires per-TxID commit resolution. It builds the gateway's
