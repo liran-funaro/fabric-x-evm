@@ -138,8 +138,16 @@ Batching:
     AutoRemoveTimeout: 10s
   BatchSize:
     MaxMessageCount: 2_000
-    AbsoluteMaxBytes: 10485760
-    PreferredMaxBytes: 2097152
-  RequestMaxBytes: 1048576
+    # The gateway merges a whole execution batch (maxBatchSize EVM txs) into ONE
+    # committer tx / Fabric request (~1 KB of read-write set per EVM tx). At the
+    # 1 MB RequestMaxBytes default a batch >~1024 produced a >1 MB request that the
+    # batcher could not batch (it sat in a bucket of size 1 -> checkFirstStrike ->
+    # throughput collapse). Raise the ceilings so large merged committer txs fit:
+    # RequestMaxBytes bounds a single merged tx; Absolute/PreferredMaxBytes bound
+    # the batcher batch that carries it (must stay >= RequestMaxBytes). gRPC
+    # MaxRecvMsgSize is 100 MB, so 16/32 MB is well within transport limits.
+    AbsoluteMaxBytes: 33554432
+    PreferredMaxBytes: 16777216
+  RequestMaxBytes: 16777216
 
 MaxPartyID: 4
