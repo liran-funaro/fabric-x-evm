@@ -137,6 +137,14 @@ type Gateway struct {
 	// per-batch wall from warm+auth to max(warm,auth)+boundary. Default false
 	// (serial); set via SetPipelined before Start. Read once at Start, so it is
 	// never written concurrently with the executor goroutine.
+	//
+	// SAFE ONLY FOR LOW CROSS-BATCH KEY CONFLICT. warm(N+1) pins its read
+	// snapshot before batch N's writes land in the cache, so if N+1 reads a key
+	// N writes, N+1's authoritative read-versions are stale -> committer aborts
+	// N+1 -> the re-warm is still stale -> rollback livelock. Measured 1.2-1.5x
+	// on disjoint-key traffic but a throughput/correctness collapse on hot-key
+	// traffic (real USDC). Keep default off; enable only for workloads verified
+	// conflict-light. See SetPipelined and report/pipeline_report.html.
 	pipelined bool
 }
 
@@ -216,9 +224,19 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // SetPipelined selects the pipelined executor loop (warm(N+1) overlapped with
 // auth(N)) when p is true, or the serial loop (default) when false. Call before
 // Start -- the flag is read once when the executor goroutine launches and must
-// not change while it runs. Opt-in until the rig validates it (see the
-// warm-auth-pipelining design); the serial path is byte-identical either way at
-// the submit boundary (both go through submitBatch).
+// not change while it runs. The serial path is byte-identical either way at the
+// submit boundary (both go through submitBatch).
+//
+// Opt-in, default off, and it must stay that way for general traffic. Rig
+// validation (2026-07-30, full stack, 20000-tx replay) found a sharp split: a
+// clean 1.2-1.5x speedup on conflict-free traffic (disjoint keys across
+// batches) but a livelock on conflict-heavy traffic (real USDC hot accounts),
+// where the pipeline collapses to 14-300x SLOWER and most runs fail to commit
+// the window at all. Cause: warm(N+1) pins its snapshot before batch N's writes
+// land, so under cross-batch key overlap N+1 endorses against stale versions,
+// the committer aborts it, and the re-warm stays stale -> rollback livelock.
+// Enable only for deployments whose traffic is verified conflict-light. See the
+// pipelined field comment and report/pipeline_report.html.
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p
 }
