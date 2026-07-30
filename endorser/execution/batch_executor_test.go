@@ -496,6 +496,109 @@ func TestExecuteBatchExecFailureDoesNotAbort(t *testing.T) {
 	}
 }
 
+// TestWarmThenAuthEqualsExecuteMerged asserts the pipelined split (WarmBatch
+// then AuthMergedBatch) produces byte-identical output to the serial
+// ExecuteMergedBatch for the same txs: same merged status/message, same merged
+// RWS, and the same per-tx outcomes (status + event). Execution never commits to
+// the backend, so running both paths against the same seeded state is a fair
+// comparison. This is the invariant the pipelined loop relies on -- overlapping
+// warm(N+1) with auth(N) must not change what auth(N) produces.
+func TestWarmThenAuthEqualsExecuteMerged(t *testing.T) {
+	backend, err := state.NewWriteDB(Channel, "file:warm_auth_eq?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keyA, addrA := newTestKey(t)
+	keyB, addrB := newTestKey(t)
+	_, addrC := newTestKey(t)
+
+	const (
+		initialA = 1_000
+		initialB = 50  // alone, insufficient to cover amount2 below
+		amount1  = 300 // tx1: A -> B
+		amount2  = 100 // tx2: B -> C; needs tx1's delivery via the overlay
+	)
+	seedAccounts(t, backend, map[ethcommon.Address]int64{addrA: initialA, addrB: initialB})
+
+	kvs := &testVersionedDBSnapshotter{db: backend}
+	cfg := EVMConfig{ChainConfig: common.BuildChainConfig(4011)}
+	engine := NewEVMEngine(Namespace, kvs, cfg, false)
+
+	tx1 := newTransferTx(t, cfg.ChainConfig, keyA, addrB, big.NewInt(amount1), 0)
+	tx2 := newTransferTx(t, cfg.ChainConfig, keyB, addrC, big.NewInt(amount2), 0)
+	txs := []*types.Transaction{tx1, tx2}
+
+	wantRes, wantOutcomes, err := engine.ExecuteMergedBatch(context.Background(), txs)
+	if err != nil {
+		t.Fatalf("ExecuteMergedBatch failed: %v", err)
+	}
+
+	wb, err := engine.WarmBatch(context.Background(), txs)
+	if err != nil {
+		t.Fatalf("WarmBatch failed: %v", err)
+	}
+	gotRes, gotOutcomes, err := engine.AuthMergedBatch(context.Background(), wb)
+	if err != nil {
+		t.Fatalf("AuthMergedBatch failed: %v", err)
+	}
+
+	if gotRes.Status != wantRes.Status {
+		t.Errorf("merged Status = %d, want %d", gotRes.Status, wantRes.Status)
+	}
+	if gotRes.Message != wantRes.Message {
+		t.Errorf("merged Message = %q, want %q", gotRes.Message, wantRes.Message)
+	}
+	assertSameRWS(t, "WarmBatch+AuthMergedBatch vs ExecuteMergedBatch", gotRes.RWS, wantRes.RWS)
+
+	if len(gotOutcomes) != len(wantOutcomes) {
+		t.Fatalf("outcomes len = %d, want %d", len(gotOutcomes), len(wantOutcomes))
+	}
+	for i := range wantOutcomes {
+		if gotOutcomes[i].Status != wantOutcomes[i].Status {
+			t.Errorf("outcome[%d] Status = %d, want %d", i, gotOutcomes[i].Status, wantOutcomes[i].Status)
+		}
+		if !bytes.Equal(gotOutcomes[i].Event, wantOutcomes[i].Event) {
+			t.Errorf("outcome[%d] Event = %x, want %x", i, gotOutcomes[i].Event, wantOutcomes[i].Event)
+		}
+	}
+}
+
+// TestWarmedBatchCloseIdempotent asserts a WarmedBatch can be Closed more than
+// once without panicking or double-closing the underlying snapshot: authBatch
+// closes it via defer, but error and shutdown paths may also Close it directly,
+// so the two must be safe to combine.
+func TestWarmedBatchCloseIdempotent(t *testing.T) {
+	backend, err := state.NewWriteDB(Channel, "file:warm_close_idem?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, addr := newTestKey(t)
+	_, recipient := newTestKey(t)
+	seedAccounts(t, backend, map[ethcommon.Address]int64{addr: 1_000})
+
+	kvs := &testVersionedDBSnapshotter{db: backend}
+	cfg := EVMConfig{ChainConfig: common.BuildChainConfig(4011)}
+	engine := NewEVMEngine(Namespace, kvs, cfg, false)
+
+	// Two txs so WarmBatch's len>1 warm pass runs (the single-tx case never
+	// produces a WarmedBatch).
+	tx1 := newTransferTx(t, cfg.ChainConfig, key, recipient, big.NewInt(100), 0)
+	tx2 := newTransferTx(t, cfg.ChainConfig, key, recipient, big.NewInt(200), 1)
+
+	wb, err := engine.WarmBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("WarmBatch failed: %v", err)
+	}
+	if err := wb.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := wb.Close(); err != nil {
+		t.Fatalf("second Close (must be a no-op): %v", err)
+	}
+}
+
 // TestExecuteBatchSingleMatchesExecute asserts ExecuteBatch([tx]) returns the
 // same RWS as Execute(tx) for one transaction: the N==1 path must be
 // indistinguishable from today's Execute.

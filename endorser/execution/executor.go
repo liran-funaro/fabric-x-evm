@@ -263,12 +263,22 @@ func (e *EVMEngine) ExecuteMergedBatch(ctx context.Context, txs []*types.Transac
 	if err != nil {
 		return endorsement.ExecutionResult{}, nil, err
 	}
+	res, outcomes := mergeOutcomes(results)
+	return res, outcomes, nil
+}
+
+// mergeOutcomes folds a batch's per-tx results into one merged ExecutionResult
+// (status 200) plus one PerTxOutcome per sub-tx, so the caller can sign a single
+// endorsement over the whole batch while still recovering each sub-tx's status
+// and event. Shared by ExecuteMergedBatch (serial) and AuthMergedBatch
+// (pipelined) so both fold identically.
+func mergeOutcomes(results []endorsement.ExecutionResult) (endorsement.ExecutionResult, []PerTxOutcome) {
 	rws, events := MergeResults(results)
 	outcomes := make([]PerTxOutcome, len(results))
 	for i := range results {
 		outcomes[i] = PerTxOutcome{Status: results[i].Status, Event: events[i]}
 	}
-	return endorsement.ExecutionResult{RWS: rws, Status: 200, Message: "OK"}, outcomes, nil
+	return endorsement.ExecutionResult{RWS: rws, Status: 200, Message: "OK"}, outcomes
 }
 
 // noopCloser is a reader stand-in for runOn's internal Executor: the real

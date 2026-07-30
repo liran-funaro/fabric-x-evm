@@ -53,19 +53,18 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		return nil, nil
 	}
 
-	// One snapshot (one view) for the whole batch: every tx, in both passes,
-	// simulates against the same consistent point-in-time state.
-	snapStart := time.Now()
-	reader, err := e.kvs.NewSnapshot(0)
-	if err != nil {
-		return nil, err
-	}
-	defer reader.Close()
-	snapDur := time.Since(snapStart)
-
 	if len(txs) == 1 {
+		// One snapshot (one view) for the single tx. This path shares
+		// runOn/newState with Execute so the two are identical. (The len>1 path
+		// opens its snapshot inside WarmBatch, so it can be carried across the
+		// warm/auth split for the pipelined loop.)
+		reader, err := e.kvs.NewSnapshot(0)
+		if err != nil {
+			return nil, err
+		}
+		defer reader.Close()
+
 		var res endorsement.ExecutionResult
-		var err error
 		if e.stateDecorator == nil && !e.evmConfig.DebugLogs {
 			res, err = e.executeReusing(reader, txs[0])
 		} else {
@@ -76,10 +75,9 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		}
 		if err != nil {
 			if rej, ok := errors.AsType[*TxRejected](err); ok {
-				// Excluded, not aborted: align with the len(txs)>1 path below
-				// so a single pending tx (e.g. a lone nonce-gap tx with no
-				// batchmate yet) doesn't hard-fail the whole cycle just
-				// because it happens to be alone.
+				// Excluded, not aborted: align with the len(txs)>1 path so a
+				// single pending tx (e.g. a lone nonce-gap tx with no batchmate
+				// yet) doesn't hard-fail the whole cycle just because it is alone.
 				return []endorsement.ExecutionResult{excludedResult(rej)}, nil
 			}
 			return nil, err
@@ -87,13 +85,83 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		return []endorsement.ExecutionResult{res}, nil
 	}
 
+	// len(txs)>1: the batch runs as a concurrent warm pass then a serial
+	// authoritative pass. ExecuteBatch runs them back-to-back (the serial path);
+	// the pipelined gateway loop instead overlaps WarmBatch(N+1) with
+	// AuthMergedBatch(N). Composing here keeps both callers on one code path so
+	// their behavior can never drift.
+	wb, err := e.WarmBatch(ctx, txs)
+	if err != nil {
+		return nil, err
+	}
+	return e.authBatch(wb)
+}
+
+// WarmedBatch bundles an open query-service snapshot that WarmBatch has already
+// warmed for txs (the concurrent warm pass ran against it, priming the snapshot
+// view's read cache) and left OPEN. The caller MUST later consume it via
+// AuthMergedBatch / authBatch (which close the snapshot) or call Close directly,
+// or the snapshot -- a query-service view -- leaks. It also carries the
+// warm-phase timing so the authoritative pass can emit the combined
+// ENDORSE-TIMING / OVERLAP-SIM lines (debug only).
+type WarmedBatch struct {
+	reader  ReadStore // the raw open snapshot; closed by Close
+	readSrc ReadStore // reader, or a countingReader wrapping it (debug timing)
+	txs     []*types.Transaction
+
+	fast    bool // no decorator / no debug logging: reuse one executor per pass
+	timing  bool // evm.batch at debug level: measure read load per phase
+	counted *countingReader
+
+	snapDur       time.Duration
+	warmDur       time.Duration
+	warmReads     int64
+	warmReadNanos int64
+	warmDoneNanos []int64 // per-tx warm-completion offset (ns from warm start)
+	authCostNanos []int64 // per-tx authoritative cost (ns), filled by authBatch
+
+	closeOnce sync.Once
+}
+
+// Close releases the warmed snapshot. Idempotent: authBatch/AuthMergedBatch
+// close it via defer, while error and shutdown paths may close it directly --
+// only the first call closes the underlying snapshot.
+func (wb *WarmedBatch) Close() error {
+	wb.closeOnce.Do(func() {
+		if wb.reader != nil {
+			_ = wb.reader.Close()
+		}
+	})
+	return nil
+}
+
+// WarmBatch opens one query-service snapshot for the batch and runs the
+// concurrent warm pass against it (results discarded), priming the snapshot
+// view's read cache before the authoritative pass. It returns the STILL-OPEN
+// snapshot bundled in a WarmedBatch; the caller MUST later call AuthMergedBatch
+// / authBatch (which close it) or Close() directly. This is the first half of
+// ExecuteBatch's len>1 path, split out so the pipelined gateway loop can overlap
+// WarmBatch(N+1) with the authoritative pass of batch N. It only READS the
+// shared cross-batch caches, exactly as the serial path does.
+//
+// Precondition: len(txs) > 1 (the caller handles the 0/1 cases).
+func (e *EVMEngine) WarmBatch(ctx context.Context, txs []*types.Transaction) (*WarmedBatch, error) {
+	// One snapshot (one view) for the whole batch: every tx, in both passes,
+	// simulates against the same consistent point-in-time state.
+	snapStart := time.Now()
+	reader, err := e.kvs.NewSnapshot(0)
+	if err != nil {
+		return nil, err
+	}
+	snapDur := time.Since(snapStart)
+
 	// When evm.batch is at debug level, wrap the batch view to measure the read
 	// load each phase places on the backend: how many under.Get calls it makes
 	// and their cumulative wall-time. Instrumentation only -- Get is a
 	// pass-through. Shared by both passes; its atomic counters are snapshotted at
 	// the warm/auth boundary to attribute reads (and read I/O time) to each phase
-	// (see the ENDORSE-TIMING log below). At the default info level the view is
-	// used unwrapped, so no per-read atomics run on the hot path.
+	// (see the ENDORSE-TIMING log in authBatch). At the default info level the
+	// view is used unwrapped, so no per-read atomics run on the hot path.
 	timing := batchLogger.IsEnabledFor(zapcore.DebugLevel)
 	readSrc := reader
 	var counted *countingReader
@@ -103,12 +171,12 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	}
 
 	// Trace-driven overlap simulation (debug only): per-tx warm-completion offset
-	// (ns from warm start) and per-tx authoritative cost (ns). Used post-batch to
-	// compute what an in-order warm||auth overlap WOULD achieve on THIS batch's
-	// real (work-stealing) warm-completion order -- without building the overlap,
-	// introducing no tx-to-tx synchronization. Each warm worker writes its own
-	// distinct index (no false-sharing race; wg.Wait provides the read barrier);
-	// the auth pass is serial. See the OVERLAP-SIM log below.
+	// (ns from warm start) and per-tx authoritative cost (ns). authBatch uses
+	// these post-batch to compute what an in-order warm||auth overlap WOULD
+	// achieve on THIS batch's real (work-stealing) warm-completion order. Each
+	// warm worker writes its own distinct index (no false-sharing race; wg.Wait
+	// provides the read barrier); the auth pass is serial. See OVERLAP-SIM in
+	// authBatch.
 	var warmDoneNanos, authCostNanos []int64
 	if timing {
 		warmDoneNanos = make([]int64, len(txs))
@@ -116,34 +184,34 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	}
 
 	// The fast path (production: no per-tx decorator, no debug logging) reuses
-	// one StateDB+Executor per warm-pass worker and one for the whole
-	// authoritative pass, resetting the StateDB in place between txs, so the
-	// per-tx machinery (StateDB maps, access list, block context, signer, EVM)
-	// is built once instead of per tx. The slow path (a decorator or debug
-	// logging wraps each StateDB) keeps building fresh per-tx state via newState.
+	// one StateDB+Executor per warm-pass worker, resetting the StateDB in place
+	// between txs, so the per-tx machinery (StateDB maps, access list, block
+	// context, signer, EVM) is built once instead of per tx. The slow path (a
+	// decorator or debug logging wraps each StateDB) keeps building fresh per-tx
+	// state via newState.
 	fast := e.stateDecorator == nil && !e.evmConfig.DebugLogs
 
 	// Warm pass: run every tx against the shared snapshot to warm any caching
 	// reader (e.g. the query-service view backing `reader`) before the sequential
-	// pass below, which is what surfaces real results and errors. A tx that would
-	// fail here (e.g. against pre-batch state) is not a bug.
+	// authoritative pass, which is what surfaces real results and errors. A tx
+	// that would fail here (e.g. against pre-batch state) is not a bug.
 	//
 	// Concurrency = batch size (design RQ1: "one goroutine per transaction in the
-	// batch"). The warm pass exists to fill the query-service view's read cache, and
-	// each warm read BLOCKS on a gRPC round-trip to the query service -- it is
-	// I/O-bound, not CPU-bound, so the worker count is NOT tied to GOMAXPROCS. The
-	// query service coalesces concurrent single-key reads into one DB call
-	// (min-batch-keys / max-batch-wait); firing all of a batch's reads at once fills
-	// that window, instead of leaving the server's max-batch-wait exposed on every
-	// small wave. Blocked workers are parked on I/O (not busy-waiting), so a large
-	// count is cheap -- the Go scheduler handles it fine.
+	// batch"). Each warm read BLOCKS on a gRPC round-trip to the query service --
+	// it is I/O-bound, not CPU-bound, so the worker count is NOT tied to
+	// GOMAXPROCS. The query service coalesces concurrent single-key reads into one
+	// DB call (min-batch-keys / max-batch-wait); firing all of a batch's reads at
+	// once fills that window instead of leaving the server's max-batch-wait
+	// exposed on every small wave. Blocked workers are parked on I/O (not
+	// busy-waiting), so a large count is cheap.
 	//
-	// A work-stealing atomic-index pool -- not a raw goroutine-per-tx spawn -- lets a
-	// free worker pick up a slow worker's remaining txs; with the default count ==
-	// len(txs) it is effectively one worker per tx. Each worker owns its per-tx state
-	// so concurrent execution never shares a journal. An explicit WarmWorkers override
-	// caps concurrency for a fast, non-blocking backend (e.g. an in-memory KVS) where
-	// unbounded warm goroutines would add scheduler churn with no I/O to overlap.
+	// A work-stealing atomic-index pool -- not a raw goroutine-per-tx spawn -- lets
+	// a free worker pick up a slow worker's remaining txs; with the default count
+	// == len(txs) it is effectively one worker per tx. Each worker owns its per-tx
+	// state so concurrent execution never shares a journal. An explicit
+	// WarmWorkers override caps concurrency for a fast, non-blocking backend (e.g.
+	// an in-memory KVS) where unbounded warm goroutines would add scheduler churn
+	// with no I/O to overlap.
 	warmWorkers := e.evmConfig.WarmWorkers
 	if warmWorkers <= 0 || warmWorkers > len(txs) {
 		warmWorkers = len(txs)
@@ -198,6 +266,32 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		warmReads, warmReadNanos = counted.n.Load(), counted.nanos.Load()
 	}
 
+	return &WarmedBatch{
+		reader:        reader,
+		readSrc:       readSrc,
+		txs:           txs,
+		fast:          fast,
+		timing:        timing,
+		counted:       counted,
+		snapDur:       snapDur,
+		warmDur:       warmDur,
+		warmReads:     warmReads,
+		warmReadNanos: warmReadNanos,
+		warmDoneNanos: warmDoneNanos,
+		authCostNanos: authCostNanos,
+	}, nil
+}
+
+// authBatch runs the serial authoritative pass over wb's already-warmed snapshot
+// and closes the snapshot when done (defer wb.Close()). It returns the same
+// []endorsement.ExecutionResult ExecuteBatch does -- one slot per input tx, index
+// = sub-index -- and is the second half of ExecuteBatch's len>1 path.
+func (e *EVMEngine) authBatch(wb *WarmedBatch) ([]endorsement.ExecutionResult, error) {
+	defer wb.Close()
+
+	txs := wb.txs
+	readSrc := wb.readSrc
+
 	// Authoritative pass: sequential, each tx against the snapshot plus an
 	// overlay carrying every earlier tx's writes from this batch.
 	authStart := time.Now()
@@ -207,7 +301,7 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	// against the overlay before each tx.
 	var authSdb *StateDB
 	var authEx *Executor
-	if fast {
+	if wb.fast {
 		var err error
 		if authSdb, authEx, err = e.newReusableExecutor(overlay); err != nil {
 			return nil, err
@@ -215,12 +309,12 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	}
 	for idx, tx := range txs {
 		var authTxStart time.Time
-		if timing {
+		if wb.timing {
 			authTxStart = time.Now()
 		}
 		var res endorsement.ExecutionResult
 		var err error
-		if fast {
+		if wb.fast {
 			authSdb.reset(overlay)
 			res, err = e.classify(authEx, authSdb, tx)
 		} else {
@@ -229,32 +323,31 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 				res, err = e.runOn(state, tx)
 			}
 		}
-		if timing {
-			// Per-tx auth EVM cost. In today's serial pass warm has already run to
-			// completion, so these reads are cache hits (auth readtime ~5ms/batch)
-			// -- i.e. this is essentially pure EVM CPU, exactly the cost auth[i]
-			// would incur in an overlap once warm[i] has prefetched its keys.
-			authCostNanos[idx] = int64(time.Since(authTxStart))
+		if wb.timing {
+			// Per-tx auth EVM cost. warm has already run to completion, so these
+			// reads are cache hits (auth readtime ~5ms/batch) -- i.e. essentially
+			// pure EVM CPU, exactly the cost auth[i] would incur in an overlap
+			// once warm[i] has prefetched its keys.
+			wb.authCostNanos[idx] = int64(time.Since(authTxStart))
 		}
 		if err != nil {
 			if rej, ok := errors.AsType[*TxRejected](err); ok {
 				// Excluded, not aborted: a client-rejected tx (nonce gap, bad
-				// signature, insufficient funds, ...) can never be included as
-				// it stands, but the rest of the batch must still make
-				// progress. Record a sentinel outcome with an empty RWS --
-				// MergeResults folds it in as a no-op -- and continue without
-				// applying anything to the overlay. The caller (chain.go's
-				// block parser) recognizes this status and skips it entirely:
-				// no domain tx, no committed write. A RETRYABLE exclusion
-				// (nonce too high, insufficient funds, ...) stays pending and
-				// is retried once its gap is filled; a TERMINAL exclusion
-				// (nonce too low) can never resolve as this exact tx and the
-				// caller should evict it instead (see excludedResult).
+				// signature, insufficient funds, ...) can never be included as it
+				// stands, but the rest of the batch must still make progress.
+				// Record a sentinel outcome with an empty RWS -- MergeResults
+				// folds it in as a no-op -- and continue without applying anything
+				// to the overlay. The caller (chain.go's block parser) recognizes
+				// this status and skips it entirely: no domain tx, no committed
+				// write. A RETRYABLE exclusion (nonce too high, insufficient funds,
+				// ...) stays pending and is retried once its gap is filled; a
+				// TERMINAL exclusion (nonce too low) can never resolve as this
+				// exact tx and the caller should evict it (see excludedResult).
 				out = append(out, excludedResult(rej))
 				continue
 			}
-			// A genuine server-side fault (not a client rejection): still
-			// abort the whole batch, as before.
+			// A genuine server-side fault (not a client rejection): still abort
+			// the whole batch, as before.
 			return nil, err
 		}
 		overlay.apply(res.RWS)
@@ -265,15 +358,15 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 	// warm reads run concurrently (readtime is the SUM across workers, so it can
 	// exceed warm wall-time); auth reads are serial (readtime <= auth wall-time,
 	// and auth-wall minus auth-readtime is the serial CPU/EVM cost). This is the
-	// single line that says which phase dominates and why. Guarded by `timing`:
+	// single line that says which phase dominates and why. Guarded by wb.timing:
 	// only reached when evm.batch is at debug level (counted is non-nil).
-	if timing {
-		authReads := counted.n.Load() - warmReads
-		authReadNanos := counted.nanos.Load() - warmReadNanos
+	if wb.timing {
+		authReads := wb.counted.n.Load() - wb.warmReads
+		authReadNanos := wb.counted.nanos.Load() - wb.warmReadNanos
 		batchLogger.Debugf("ENDORSE-TIMING n=%d snapshot=%s warm=%s{reads=%d readtime=%s} auth=%s{reads=%d readtime=%s cpu=%s}",
 			len(txs),
-			snapDur.Round(time.Microsecond),
-			warmDur.Round(time.Microsecond), warmReads, time.Duration(warmReadNanos).Round(time.Microsecond),
+			wb.snapDur.Round(time.Microsecond),
+			wb.warmDur.Round(time.Microsecond), wb.warmReads, time.Duration(wb.warmReadNanos).Round(time.Microsecond),
 			authDur.Round(time.Microsecond), authReads, time.Duration(authReadNanos).Round(time.Microsecond),
 			(authDur - time.Duration(authReadNanos)).Round(time.Microsecond),
 		)
@@ -282,24 +375,21 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		// completion offsets and per-tx auth costs, compute the wall an in-order
 		// warm||auth overlap would achieve: auth[i] cannot start until warm[i] has
 		// finished AND auth[i-1] has finished (auth stays serial; MVCC needs
-		// tx-order). Both clocks share the warm-start origin. This bounds Option 1's
-		// payoff on the EXISTING work-stealing warm order -- no overlap is built and
-		// no warm reordering is assumed, so it isolates the benefit reachable with
-		// zero load-balancing cost (only ~per-tx signaling remains). serial =
-		// today's warm+auth; ideal = max(warm,auth) (a perfectly in-order warm);
-		// stall = total time auth would sit idle waiting for its next-in-order tx.
+		// tx-order). Both clocks share the warm-start origin. serial = today's
+		// warm+auth; ideal = max(warm,auth) (a perfectly in-order warm); stall =
+		// total time auth would sit idle waiting for its next-in-order tx.
 		var authClock, authSum, stall int64
 		for i := range txs {
-			if authClock < warmDoneNanos[i] {
-				stall += warmDoneNanos[i] - authClock
-				authClock = warmDoneNanos[i]
+			if authClock < wb.warmDoneNanos[i] {
+				stall += wb.warmDoneNanos[i] - authClock
+				authClock = wb.warmDoneNanos[i]
 			}
-			authClock += authCostNanos[i]
-			authSum += authCostNanos[i]
+			authClock += wb.authCostNanos[i]
+			authSum += wb.authCostNanos[i]
 		}
-		serial := warmDur + authDur
+		serial := wb.warmDur + authDur
 		overlap := time.Duration(authClock)
-		ideal := warmDur
+		ideal := wb.warmDur
 		if authDur > ideal {
 			ideal = authDur
 		}
@@ -311,6 +401,21 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		)
 	}
 	return out, nil
+}
+
+// AuthMergedBatch is authBatch folded into a single merged endorsement -- the
+// pipelined counterpart of ExecuteMergedBatch. It runs the serial authoritative
+// pass over wb's already-warmed snapshot (closing the snapshot when done) and
+// folds the per-tx results into one merged ExecutionResult (status 200) plus one
+// PerTxOutcome per sub-tx. For the same txs it is byte-identical to
+// ExecuteMergedBatch(txs), only with the warm pass already run separately.
+func (e *EVMEngine) AuthMergedBatch(ctx context.Context, wb *WarmedBatch) (endorsement.ExecutionResult, []PerTxOutcome, error) {
+	results, err := e.authBatch(wb)
+	if err != nil {
+		return endorsement.ExecutionResult{}, nil, err
+	}
+	res, outcomes := mergeOutcomes(results)
+	return res, outcomes, nil
 }
 
 // excludedResult builds the sentinel outcome for a tx that runOn rejected
