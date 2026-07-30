@@ -34,13 +34,35 @@ type stubEndorser struct {
 	execResp    *peer.ProposalResponse
 	execErr     error
 	gotInv      endorsement.Invocation
+	warmErr     error // WarmBatch returns this (with a nil handle) when set
+	warmClosed  int   // incremented each time a handle from WarmBatch is Closed
 }
+
+// stubWarmed is a no-op api.WarmedBatch handle whose Close is observable by the
+// stub that produced it, so tests can assert AuthBatch (or an abandoned handle)
+// released the warm pass.
+type stubWarmed struct{ s *stubEndorser }
+
+func (w *stubWarmed) Close() error { w.s.warmClosed++; return nil }
 
 func (s *stubEndorser) Execute(ctx context.Context, inv endorsement.Invocation, ethTx *types.Transaction) (*peer.ProposalResponse, error) {
 	return s.execResp, s.execErr
 }
 func (s *stubEndorser) ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error) {
 	s.gotInv = inv
+	return s.execResp, s.execErr
+}
+func (s *stubEndorser) WarmBatch(ctx context.Context, txs []*types.Transaction) (api.WarmedBatch, error) {
+	if s.warmErr != nil {
+		return nil, s.warmErr
+	}
+	return &stubWarmed{s: s}, nil
+}
+func (s *stubEndorser) AuthBatch(ctx context.Context, inv endorsement.Invocation, warmed api.WarmedBatch) (*peer.ProposalResponse, error) {
+	s.gotInv = inv
+	if warmed != nil {
+		_ = warmed.Close()
+	}
 	return s.execResp, s.execErr
 }
 func (s *stubEndorser) Call(ctx context.Context, msg *ethereum.CallMsg, _ *big.Int) ([]byte, error) {

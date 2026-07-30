@@ -19,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/hyperledger/fabric-protos-go-apiv2/peer"
 	"github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/endorser/api"
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
@@ -34,6 +35,11 @@ type Endorser struct {
 type EVMEngineInterface interface {
 	Execute(ctx context.Context, tx *types.Transaction) (endorsement.ExecutionResult, error)
 	ExecuteMergedBatch(ctx context.Context, txs []*types.Transaction) (endorsement.ExecutionResult, []execution.PerTxOutcome, error)
+	// WarmBatch/AuthMergedBatch are the split form of ExecuteMergedBatch: the
+	// concurrent warm pass (WarmBatch, returns an open handle) and the serial
+	// authoritative pass (AuthMergedBatch, consumes and closes the handle).
+	WarmBatch(ctx context.Context, txs []*types.Transaction) (*execution.WarmedBatch, error)
+	AuthMergedBatch(ctx context.Context, wb *execution.WarmedBatch) (endorsement.ExecutionResult, []execution.PerTxOutcome, error)
 	Call(msg ethereum.CallMsg, blockNumber *big.Int) ([]byte, error)
 	BalanceAt(ctx context.Context, account ethcommon.Address, blockNumber *big.Int) (*big.Int, error)
 	StorageAt(ctx context.Context, account ethcommon.Address, key ethcommon.Hash, blockNumber *big.Int) ([]byte, error)
@@ -86,9 +92,50 @@ func (f *Endorser) ExecuteBatch(ctx context.Context, inv endorsement.Invocation,
 	if err != nil {
 		return response(nil, err), nil
 	}
+	return f.endorseBatch(inv, res, outcomes)
+}
 
-	// Per-tx outcomes (status + event, nil event = no event) ride in the merged
-	// result's Event field so they survive into the committed block.
+// WarmBatch runs only the concurrent warm pass of a merged batch and returns an
+// opaque handle (as api.WarmedBatch, so callers never depend on the execution
+// package's concrete type). It produces no endorsement — signing stays in the
+// authoritative pass, where it belongs. On error a nil interface is returned
+// (not a typed nil), so `handle != nil` reliably distinguishes a live handle.
+func (f *Endorser) WarmBatch(ctx context.Context, txs []*types.Transaction) (api.WarmedBatch, error) {
+	wb, err := f.Engine.WarmBatch(ctx, txs)
+	if err != nil {
+		return nil, err
+	}
+	return wb, nil
+}
+
+// AuthBatch runs the serial authoritative pass over an already-warmed batch and
+// signs the merged response, exactly as ExecuteBatch does — the two share
+// endorseBatch so serial and pipelined execution fold identically. It closes the
+// handle (via the engine's authoritative pass). A handle that did not originate
+// from this endorser's WarmBatch is a programming error and yields a server
+// error response.
+func (f *Endorser) AuthBatch(ctx context.Context, inv endorsement.Invocation, warmed api.WarmedBatch) (*peer.ProposalResponse, error) {
+	wb, ok := warmed.(*execution.WarmedBatch)
+	if !ok {
+		return response(nil, fmt.Errorf("auth batch: unexpected warmed-batch handle %T", warmed)), nil
+	}
+	res, outcomes, err := f.Engine.AuthMergedBatch(ctx, wb)
+	if err != nil {
+		return response(nil, err), nil
+	}
+	return f.endorseBatch(inv, res, outcomes)
+}
+
+// endorseBatch folds a batch's per-tx outcomes into the merged result's Event
+// field and signs a single ProposalResponse over it. Shared by ExecuteBatch
+// (serial) and AuthBatch (pipelined) so both fold and sign identically.
+//
+// Per-tx outcomes (status + event, nil event = no event) ride in the merged
+// result's Event field — not the response Payload — because a later stage
+// recovers per-tx receipts from the committed block's blocks.Transaction.Events,
+// fed from the endorsement's ExecutionResult.Event; the Payload does not survive
+// to the committed block.
+func (f *Endorser) endorseBatch(inv endorsement.Invocation, res endorsement.ExecutionResult, outcomes []execution.PerTxOutcome) (*peer.ProposalResponse, error) {
 	outcomesPayload, err := json.Marshal(outcomes)
 	if err != nil {
 		return response(nil, fmt.Errorf("marshal batch outcomes: %w", err)), nil

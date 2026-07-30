@@ -82,12 +82,26 @@ type stubEngine struct {
 	mergedRes      endorsement.ExecutionResult
 	mergedOutcomes []execution.PerTxOutcome
 	mergedErr      error
+	warmErr        error
 }
 
 func (s *stubEngine) Execute(context.Context, *types.Transaction) (endorsement.ExecutionResult, error) {
 	return endorsement.ExecutionResult{}, s.execErr
 }
 func (s *stubEngine) ExecuteMergedBatch(context.Context, []*types.Transaction) (endorsement.ExecutionResult, []execution.PerTxOutcome, error) {
+	return s.mergedRes, s.mergedOutcomes, s.mergedErr
+}
+
+// WarmBatch returns a zero-value handle (Close is nil-safe) or warmErr. The
+// authoritative pass returns the same merged fixture as ExecuteMergedBatch, so
+// WarmBatch+AuthBatch and ExecuteBatch fold identically.
+func (s *stubEngine) WarmBatch(context.Context, []*types.Transaction) (*execution.WarmedBatch, error) {
+	if s.warmErr != nil {
+		return nil, s.warmErr
+	}
+	return &execution.WarmedBatch{}, nil
+}
+func (s *stubEngine) AuthMergedBatch(context.Context, *execution.WarmedBatch) (endorsement.ExecutionResult, []execution.PerTxOutcome, error) {
 	return s.mergedRes, s.mergedOutcomes, s.mergedErr
 }
 func (s *stubEngine) Call(ethereum.CallMsg, *big.Int) ([]byte, error) {
@@ -310,6 +324,101 @@ func TestExecuteBatchMergedEndorsement(t *testing.T) {
 	}
 	if len(builder.gotRes.Payload) != 0 {
 		t.Errorf("Payload = %q, want empty (outcomes must ride in Event, not Payload)", builder.gotRes.Payload)
+	}
+}
+
+// WarmBatch+AuthBatch is the split form of ExecuteBatch and must produce the
+// same signed response: AuthBatch signs the same merged write-set and carries
+// the same per-tx outcomes in Event, because both fold through endorseBatch.
+func TestWarmThenAuthBatchMatchesExecuteBatch(t *testing.T) {
+	tx1Res := endorsement.ExecutionResult{
+		RWS:    blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k1", Value: []byte("v1")}}},
+		Event:  []byte("event-1"),
+		Status: 200,
+	}
+	tx2Res := endorsement.ExecutionResult{
+		RWS:    blocks.ReadWriteSet{Writes: []blocks.KVWrite{{Key: "k2", Value: []byte("v2")}}},
+		Event:  []byte("event-2-revert"),
+		Status: 201,
+	}
+	mergedRWS, mergedEvents := execution.MergeResults([]endorsement.ExecutionResult{tx1Res, tx2Res})
+	mergedOutcomes := []execution.PerTxOutcome{
+		{Status: tx1Res.Status, Event: mergedEvents[0]},
+		{Status: tx2Res.Status, Event: mergedEvents[1]},
+	}
+
+	want := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
+	builder := &stubBuilder{resp: want}
+	eng := &stubEngine{
+		mergedRes:      endorsement.ExecutionResult{RWS: mergedRWS, Status: 200, Message: "OK"},
+		mergedOutcomes: mergedOutcomes,
+	}
+	f := &Endorser{Engine: eng, builder: builder}
+
+	tx1 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0)})
+	tx2 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 1})
+
+	warmed, err := f.WarmBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("WarmBatch returned Go error: %v", err)
+	}
+	if warmed == nil {
+		t.Fatal("WarmBatch returned a nil handle")
+	}
+
+	resp, err := f.AuthBatch(context.Background(), endorsement.Invocation{}, warmed)
+	if err != nil {
+		t.Fatalf("AuthBatch must encode failures in the response, got Go error: %v", err)
+	}
+	if resp != want {
+		t.Errorf("resp = %v, want %v", resp, want)
+	}
+
+	// AuthBatch must have signed the merged write-set with the outcomes folded
+	// into Event, byte-identical to what ExecuteBatch signs.
+	if len(builder.gotRes.RWS.Writes) != 2 {
+		t.Fatalf("merged write-set has %d writes, want 2", len(builder.gotRes.RWS.Writes))
+	}
+	var perTxOutcomes []execution.PerTxOutcome
+	if err := json.Unmarshal(builder.gotRes.Event, &perTxOutcomes); err != nil {
+		t.Fatalf("res.Event must decode as a per-tx outcomes array: %v", err)
+	}
+	if len(perTxOutcomes) != 2 ||
+		perTxOutcomes[0].Status != 200 || string(perTxOutcomes[0].Event) != "event-1" ||
+		perTxOutcomes[1].Status != 201 || string(perTxOutcomes[1].Event) != "event-2-revert" {
+		t.Errorf("perTxOutcomes = %+v, want [{200 event-1} {201 event-2-revert}]", perTxOutcomes)
+	}
+}
+
+// A warm-pass failure rides in the AuthBatch/WarmBatch contract as a Go error
+// from WarmBatch (transport failure), while an auth-pass engine failure rides in
+// the response as a non-2xx status, never a Go error.
+func TestWarmBatchErrorAndAuthBatchEngineFailure(t *testing.T) {
+	// WarmBatch surfaces the engine's warm error as a Go error and a nil handle.
+	warmFail := &Endorser{Engine: &stubEngine{warmErr: errors.New("open snapshot: db unavailable")}}
+	handle, err := warmFail.WarmBatch(context.Background(), nil)
+	if err == nil {
+		t.Fatal("WarmBatch must return the engine's warm error")
+	}
+	if handle != nil {
+		t.Errorf("WarmBatch handle = %v, want nil on error", handle)
+	}
+
+	// AuthBatch surfaces an engine auth failure as a 500 response, not a Go error.
+	authFail := &Endorser{
+		Engine:  &stubEngine{mergedErr: errors.New("auth pass: backend gone")},
+		builder: &stubBuilder{},
+	}
+	warmed, err := authFail.WarmBatch(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("WarmBatch unexpected error: %v", err)
+	}
+	resp, err := authFail.AuthBatch(context.Background(), endorsement.Invocation{}, warmed)
+	if err != nil {
+		t.Fatalf("AuthBatch must encode the failure in the response, got Go error: %v", err)
+	}
+	if resp.Response.Status != common.StatusServerError {
+		t.Errorf("status = %d, want %d (StatusServerError)", resp.Response.Status, common.StatusServerError)
 	}
 }
 

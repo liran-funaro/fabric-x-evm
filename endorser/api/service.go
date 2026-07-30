@@ -23,6 +23,18 @@ import (
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 )
 
+// WarmedBatch is an opaque handle to a batch whose concurrent warm pass has
+// completed: its per-view read cache is primed and its authoritative pass has
+// not yet run. It is produced by Service.WarmBatch and consumed by
+// Service.AuthBatch. The only thing a caller may do with it directly is Close
+// it — the interface is deliberately behaviourless so api never depends on the
+// execution package's concrete type. AuthBatch closes the handle; Close is
+// idempotent, so an abandoned handle (never passed to AuthBatch) can be closed
+// safely to release its snapshot.
+type WarmedBatch interface {
+	Close() error
+}
+
 // Service is one typed method per endorser function, mirroring the EVM engine.
 // Execute is the only method that produces an endorsement; the read-only
 // methods return plain values.
@@ -45,6 +57,22 @@ type Service interface {
 	// for the whole batch. Per-tx outcomes ride in the merged ExecutionResult's
 	// Event field, recoverable later from the committed block.
 	ExecuteBatch(ctx context.Context, inv endorsement.Invocation, txs []*types.Transaction) (*peer.ProposalResponse, error)
+
+	// WarmBatch runs only the concurrent warm pass of a merged batch: it opens a
+	// read snapshot and primes the per-view read cache, returning a WarmedBatch
+	// handle. It produces no endorsement — signing belongs to the authoritative
+	// pass. The caller must eventually Close the handle (AuthBatch does so), even
+	// on the error paths where a handle is still returned. WarmBatch/AuthBatch
+	// are the split form of ExecuteBatch: warming batch N+1 can overlap the
+	// authoritative pass of batch N.
+	WarmBatch(ctx context.Context, txs []*types.Transaction) (WarmedBatch, error)
+
+	// AuthBatch runs the serial authoritative pass over an already-warmed batch
+	// and folds it into a single signed response, exactly as ExecuteBatch does.
+	// It closes the handle. Passing a handle that did not originate from this
+	// Service's WarmBatch is a programming error and yields a server-error
+	// response.
+	AuthBatch(ctx context.Context, inv endorsement.Invocation, warmed WarmedBatch) (*peer.ProposalResponse, error)
 
 	// Call runs a read-only eth_call. On an EVM revert or a failed execution it
 	// returns a *common.CallError; the revert payload is returned alongside it.
