@@ -3,6 +3,20 @@
 ---
 server:
   endpoint: :7001
+  # The endorser's warm pass fires a whole batch's state reads concurrently as
+  # individual GetRows/GetCode/GetBalance RPCs, so a single gateway approaches the
+  # query-service default cap of 5000 unary req/s (burst 1000) at sustained load.
+  # Disable it for benchmarking so the measured ceiling is the real system, not this
+  # DoS-protection default. 0 removes the limiter entirely (start_serve.go only wires
+  # it when requests-per-second > 0).
+  # NOTE: in the colima/QEMU/sshfs dev stack this is NOT the binding ceiling — the
+  # throughput wall at ~35k txs / ~550 orderer blocks is the sshfs mount wedging under
+  # the arma orderer's block-ledger appends (append latency cliffs 34ms -> 11s at
+  # block ~554), which surfaces at the gateway as endorse-read DeadlineExceeded.
+  # Disabling this had no effect on that wall; it matters on faster (non-sshfs) hosts.
+  rate-limit:
+    requests-per-second: 0
+    burst: 0
   tls:
     mode: mtls
     cert-path: /node-tls/server.crt
