@@ -47,7 +47,15 @@ var gatewayConfig = flag.String("gateway-config", "fabx.yaml", "gateway config f
 var metricsAddr = flag.String("metrics-addr", "0.0.0.0:2112", "address for Prometheus metrics endpoint")
 var enableMetrics = flag.Bool("enable-metrics", false, "enable Prometheus metrics export")
 var namespace = flag.String("namespace", "real", "namespace to commit transactions to")
-var dataset = flag.String("dataset", "testdata/USDC_dataset.json.gz", "dataset to use")
+
+// dataset selects the replay workload. A bare name ("synthetic", "historic")
+// resolves to testdata/USDC_dataset.<name>.json.gz (both downloaded by setup.sh);
+// any value with a file extension (e.g. "testdata/foo.json.gz", "/abs/bar.json.gz")
+// is used as a literal path. The two named workloads are complementary and BOTH
+// should be measured: "synthetic" is conflict-free (raw throughput ceiling), while
+// "historic" is the real Jan-2020 USDC trace with an extremely high MVCC-conflict
+// rate that stresses the rollback / re-batch path.
+var dataset = flag.String("dataset", "synthetic", "replay workload: 'synthetic', 'historic', or a path to a .json.gz dataset")
 
 // submitters sets how many goroutines call the gateway's SendTransaction concurrently.
 // The gateway itself is now a single drain-all executor (no per-tx worker pool), so
@@ -411,6 +419,11 @@ func runReplayTest(
 	// When running `go test ./integration/perf/...` from repo root, the test's
 	// working directory becomes integration/perf/, so we try both cwd and repo root.
 	datasetPath := *dataset
+	// A bare workload name (no file extension) selects one of setup.sh's two
+	// downloads; a value with an extension is treated as a literal path.
+	if filepath.Ext(datasetPath) == "" {
+		datasetPath = filepath.Join("testdata", fmt.Sprintf("USDC_dataset.%s.json.gz", datasetPath))
+	}
 
 	var file *os.File
 	var fileErr error

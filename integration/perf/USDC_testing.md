@@ -102,10 +102,19 @@ This creates [`integration/perf/testdata/USDC_dataset.json.gz`](integration/perf
 
 ### Step 6: Run Performance Tests
 
-Now you can run the performance tests:
+The test replays one of two named workloads, selected with `-dataset`:
+
+- `-dataset synthetic` → `testdata/USDC_dataset.synthetic.json.gz` — conflict-free, measures the raw throughput ceiling (the default).
+- `-dataset historic` → `testdata/USDC_dataset.historic.json.gz` — the real Jan-2020 USDC trace with an extremely high MVCC-conflict rate, which stresses the rollback / re-batch path.
+
+`setup.sh` downloads both. Always measure both. A value with a file extension (e.g. `-dataset testdata/foo.json.gz`) is used as a literal path — the generation pipeline above emits `USDC_dataset.json.gz`, so run it with `-dataset testdata/USDC_dataset.json.gz` (or rename it to `USDC_dataset.historic.json.gz`).
 
 ```bash
+# Default (synthetic) workload:
 go test -tags=perf -v ./integration/perf/...
+
+# Historic (high-conflict) workload:
+go test -tags=perf -v ./integration/perf/... -dataset historic
 ```
 
 > [!TIP]
