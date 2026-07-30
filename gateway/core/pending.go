@@ -20,13 +20,17 @@ import (
 // commits (Remove) or, if excluded from a batch (nonce gap) or belonging to an
 // aborted batch, until a later cycle picks them up again.
 type PendingPool struct {
-	mu    sync.Mutex
-	order []ethcommon.Hash
-	txs   map[ethcommon.Hash]*types.Transaction
+	mu       sync.Mutex
+	order    []ethcommon.Hash
+	txs      map[ethcommon.Hash]*types.Transaction
+	reserved map[ethcommon.Hash]struct{} // drained-but-not-yet-resolved (pipelined executor only)
 }
 
 func NewPendingPool() *PendingPool {
-	return &PendingPool{txs: make(map[ethcommon.Hash]*types.Transaction)}
+	return &PendingPool{
+		txs:      make(map[ethcommon.Hash]*types.Transaction),
+		reserved: make(map[ethcommon.Hash]struct{}),
+	}
 }
 
 func (p *PendingPool) Add(tx *types.Transaction) {
@@ -86,11 +90,52 @@ func (p *PendingPool) DrainUpTo(max int) []*types.Transaction {
 	return out
 }
 
+// DrainUpToReserved returns up to max pending txs in insertion (FIFO) order,
+// SKIPPING any already reserved, and marks the returned hashes reserved before
+// returning them. It is the pipelined executor's drain (runExecutorPipelined):
+// it lets the executor hold batch N reserved (drained-but-not-yet-resolved)
+// while it drains and warms batch N+1, so the non-destructive pool never
+// re-draws an in-flight batch. max <= 0 means "all unreserved". The serial path
+// uses DrainUpTo, which does not reserve, so it is unaffected.
+func (p *PendingPool) DrainUpToReserved(max int) []*types.Transaction {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*types.Transaction, 0, len(p.order))
+	for _, h := range p.order {
+		if _, isReserved := p.reserved[h]; isReserved {
+			continue
+		}
+		tx, ok := p.txs[h]
+		if !ok {
+			continue
+		}
+		out = append(out, tx)
+		p.reserved[h] = struct{}{}
+		if max > 0 && len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// Release clears the reservation for the given hashes that remain in pending
+// (e.g. a batch whose results were handled: included/terminal txs are Remove()d,
+// the rest are Released so a later drain can re-draw them). Releasing an unknown
+// or already-removed hash is a no-op.
+func (p *PendingPool) Release(hashes []ethcommon.Hash) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, h := range hashes {
+		delete(p.reserved, h)
+	}
+}
+
 func (p *PendingPool) Remove(hashes []ethcommon.Hash) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, h := range hashes {
 		delete(p.txs, h)
+		delete(p.reserved, h)
 	}
 	kept := p.order[:0]
 	for _, h := range p.order {

@@ -34,6 +34,47 @@ func TestPendingPoolAddDrainRemove(t *testing.T) {
 	}
 }
 
+func TestPendingPoolReservation(t *testing.T) {
+	p := NewPendingPool()
+	a, b, c := txWithNonce(1), txWithNonce(2), txWithNonce(3)
+	p.Add(a)
+	p.Add(b)
+	p.Add(c)
+
+	// First reserved drain takes the batch (FIFO) and reserves it.
+	first := p.DrainUpToReserved(2)
+	if len(first) != 2 || first[0].Hash() != a.Hash() || first[1].Hash() != b.Hash() {
+		t.Fatalf("first reserved drain = %d txs, want [a b] in order", len(first))
+	}
+	// Second reserved drain SKIPS the reserved a,b and returns c.
+	second := p.DrainUpToReserved(2)
+	if len(second) != 1 || second[0].Hash() != c.Hash() {
+		t.Fatalf("second reserved drain = %d txs, want [c]", len(second))
+	}
+	// Third reserved drain returns nothing (all reserved).
+	if got := p.DrainUpToReserved(2); len(got) != 0 {
+		t.Fatalf("third reserved drain = %d txs, want empty", len(got))
+	}
+	// Serial DrainUpTo is unaffected by reservations (non-destructive peek).
+	if got := p.DrainUpTo(10); len(got) != 3 {
+		t.Fatalf("serial DrainUpTo(10) = %d txs, want all 3 (reservations ignored)", len(got))
+	}
+	// Release a,b -> re-drawable by the reserved drain again.
+	p.Release([]ethcommon.Hash{a.Hash(), b.Hash()})
+	redraw := p.DrainUpToReserved(2)
+	if len(redraw) != 2 || redraw[0].Hash() != a.Hash() || redraw[1].Hash() != b.Hash() {
+		t.Fatalf("re-draw after release = %d txs, want [a b]", len(redraw))
+	}
+	// Remove clears reservations AND deletes from pending.
+	p.Remove([]ethcommon.Hash{a.Hash(), b.Hash(), c.Hash()})
+	if p.Len() != 0 {
+		t.Fatalf("Len after remove = %d, want 0", p.Len())
+	}
+	if len(p.reserved) != 0 {
+		t.Fatalf("reserved after remove = %d, want 0", len(p.reserved))
+	}
+}
+
 func TestPendingPoolDrainUpTo(t *testing.T) {
 	p := NewPendingPool()
 	txs := make([]*types.Transaction, 5)
