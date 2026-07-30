@@ -81,6 +81,15 @@ var orderers = flag.Int("orderers", 64, "number of goroutines submitting transac
 // still commit; batching the per-key reads would raise this ceiling substantially.
 var maxBatchSize = flag.Int("max-batch-size", 128, "max EVM txs per merged committer tx (0 = unbounded drain-all)")
 
+// pipeline selects the warm(N+1) || auth(N) pipelined executor loop over the
+// serial one (see gwcore.Gateway.SetPipelined). It overlaps the I/O-bound
+// concurrent warm pass of the next batch with the CPU-bound serial
+// authoritative pass of the current one. Run the same dataset with -pipeline
+// off (control) then on to measure the speedup. Threaded through the config
+// override (Gateway.Pipelined) so BuildGateway sets it before the gateway
+// Start reads it once.
+var pipeline = flag.Bool("pipeline", false, "enable the warm(N+1)||auth(N) pipelined executor loop")
+
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.
 type TxCompletionTracker struct {
@@ -389,6 +398,10 @@ func runReplayTest(
 		map[string]any{
 			"Gateway.SubmitterCount": ordererSubmitterCount,
 			"Network.Namespace":      *namespace,
+			// Set via the config override (consumed by BuildGateway before the
+			// gateway Start reads the flag once), NOT a post-construction setter
+			// like SetMaxBatchSize below -- SetPipelined must precede Start.
+			"Gateway.Pipelined": *pipeline,
 		},
 		factory,
 		tracker,

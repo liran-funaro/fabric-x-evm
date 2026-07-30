@@ -230,7 +230,7 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	if cfg.Network.Namespace == "synthetic" {
 		txPerSec = 10000
 	}
-	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cache)
+	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache)
 	if err != nil {
 		return nil, nil, err
 	}

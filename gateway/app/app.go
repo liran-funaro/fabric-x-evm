@@ -161,7 +161,7 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 
 	// Gateway owns the BatchSubmitter and will handle its lifecycle. Reuse the
 	// same clamped submitterCount computed above (see orderedOrdererSubmitterCount).
-	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, submitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cache)
+	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, submitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache)
 	if err != nil {
 		return nil, err
 	}

@@ -60,6 +60,8 @@ type Gateway struct {
 	MaxInflight         int `mapstructure:"max-inflight"          yaml:"max-inflight"`          // max submitted-but-unconfirmed committer txs the pipelined executor keeps in flight; <=0 defaults to 16 (see core.Gateway.SetMaxInflight)
 
 	NotifyTimeout time.Duration `mapstructure:"notify-timeout" yaml:"notify-timeout"` // client-side backstop before the pipelined executor resolves an in-flight batch by fallback/rollback if no commit/abort notification arrives; <=0 defaults to 60s (see core.Gateway.SetCommitTimeout)
+
+	Pipelined bool `mapstructure:"pipelined" yaml:"pipelined"` // overlap the concurrent warm pass of batch N+1 with the serial authoritative pass of batch N; default false (serial). See core.Gateway.SetPipelined and the warm-auth-pipelining design.
 }
 
 // DB holds the database paths for the gateway.
