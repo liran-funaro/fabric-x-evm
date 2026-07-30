@@ -324,6 +324,23 @@ func runReplayTest(
 	}
 	evmConfig := execution.EVMConfig{}
 
+	// PERF_WARM_WORKERS caps ExecuteBatch's warm-pass concurrency
+	// (execution.EVMConfig.WarmWorkers) for sweeps. Unset/0 keeps the production
+	// default of one warm worker per tx. A positive value forces each warm worker
+	// to reuse its primed EVM across several txs, restoring cross-tx reuse of the
+	// EVM/stack-arena/JUMPDEST cache -- used to measure the alloc/GC cost of the
+	// len(txs)-workers regime against warm-pass I/O saturation. Correctness is
+	// unaffected: the warm pass only primes caches and always completes (wg.Wait)
+	// before the serial authoritative pass reads, so a lower worker count changes
+	// warm wall-time, never the auth pass's cache-hit rate or MVCC outcome.
+	if v := os.Getenv("PERF_WARM_WORKERS"); v != "" {
+		var ww int
+		_, err := fmt.Sscanf(v, "%d", &ww)
+		require.NoError(t, err, "PERF_WARM_WORKERS must be a valid integer")
+		require.GreaterOrEqual(t, ww, 0, "PERF_WARM_WORKERS must be >= 0")
+		evmConfig.WarmWorkers = ww
+	}
+
 	// Setup test harness with USDC contract and balance priming enabled
 	factory := balancePrimingEndorserFactory(balancePriming)
 
