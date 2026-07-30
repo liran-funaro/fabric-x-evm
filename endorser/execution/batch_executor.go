@@ -102,6 +102,19 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 		readSrc = counted
 	}
 
+	// Trace-driven overlap simulation (debug only): per-tx warm-completion offset
+	// (ns from warm start) and per-tx authoritative cost (ns). Used post-batch to
+	// compute what an in-order warm||auth overlap WOULD achieve on THIS batch's
+	// real (work-stealing) warm-completion order -- without building the overlap,
+	// introducing no tx-to-tx synchronization. Each warm worker writes its own
+	// distinct index (no false-sharing race; wg.Wait provides the read barrier);
+	// the auth pass is serial. See the OVERLAP-SIM log below.
+	var warmDoneNanos, authCostNanos []int64
+	if timing {
+		warmDoneNanos = make([]int64, len(txs))
+		authCostNanos = make([]int64, len(txs))
+	}
+
 	// The fast path (production: no per-tx decorator, no debug logging) reuses
 	// one StateDB+Executor per warm-pass worker and one for the whole
 	// authoritative pass, resetting the StateDB in place between txs, so the
@@ -172,6 +185,9 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 						_, _ = e.runOn(s, tx) // warm only; ignore result/error.
 					}
 				}(txs[i])
+				if timing {
+					warmDoneNanos[i] = int64(time.Since(warmStart))
+				}
 			}
 		}()
 	}
@@ -197,7 +213,11 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 			return nil, err
 		}
 	}
-	for _, tx := range txs {
+	for idx, tx := range txs {
+		var authTxStart time.Time
+		if timing {
+			authTxStart = time.Now()
+		}
 		var res endorsement.ExecutionResult
 		var err error
 		if fast {
@@ -208,6 +228,13 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 			if state, err = e.newState(overlay); err == nil {
 				res, err = e.runOn(state, tx)
 			}
+		}
+		if timing {
+			// Per-tx auth EVM cost. In today's serial pass warm has already run to
+			// completion, so these reads are cache hits (auth readtime ~5ms/batch)
+			// -- i.e. this is essentially pure EVM CPU, exactly the cost auth[i]
+			// would incur in an overlap once warm[i] has prefetched its keys.
+			authCostNanos[idx] = int64(time.Since(authTxStart))
 		}
 		if err != nil {
 			if rej, ok := errors.AsType[*TxRejected](err); ok {
@@ -249,6 +276,38 @@ func (e *EVMEngine) ExecuteBatch(ctx context.Context, txs []*types.Transaction) 
 			warmDur.Round(time.Microsecond), warmReads, time.Duration(warmReadNanos).Round(time.Microsecond),
 			authDur.Round(time.Microsecond), authReads, time.Duration(authReadNanos).Round(time.Microsecond),
 			(authDur - time.Duration(authReadNanos)).Round(time.Microsecond),
+		)
+
+		// Trace-driven overlap simulation. Given THIS batch's real per-tx warm-
+		// completion offsets and per-tx auth costs, compute the wall an in-order
+		// warm||auth overlap would achieve: auth[i] cannot start until warm[i] has
+		// finished AND auth[i-1] has finished (auth stays serial; MVCC needs
+		// tx-order). Both clocks share the warm-start origin. This bounds Option 1's
+		// payoff on the EXISTING work-stealing warm order -- no overlap is built and
+		// no warm reordering is assumed, so it isolates the benefit reachable with
+		// zero load-balancing cost (only ~per-tx signaling remains). serial =
+		// today's warm+auth; ideal = max(warm,auth) (a perfectly in-order warm);
+		// stall = total time auth would sit idle waiting for its next-in-order tx.
+		var authClock, authSum, stall int64
+		for i := range txs {
+			if authClock < warmDoneNanos[i] {
+				stall += warmDoneNanos[i] - authClock
+				authClock = warmDoneNanos[i]
+			}
+			authClock += authCostNanos[i]
+			authSum += authCostNanos[i]
+		}
+		serial := warmDur + authDur
+		overlap := time.Duration(authClock)
+		ideal := warmDur
+		if authDur > ideal {
+			ideal = authDur
+		}
+		batchLogger.Debugf("OVERLAP-SIM n=%d serial=%s overlap=%s ideal=%s stall=%s authwork=%s speedup=%.2fx (ceiling=%.2fx)",
+			len(txs),
+			serial.Round(time.Microsecond), overlap.Round(time.Microsecond), ideal.Round(time.Microsecond),
+			time.Duration(stall).Round(time.Microsecond), time.Duration(authSum).Round(time.Microsecond),
+			float64(serial)/float64(overlap), float64(serial)/float64(ideal),
 		)
 	}
 	return out, nil
