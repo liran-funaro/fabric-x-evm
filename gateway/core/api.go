@@ -83,6 +83,17 @@ type Gateway struct {
 	// (see CascadeCount).
 	cascadeCount atomic.Int64 // number of real cascade events; test observability (CascadeCount)
 
+	// commit-latency observability (see CommitLatencyStats): submit->commit-
+	// notification wall time, accumulated by resolveInflight over committed
+	// batches only. Always-on and cheap (one timestamp per batch in trackInflight
+	// + atomic adds here), like maxInflightObserved. Read alongside
+	// MaxInflightObserved vs the in-flight cap, this answers whether the commit
+	// path is on the critical path (window saturated) or hidden behind execution
+	// (window never fills) -- the gap the ENDORSE-TIMING execution split cannot see.
+	commitCount        atomic.Int64 // committed batches observed
+	commitLatencyNanos atomic.Int64 // sum of submit->commit latency (ns) over commitCount
+	commitLatencyMax   atomic.Int64 // max single submit->commit latency (ns)
+
 	// commitTimeout backstops each in-flight batch: if no commit/abort
 	// notification arrives within it, resolveInflight treats the batch as
 	// unconfirmed (rolled back) so a lost notification cannot wedge the
@@ -239,6 +250,25 @@ func (g *Gateway) MaxInflightObserved() int { return int(g.maxInflightObserved.L
 // CascadeCount returns how many rollback cascades actually detached a suffix.
 // Test observability: 0 means no in-flight batch was rolled back.
 func (g *Gateway) CascadeCount() int { return int(g.cascadeCount.Load()) }
+
+// CommitLatencyStats returns the number of committed committer batches observed
+// and the average and maximum submit->commit-notification wall time across them
+// (zero durations when count is 0). This is the commit-path cost the endorser's
+// ENDORSE-TIMING split cannot see; read with MaxInflightObserved vs MaxInflight
+// to tell whether commit is on the critical path (peak in-flight == cap) or
+// hidden behind execution (peak < cap). Lock-free observability.
+func (g *Gateway) CommitLatencyStats() (count int, avg, max time.Duration) {
+	n := g.commitCount.Load()
+	if n == 0 {
+		return 0, 0, 0
+	}
+	return int(n), time.Duration(g.commitLatencyNanos.Load() / n), time.Duration(g.commitLatencyMax.Load())
+}
+
+// MaxInflight returns the configured in-flight window size (the committer-batch
+// backpressure cap; see SetMaxInflight). Test observability, paired with
+// MaxInflightObserved and CommitLatencyStats.
+func (g *Gateway) MaxInflight() int { return g.maxInflight }
 
 // InflightLen returns the number of currently outstanding (submitted-but-unresolved)
 // committer batches. Test observability.

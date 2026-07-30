@@ -629,6 +629,17 @@ wait:
 	t.Logf("Replay complete: %d/%d EVM txs committed in %.1fs across %d committer txs (avg %.1f EVM/batch); %d rolled-back batches, %d submit failures | %.0f EVM tx/s",
 		finalCommitted, totalToSubmit, elapsed, finalBatches, avgBatch, finalRolledBack, finalSubmitFailed, evmThroughput)
 
+	// Commit-path timing: submit->commit-notification latency and how full the
+	// in-flight window got. If peak in-flight stays below the cap, the commit path
+	// was hidden behind execution (never on the critical path); if it pins at the
+	// cap, commit latency is throttling the executor. This is the piece the
+	// endorser's ENDORSE-TIMING execution split cannot measure.
+	if n, avgCommit, maxCommit := th.Gateways[0].CommitLatencyStats(); n > 0 {
+		t.Logf("Commit-path timing: %d committer txs | submit->commit avg %s max %s | peak in-flight %d/%d",
+			n, avgCommit.Round(time.Millisecond), maxCommit.Round(time.Millisecond),
+			th.Gateways[0].MaxInflightObserved(), th.Gateways[0].MaxInflight())
+	}
+
 	// Return (EVM tx/s, EVM txs that never committed, total EVM txs targeted).
 	return evmThroughput, totalToSubmit - finalCommitted, totalToSubmit
 }

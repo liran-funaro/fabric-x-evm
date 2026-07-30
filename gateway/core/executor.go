@@ -18,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
+	"go.uber.org/zap/zapcore"
 )
 
 // commitTimeoutDefault is the per-batch stall backstop armed by trackInflight.
@@ -60,6 +61,13 @@ type inflightBatch struct {
 	rws      blocks.ReadWriteSet
 	specVers map[string]uint64
 	timer    *time.Timer
+	// submittedAt is when this batch entered the in-flight registry, set in
+	// trackInflight immediately before SubmitFabricTx. resolveInflight subtracts
+	// it from the commit-notification arrival to measure submit->commit wall time
+	// (see Gateway.commitLatencyNanos / CommitLatencyStats) -- the commit-path
+	// cost the ENDORSE-TIMING execution split cannot see. Set once, never mutated,
+	// so any goroutine may read it lock-free.
+	submittedAt time.Time
 }
 
 // runExecutor is the pipelined drain loop. Each cycle drains up to
@@ -241,7 +249,7 @@ func committerTxID(prop *peer.Proposal) (string, error) {
 // remain idempotent regardless, so a fast commit/cascade that resolves the
 // entry the instant after this critical section releases the lock is harmless.
 func (g *Gateway) trackInflight(txID string, included []*types.Transaction, rws blocks.ReadWriteSet, specVers map[string]uint64) {
-	b := &inflightBatch{txID: txID, included: included, rws: rws, specVers: specVers}
+	b := &inflightBatch{txID: txID, included: included, rws: rws, specVers: specVers, submittedAt: time.Now()}
 
 	g.inflightMu.Lock()
 	g.inflight = append(g.inflight, b)
@@ -308,6 +316,26 @@ func (g *Gateway) resolveInflight(txID string, committed bool) {
 	g.inflightMu.Unlock()
 
 	<-g.inflightSlots // free the in-flight slot
+
+	// Record submit->commit wall time (commit-path observability; see
+	// CommitLatencyStats). b.submittedAt is immutable, so this lock-free read is
+	// race-free. Only the committed path is measured: a rollback/timeout is not a
+	// commit latency. Together with MaxInflightObserved vs the in-flight cap this
+	// says whether the commit path is on the critical path (window saturated) or
+	// hidden behind execution (window never fills).
+	lat := time.Since(b.submittedAt)
+	g.commitCount.Add(1)
+	g.commitLatencyNanos.Add(int64(lat))
+	for { // maintain the max lock-free (CAS retry loop; contention is negligible)
+		cur := g.commitLatencyMax.Load()
+		if int64(lat) <= cur || g.commitLatencyMax.CompareAndSwap(cur, int64(lat)) {
+			break
+		}
+	}
+	if logger.IsEnabledFor(zapcore.DebugLevel) {
+		logger.Debugf("COMMIT-TIMING tx=%s submit->commit=%s inflight-peak=%d/%d",
+			txID, lat.Round(time.Millisecond), g.maxInflightObserved.Load(), g.maxInflight)
+	}
 
 	g.cache.NoteCommitted(txID)
 
