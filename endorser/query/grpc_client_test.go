@@ -9,6 +9,7 @@ package query_test
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,6 +80,102 @@ func TestGRPCClientRoundTrip(t *testing.T) {
 	}
 	if err := c.EndView(ctx, view); err != nil {
 		t.Fatalf("EndView: %v", err)
+	}
+}
+
+// countingQS records how many BeginView/GetRows calls it served, so a test can
+// observe which connection in a pool a request landed on. Every instance serves
+// the same view id, modelling a server-side view queryable over any connection.
+type countingQS struct {
+	committerpb.UnimplementedQueryServiceServer
+	begins  atomic.Int64
+	getRows atomic.Int64
+	value   []byte
+}
+
+func (f *countingQS) BeginView(context.Context, *committerpb.ViewParameters) (*committerpb.View, error) {
+	f.begins.Add(1)
+	return &committerpb.View{Id: "v1"}, nil
+}
+func (f *countingQS) EndView(context.Context, *committerpb.View) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+func (f *countingQS) GetRows(_ context.Context, q *committerpb.Query) (*committerpb.Rows, error) {
+	f.getRows.Add(1)
+	out := &committerpb.Rows{}
+	for _, ns := range q.GetNamespaces() {
+		rns := &committerpb.RowsNamespace{NsId: ns.GetNsId()}
+		for _, k := range ns.GetKeys() {
+			rns.Rows = append(rns.Rows, &committerpb.Row{Key: k, Value: f.value, Version: 1})
+		}
+		out.Namespaces = append(out.Namespaces, rns)
+	}
+	return out, nil
+}
+
+// TestGRPCClientPoolRoundRobin verifies that a pooled client spreads GetRows
+// evenly across its connections while pinning BeginView to the first connection,
+// and that a view begun on the first connection is served over every connection
+// (server-side views are addressed by id, not by connection).
+func TestGRPCClientPoolRoundRobin(t *testing.T) {
+	const numConns = 3
+	const callsPerConn = 4
+
+	fakes := make([]*countingQS, numConns)
+	conns := make([]*grpc.ClientConn, numConns)
+	for i := range numConns {
+		lis, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := grpc.NewServer()
+		fakes[i] = &countingQS{value: []byte("v")}
+		committerpb.RegisterQueryServiceServer(srv, fakes[i])
+		go srv.Serve(lis)
+		defer srv.Stop()
+
+		conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns[i] = conn
+	}
+
+	c := query.NewGRPCClientPool(conns, time.Second)
+	defer c.Close()
+
+	ctx := context.Background()
+	view, err := c.BeginView(ctx)
+	if err != nil || view != "v1" {
+		t.Fatalf("BeginView = %q, %v", view, err)
+	}
+
+	for range numConns * callsPerConn {
+		rows, err := c.GetRows(ctx, view, "evm", [][]byte{[]byte("k")})
+		if err != nil {
+			t.Fatalf("GetRows: %v", err)
+		}
+		if len(rows) != 1 || string(rows[0].Value) != "v" {
+			t.Fatalf("rows = %+v, want one row v", rows)
+		}
+	}
+
+	// BeginView is pinned to the first connection only.
+	if got := fakes[0].begins.Load(); got != 1 {
+		t.Errorf("conn[0] BeginView count = %d, want 1", got)
+	}
+	for i := 1; i < numConns; i++ {
+		if got := fakes[i].begins.Load(); got != 0 {
+			t.Errorf("conn[%d] BeginView count = %d, want 0 (BeginView must pin to conn[0])", i, got)
+		}
+	}
+
+	// GetRows is spread evenly (round-robin) across every connection -- proving no
+	// single connection serialises the batch's reads.
+	for i := range numConns {
+		if got := fakes[i].getRows.Load(); got != callsPerConn {
+			t.Errorf("conn[%d] GetRows count = %d, want %d (round-robin)", i, got, callsPerConn)
+		}
 	}
 }
 

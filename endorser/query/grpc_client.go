@@ -10,8 +10,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
@@ -56,19 +58,48 @@ func Dial(cfg common.ClientConfig) (*grpc.ClientConn, error) {
 	return grpc.NewClient(cfg.Endpoint.Address(), grpc.WithTransportCredentials(creds))
 }
 
-// GRPCClient is a QueryClient backed by the query service over gRPC.
+// GRPCClient is a QueryClient backed by the query service over gRPC. It may hold
+// more than one connection: the endorser's warm pass fires a whole batch's state
+// reads concurrently, and a single *grpc.ClientConn serializes them behind one
+// HTTP/2 transport (one writer goroutine, ~100 concurrent-stream cap). Holding a
+// pool of connections and round-robining GetRows across them lets the concurrent
+// readers use independent transports. BeginView/EndView are pinned to the first
+// connection; the view is a server-side handle (keyed by id, not by connection),
+// so GetRows for that view may be issued over any connection in the pool.
 type GRPCClient struct {
-	conn        *grpc.ClientConn
-	cl          committerpb.QueryServiceClient
+	conns       []*grpc.ClientConn
+	cls         []committerpb.QueryServiceClient
+	next        atomic.Uint32
 	viewTimeout time.Duration
 }
 
 var _ QueryClient = (*GRPCClient)(nil)
 
-// NewGRPCClient wraps an existing connection. viewTimeout is passed to BeginView
-// (0 lets the server pick its maximum).
+// NewGRPCClient wraps a single connection. viewTimeout is passed to BeginView
+// (0 lets the server pick its maximum). Equivalent to NewGRPCClientPool with one
+// connection.
 func NewGRPCClient(conn *grpc.ClientConn, viewTimeout time.Duration) *GRPCClient {
-	return &GRPCClient{conn: conn, cl: committerpb.NewQueryServiceClient(conn), viewTimeout: viewTimeout}
+	return NewGRPCClientPool([]*grpc.ClientConn{conn}, viewTimeout)
+}
+
+// NewGRPCClientPool wraps one or more connections to the same query service.
+// GetRows round-robins across them; BeginView/EndView/Close operate on the pool.
+// conns must be non-empty.
+func NewGRPCClientPool(conns []*grpc.ClientConn, viewTimeout time.Duration) *GRPCClient {
+	cls := make([]committerpb.QueryServiceClient, len(conns))
+	for i, conn := range conns {
+		cls[i] = committerpb.NewQueryServiceClient(conn)
+	}
+	return &GRPCClient{conns: conns, cls: cls, viewTimeout: viewTimeout}
+}
+
+// pick returns the next client in round-robin order. len(cls) is always >= 1.
+func (c *GRPCClient) pick() committerpb.QueryServiceClient {
+	if len(c.cls) == 1 {
+		return c.cls[0]
+	}
+	i := c.next.Add(1) - 1
+	return c.cls[int(i%uint32(len(c.cls)))]
 }
 
 func (c *GRPCClient) BeginView(ctx context.Context) (string, error) {
@@ -77,7 +108,7 @@ func (c *GRPCClient) BeginView(ctx context.Context) (string, error) {
 		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
 		defer cancel()
 	}
-	view, err := c.cl.BeginView(ctx, &committerpb.ViewParameters{
+	view, err := c.cls[0].BeginView(ctx, &committerpb.ViewParameters{
 		IsoLevel:            committerpb.IsoLevel_SERIALIZABLE,
 		TimeoutMilliseconds: uint64(c.viewTimeout.Milliseconds()),
 	})
@@ -97,7 +128,7 @@ func (c *GRPCClient) GetRows(ctx context.Context, viewID, ns string, keys [][]by
 		View:       &committerpb.View{Id: viewID},
 		Namespaces: []*committerpb.QueryNamespace{{NsId: ns, Keys: keys}},
 	}
-	res, err := c.cl.GetRows(ctx, q)
+	res, err := c.pick().GetRows(ctx, q)
 	if err != nil {
 		return nil, err
 	}
@@ -119,8 +150,17 @@ func (c *GRPCClient) EndView(ctx context.Context, viewID string) error {
 		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
 		defer cancel()
 	}
-	_, err := c.cl.EndView(ctx, &committerpb.View{Id: viewID})
+	_, err := c.cls[0].EndView(ctx, &committerpb.View{Id: viewID})
 	return err
 }
 
-func (c *GRPCClient) Close() error { return c.conn.Close() }
+// Close closes every connection in the pool, joining any errors.
+func (c *GRPCClient) Close() error {
+	var errs []error
+	for _, conn := range c.conns {
+		if err := conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}

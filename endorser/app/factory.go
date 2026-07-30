@@ -19,7 +19,18 @@ import (
 	"github.com/hyperledger/fabric-x-sdk/endorsement"
 	efab "github.com/hyperledger/fabric-x-sdk/endorsement/fabric"
 	efabx "github.com/hyperledger/fabric-x-sdk/endorsement/fabricx"
+	"google.golang.org/grpc"
 )
+
+// defaultQueryServiceConnections is the endorser->query-service gRPC pool size used
+// when config leaves query-service-connections unset. The warm pass fires a whole
+// batch's reads concurrently; a single connection serializes them behind one HTTP/2
+// transport. A perf sweep (bs=1024, window=20000) measured throughput vs pool size —
+// 4212 tx/s at 1 conn, rising to a ~5040 tx/s plateau at 4-16 conns (+19.6% peak at
+// 8) and regressing at 32 as per-connection overhead outweighs the added parallelism.
+// 8 sits at the peak with margin below the regression point. The query service serves
+// a view by id independent of connection, so spreading reads across the pool is safe.
+const defaultQueryServiceConnections = 8
 
 // NewEndorserCore builds the endorser engine, its read store, and its endorsement
 // builder — the construction shared by a production endorser (see NewEndorser) and the
@@ -49,11 +60,24 @@ func NewEndorserCore(
 	var back *storage.RevertibleLightKVS
 	switch cfg.Database.Database {
 	case "query-service":
-		conn, err := query.Dial(cfg.QueryService)
-		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("failed to dial query service: %w", err)
+		// 0 (unset) opens the tuned default-sized pool; an explicit positive value
+		// overrides it (set 1 to force the pre-pool single shared connection).
+		n := cfg.QueryServiceConnections
+		if n <= 0 {
+			n = defaultQueryServiceConnections
 		}
-		store = query.NewStore(query.NewGRPCClient(conn, cfg.ViewTimeout), namespace)
+		conns := make([]*grpc.ClientConn, 0, n)
+		for i := range n {
+			conn, err := query.Dial(cfg.QueryService)
+			if err != nil {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+				return nil, nil, nil, nil, fmt.Errorf("failed to dial query service (connection %d/%d): %w", i+1, n, err)
+			}
+			conns = append(conns, conn)
+		}
+		store = query.NewStore(query.NewGRPCClientPool(conns, cfg.ViewTimeout), namespace)
 	case "memory":
 		back = storage.NewRevertibleLightKVS(storage.NewLightKVS(cfg.Database.HistorySize))
 		store = query.NewStore(query.NewMemClient(back), namespace)

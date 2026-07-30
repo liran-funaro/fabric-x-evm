@@ -21,7 +21,14 @@ type Endorser struct {
 	Committer    common.ClientConfig   `mapstructure:"committer"     yaml:"committer"`
 	Database     DB                    `mapstructure:"database"      yaml:"database"`
 	QueryService common.ClientConfig   `mapstructure:"query-service" yaml:"query-service"`
-	ViewTimeout  time.Duration         `mapstructure:"view-timeout"  yaml:"view-timeout"`
+	// QueryServiceConnections is the number of gRPC connections the endorser opens
+	// to the query service. The warm pass fires a whole batch's reads concurrently;
+	// a single connection serializes them behind one HTTP/2 transport, so a pool of
+	// connections (round-robined per read) lets concurrent readers use independent
+	// transports. 0 (unset) opens the tuned default-sized pool; set 1 to force a
+	// single shared connection.
+	QueryServiceConnections int           `mapstructure:"query-service-connections" yaml:"query-service-connections"`
+	ViewTimeout             time.Duration `mapstructure:"view-timeout"              yaml:"view-timeout"`
 	// DebugLogs enables per-tx StateDB DEBUG logging via StateDBLogger.
 	DebugLogs bool `mapstructure:"debug-logs" yaml:"debug-logs"`
 }

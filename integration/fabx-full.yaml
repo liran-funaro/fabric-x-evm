@@ -91,6 +91,8 @@ endorsers:
           - ../testdata/crypto/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem
     database:
       database: query-service
+    # query-service-connections: 8   # endorser->QS gRPC pool size (0/unset = tuned
+    #                                 # default). The perf test overrides via PERF_QS_CONNS.
     query-service:
       endpoint:
         host: 127.0.0.1

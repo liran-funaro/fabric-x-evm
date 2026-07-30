@@ -118,6 +118,21 @@ func (t *TxCompletionTracker) HandleTx(ctx context.Context, notifs []fxcommon.Tx
 // balancePrimingEndorserFactory creates endorsers with balance priming support for testing.
 func balancePrimingEndorserFactory(balancePriming *testimpl.BalancePrimingConfig) integration.EndorserFactory {
 	return func(t *testing.T, ecfg econf.Endorser, channel, namespace string, evmConfig execution.EVMConfig, protocol string, cacheWrap func(execution.KVSSnapshotter) execution.KVSSnapshotter) integration.EndorserComponents {
+		// PERF_QS_CONNS overrides the number of gRPC connections the endorser opens
+		// to the query service (econf.Endorser.QueryServiceConnections) for sweeps.
+		// Unset/0 keeps the production default of a single shared connection. Because
+		// the warm pass fires a whole batch's reads concurrently, a pool lets those
+		// reads use independent HTTP/2 transports instead of serializing behind one.
+		// The view is a server-side handle, so correctness is unaffected: reads for a
+		// view may be issued over any connection in the pool.
+		if v := os.Getenv("PERF_QS_CONNS"); v != "" {
+			var nc int
+			_, err := fmt.Sscanf(v, "%d", &nc)
+			require.NoError(t, err, "PERF_QS_CONNS must be a valid integer")
+			require.GreaterOrEqual(t, nc, 1, "PERF_QS_CONNS must be >= 1")
+			ecfg.QueryServiceConnections = nc
+		}
+
 		// Create the base endorser components
 		readStore, backing, builder, baseEndorser := integration.NewEndorser(t, ecfg, channel, namespace, evmConfig, protocol, cacheWrap)
 
