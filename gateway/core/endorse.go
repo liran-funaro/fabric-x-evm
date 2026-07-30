@@ -164,6 +164,146 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 		return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, err
 	}
 
+	res, errs := e.fanOut(ctx, func(ctx context.Context, _ int, endorser api.Service) (*peer.ProposalResponse, error) {
+		return statusOnly(endorser.ExecuteBatch(ctx, inv, txs))
+	})
+	return e.finishBatch(inv, txs, res, errs)
+}
+
+// WarmBatch runs only the warm pass of a batch across all endorsers and bundles
+// the per-endorser warmed handles into one gateway-level WarmedBatch (handling
+// N >= 1 endorsers; today N = 1). It builds the invocation up front so AuthBatch
+// need not — this lets the pipelined executor overlap invocation-building and
+// warming of batch N+1 with the authoritative pass of batch N. The caller MUST
+// later pass the handle to AuthBatch or Close it; on any per-endorser warm
+// failure, WarmBatch closes the handles that did open (no snapshot leaks) and
+// returns the error.
+func (e *EndorsementClient) WarmBatch(ctx context.Context, txs []*types.Transaction) (*WarmedBatch, error) {
+	args := make([][]byte, 0, len(txs)+1)
+	args = append(args, []byte{byte(common.ProposalTypeEVMBatch)})
+	for _, tx := range txs {
+		b, err := tx.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, b)
+	}
+	inv, err := e.createInvocation(args)
+	if err != nil {
+		return nil, err
+	}
+
+	// Derive a cancellable context so goroutines can stop early on error
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	per := make([]api.WarmedBatch, len(e.endorsers))
+	errs := make([]error, len(e.endorsers)) // indexed — deterministic error order
+	var wg sync.WaitGroup
+	for i, end := range e.endorsers {
+		run := func(index int, endorser api.Service) {
+			wb, err := endorser.WarmBatch(ctx, txs)
+			if err != nil {
+				errs[index] = fmt.Errorf("call endorser warm: %w", err)
+				cancel()
+				return
+			}
+			per[index] = wb
+		}
+		if len(e.endorsers) > 1 {
+			wg.Add(1)
+			go func(index int, endorser api.Service) {
+				defer wg.Done()
+				run(index, endorser)
+			}(i, end)
+		} else {
+			run(i, end)
+		}
+	}
+	wg.Wait()
+
+	// Return first error in slice order — stable and deterministic. Close any
+	// handles that DID open so a partially-warmed batch never leaks a snapshot.
+	for _, err := range errs {
+		if err != nil {
+			closeWarmHandles(per)
+			return nil, err
+		}
+	}
+
+	return &WarmedBatch{inv: inv, txs: txs, per: per}, nil
+}
+
+// AuthBatch runs the authoritative pass over an already-warmed batch across all
+// endorsers and returns the same (endorsement, included, terminal, mergedRWS)
+// tuple as ExecuteBatch — the two share finishBatch so serial and pipelined
+// execution decode identically. Each endorser's AuthBatch closes its own warmed
+// handle; the executor may still Close the bundle defensively (idempotent).
+func (e *EndorsementClient) AuthBatch(ctx context.Context, warmed *WarmedBatch) (sdk.Endorsement, []*types.Transaction, []*types.Transaction, blocks.ReadWriteSet, error) {
+	if warmed == nil {
+		return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, fmt.Errorf("auth batch: nil warmed handle")
+	}
+	res, errs := e.fanOut(ctx, func(ctx context.Context, index int, endorser api.Service) (*peer.ProposalResponse, error) {
+		return statusOnly(endorser.AuthBatch(ctx, warmed.inv, warmed.per[index]))
+	})
+	return e.finishBatch(warmed.inv, warmed.txs, res, errs)
+}
+
+// WarmedBatch bundles the per-endorser warmed handles for one batch (index-aligned
+// with EndorsementClient.endorsers) plus the invocation and txs the authoritative
+// pass needs. It is produced by WarmBatch and consumed by AuthBatch.
+type WarmedBatch struct {
+	inv endorsement.Invocation
+	txs []*types.Transaction
+	per []api.WarmedBatch
+}
+
+// Txs returns the batch's transactions (in batch order) so the pipelined
+// executor can Release their pending-pool reservation at the boundary.
+func (w *WarmedBatch) Txs() []*types.Transaction { return w.txs }
+
+// Close releases every per-endorser warmed handle. It is safe to call more than
+// once and after AuthBatch (the endorser handles' Close is idempotent), so the
+// executor can Close defensively on any abandon/error/shutdown path.
+func (w *WarmedBatch) Close() error {
+	if w == nil {
+		return nil
+	}
+	closeWarmHandles(w.per)
+	return nil
+}
+
+// closeWarmHandles closes each non-nil handle, ignoring per-handle Close errors
+// (a snapshot-close failure is not actionable at this layer).
+func closeWarmHandles(per []api.WarmedBatch) {
+	for _, h := range per {
+		if h != nil {
+			_ = h.Close()
+		}
+	}
+}
+
+// statusOnly maps a per-endorser batch response to the fan-out contract: a
+// non-nil error is a transport/delivery failure; a non-OK status is an
+// application failure of the merged batch. Both are returned as errors so the
+// fan-out cancels its siblings; only a StatusOK response passes through.
+func statusOnly(pResp *peer.ProposalResponse, err error) (*peer.ProposalResponse, error) {
+	if err != nil {
+		return nil, fmt.Errorf("call endorser: %w", err)
+	}
+	if pResp.Response.Status != common.StatusOK {
+		return nil, fmt.Errorf("process EVM batch: %s", pResp.Response.Message)
+	}
+	return pResp, nil
+}
+
+// fanOut runs call for every endorser — concurrently when there is more than
+// one, inline for the common single-endorser case — and returns the
+// per-endorser responses and errors, index-aligned and in deterministic slice
+// order. The first per-endorser error cancels the derived context so siblings
+// can stop early. call must depend only on its index; it must not write shared
+// state for another endorser.
+func (e *EndorsementClient) fanOut(ctx context.Context, call func(ctx context.Context, index int, endorser api.Service) (*peer.ProposalResponse, error)) ([]*peer.ProposalResponse, []error) {
 	// Derive a cancellable context so goroutines can stop early on error
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -173,14 +313,9 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 	var wg sync.WaitGroup
 	for i, end := range e.endorsers {
 		run := func(index int, endorser api.Service) {
-			pResp, err := endorser.ExecuteBatch(ctx, inv, txs)
+			pResp, err := call(ctx, index, endorser)
 			if err != nil {
-				errs[index] = fmt.Errorf("call endorser: %w", err)
-				cancel()
-				return
-			}
-			if pResp.Response.Status != common.StatusOK {
-				errs[index] = fmt.Errorf("process EVM batch: %s", pResp.Response.Message)
+				errs[index] = err
 				cancel()
 				return
 			}
@@ -197,8 +332,16 @@ func (e *EndorsementClient) ExecuteBatch(ctx context.Context, txs []*types.Trans
 		}
 	}
 	wg.Wait()
+	return res, errs
+}
 
-	// Return first error in slice order — stable and deterministic
+// finishBatch turns the fan-out result into the batch endorsement: it returns
+// the first per-endorser error (stable slice order), otherwise decodes the
+// included/terminal tx subsets and the merged read-write set from any one signed
+// response (every responding endorser executed the same deterministic batch, so
+// they decode identically). Shared by ExecuteBatch (serial) and AuthBatch
+// (pipelined).
+func (e *EndorsementClient) finishBatch(inv endorsement.Invocation, txs []*types.Transaction, res []*peer.ProposalResponse, errs []error) (sdk.Endorsement, []*types.Transaction, []*types.Transaction, blocks.ReadWriteSet, error) {
 	for _, err := range errs {
 		if err != nil {
 			return sdk.Endorsement{}, nil, nil, blocks.ReadWriteSet{}, err

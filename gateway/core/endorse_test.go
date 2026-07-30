@@ -333,3 +333,127 @@ func TestExecuteBatchBuildsMergedInvocation(t *testing.T) {
 		t.Errorf("Args[2] = %x, want %x", args[2], txBytes2)
 	}
 }
+
+// WarmBatch+AuthBatch is the split form of ExecuteBatch and must build the same
+// invocation and return the same endorsement tuple. WarmBatch builds the
+// invocation (so AuthBatch reuses it), and AuthBatch closes the warmed handle.
+func TestWarmThenAuthBatchMatchesExecuteBatch(t *testing.T) {
+	pResp := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusOK}}
+	stub := &stubEndorser{execResp: pResp}
+	c := signingClient(stub)
+
+	tx1 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 1})
+	tx2 := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0), Nonce: 2})
+	txBytes1, _ := tx1.MarshalBinary()
+	txBytes2, _ := tx2.MarshalBinary()
+
+	warmed, err := c.WarmBatch(context.Background(), []*types.Transaction{tx1, tx2})
+	if err != nil {
+		t.Fatalf("WarmBatch: %v", err)
+	}
+	if warmed == nil {
+		t.Fatal("WarmBatch returned a nil bundle")
+	}
+	// The bundle exposes the batch's txs so the executor can Release them.
+	if got := warmed.Txs(); len(got) != 2 || got[0] != tx1 || got[1] != tx2 {
+		t.Errorf("warmed.Txs() = %v, want [tx1 tx2]", got)
+	}
+
+	end, included, terminal, rws, err := c.AuthBatch(context.Background(), warmed)
+	if err != nil {
+		t.Fatalf("AuthBatch: %v", err)
+	}
+	// AuthBatch signs the invocation built at warm time, carrying the whole batch
+	// in order (type byte + each tx's marshaled bytes) — identical to ExecuteBatch.
+	args := stub.gotInv.Args
+	if len(args) != 3 || args[0][0] != byte(common.ProposalTypeEVMBatch) ||
+		!bytes.Equal(args[1], txBytes1) || !bytes.Equal(args[2], txBytes2) {
+		t.Fatalf("auth invocation Args = %v, want [type tx1 tx2]", args)
+	}
+	if len(end.Responses) != 1 || end.Responses[0] != pResp {
+		t.Errorf("Responses = %v, want [%v]", end.Responses, pResp)
+	}
+	if end.Proposal == nil {
+		t.Error("Proposal = nil, want non-nil")
+	}
+	// Same fallback as ExecuteBatch: no decodable Payload -> all included.
+	if len(included) != 2 || included[0] != tx1 || included[1] != tx2 {
+		t.Errorf("included = %v, want [tx1 tx2]", included)
+	}
+	if len(terminal) != 0 {
+		t.Errorf("terminal = %v, want []", terminal)
+	}
+	if len(rws.Reads) != 0 || len(rws.Writes) != 0 {
+		t.Errorf("rws = %v, want empty", rws)
+	}
+	// AuthBatch closed the warmed handle exactly once.
+	if stub.warmClosed != 1 {
+		t.Errorf("warmClosed = %d, want 1 (AuthBatch closes the handle)", stub.warmClosed)
+	}
+}
+
+// AuthBatch surfaces a non-OK auth response as a Go error (the executor backs
+// off and re-drains), exactly as ExecuteBatch does.
+func TestAuthBatchNonOKStatusErrors(t *testing.T) {
+	pResp := &peer.ProposalResponse{Response: &peer.Response{Status: common.StatusServerError, Message: "auth pass: backend gone"}}
+	stub := &stubEndorser{execResp: pResp}
+	c := signingClient(stub)
+
+	tx := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0)})
+	warmed, err := c.WarmBatch(context.Background(), []*types.Transaction{tx})
+	if err != nil {
+		t.Fatalf("WarmBatch: %v", err)
+	}
+	if _, _, _, _, err := c.AuthBatch(context.Background(), warmed); err == nil {
+		t.Fatal("expected error for non-OK auth status")
+	}
+	// Even on the error path the handle was closed by the endorser.
+	if stub.warmClosed != 1 {
+		t.Errorf("warmClosed = %d, want 1", stub.warmClosed)
+	}
+}
+
+// A nil bundle is a programming error the caller must not make; AuthBatch
+// reports it rather than panicking.
+func TestAuthBatchNilBundleErrors(t *testing.T) {
+	c := signingClient(&stubEndorser{})
+	if _, _, _, _, err := c.AuthBatch(context.Background(), nil); err == nil {
+		t.Fatal("expected error for nil warmed bundle")
+	}
+}
+
+// A per-endorser warm failure closes the handles that DID open (no snapshot
+// leak) and returns the error. Uses two endorsers so one succeeds and one fails.
+func TestWarmBatchClosesOpenedHandlesOnError(t *testing.T) {
+	good := &stubEndorser{}
+	bad := &stubEndorser{warmErr: errors.New("open snapshot: db unavailable")}
+	c := &EndorsementClient{
+		endorsers: []api.Service{good, bad},
+		signer:    stubSigner{},
+		channel:   "ch",
+		namespace: "ns",
+		nsVersion: "1.0",
+	}
+
+	tx := types.NewTx(&types.LegacyTx{Gas: 21000, GasPrice: big.NewInt(0)})
+	warmed, err := c.WarmBatch(context.Background(), []*types.Transaction{tx})
+	if err == nil {
+		t.Fatal("expected error when an endorser's warm fails")
+	}
+	if warmed != nil {
+		t.Errorf("bundle = %v, want nil on error", warmed)
+	}
+	// The endorser that DID open a handle had it closed to avoid a snapshot leak.
+	if good.warmClosed != 1 {
+		t.Errorf("good.warmClosed = %d, want 1 (opened handle closed on partial failure)", good.warmClosed)
+	}
+}
+
+// WarmedBatch.Close is safe on a nil bundle (the executor may Close defensively
+// on paths where no bundle was produced).
+func TestWarmedBatchCloseNilSafe(t *testing.T) {
+	var w *WarmedBatch
+	if err := w.Close(); err != nil {
+		t.Errorf("nil bundle Close() = %v, want nil", err)
+	}
+}
