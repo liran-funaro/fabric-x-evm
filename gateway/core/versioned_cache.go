@@ -23,12 +23,24 @@ type entry struct {
 // later batch can execute on them before they commit. It holds ONLY in-flight
 // writes (cold committed reads are served by the per-batch query view). Bounded
 // by the executor's in-flight window; entries drop when their writer commits.
+// Concurrency contract: entries (and roEvictPending) are STRUCTURALLY MUTATED
+// only at the batch boundary on the single executor goroutine -- ApplyWrites,
+// DrainEvictions, Rebuild, and MaintainReadOnly all run there, between batches,
+// when no warm-pass worker is in flight. They are READ concurrently only during
+// a batch (Read, on warm-pass workers). Reads and writes therefore never
+// overlap, and the happens-before edge is supplied for free by the executor's
+// wg.Wait() (joins all warm workers before the boundary mutates) and the
+// go-spawn that starts the next batch (boundary writes -> spawn -> next batch's
+// reads). No mutex guards entries; adding a writer OUTSIDE the boundary would
+// break this invariant and require reintroducing one. Only committed/invalidated
+// (queued asynchronously by notification handlers) need their own lock.
 type VersionedCache struct {
-	mu      sync.RWMutex
 	entries map[string]entry
 
-	// committed/invalidated TxIDs queued by notification handlers, applied at
-	// the next batch boundary by DrainEvictions (never mid-batch).
+	// committed/invalidated TxIDs queued by notification handlers off the
+	// executor goroutine, applied at the next batch boundary by DrainEvictions
+	// (never mid-batch). These are the only fields touched concurrently, so they
+	// keep evictMu.
 	evictMu     sync.Mutex
 	committed   []string
 	invalidated []string
@@ -38,10 +50,10 @@ type VersionedCache struct {
 	// BELOW this in-flight write cache in the read path (write-cache ->
 	// read-only-cache -> query view) and is maintained at the same batch
 	// boundary. roEvictPending accumulates the keys this gateway writes each
-	// cycle (recorded in ApplyWrites, under c.mu) so MaintainReadOnly can evict
-	// their now-stale read-only entries at the next boundary. roEvictPending is
-	// touched only on the executor goroutine (ApplyWrites and MaintainReadOnly
-	// both run there) but is guarded by c.mu to stay robust to future callers.
+	// cycle (recorded in ApplyWrites) so MaintainReadOnly can evict their
+	// now-stale read-only entries at the next boundary. Both ApplyWrites and
+	// MaintainReadOnly run at the boundary on the executor goroutine, so
+	// roEvictPending needs no lock.
 	ro             *ReadOnlyCache
 	roEvictPending []string
 }
@@ -60,8 +72,6 @@ func (c *VersionedCache) EnableReadOnlyCache(capacity int, threshold uint64) {
 }
 
 func (c *VersionedCache) Read(key string) (*blocks.WriteRecord, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	e, ok := c.entries[key]
 	if !ok {
 		return nil, false
@@ -76,9 +86,7 @@ func (c *VersionedCache) Read(key string) (*blocks.WriteRecord, bool) {
 // which is correct for read-modify-write workloads (every written key is read
 // first). A key already cached takes cachedSpec+1.
 func (c *VersionedCache) ApplyWrites(txID string, r blocks.ReadWriteSet) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.applyLocked(txID, r)
+	c.apply(txID, r)
 	// Queue this batch's written keys for read-only-cache eviction at the next
 	// boundary: once these commit, their committed version advances, so any
 	// read-only entry for them would be stale. Evicting one boundary after the
@@ -120,18 +128,16 @@ func (c *VersionedCache) MaintainReadOnly() {
 	if c.ro == nil {
 		return
 	}
-	c.mu.Lock()
 	evict := c.roEvictPending
 	c.roEvictPending = nil
-	c.mu.Unlock()
 	c.ro.maintain(evict)
 }
 
-// applyLocked records tx's writes into c.entries at deterministic spec versions.
-// It assumes c.mu is already held (called by ApplyWrites and by Rebuild, which
-// re-applies survivors under one lock acquisition). See ApplyWrites for the
-// spec-version rules.
-func (c *VersionedCache) applyLocked(txID string, r blocks.ReadWriteSet) {
+// apply records tx's writes into c.entries at deterministic spec versions. Runs
+// only at the batch boundary on the executor goroutine -- via ApplyWrites, or
+// via Rebuild re-applying survivors -- so it needs no lock (see VersionedCache).
+// See ApplyWrites for the spec-version rules.
+func (c *VersionedCache) apply(txID string, r blocks.ReadWriteSet) {
 	readVer := make(map[string]*blocks.Version, len(r.Reads))
 	for _, rd := range r.Reads {
 		readVer[rd.Key] = rd.Version
@@ -183,19 +189,19 @@ func (c *VersionedCache) DrainEvictions() (committed, invalidated []string) {
 	for _, id := range invalidated {
 		drop[id] = struct{}{}
 	}
-	c.mu.Lock()
+	// entries is mutated only here at the boundary on the executor goroutine, so
+	// the drop scan needs no lock (see VersionedCache).
 	for k, e := range c.entries {
 		if _, ok := drop[e.writerTx]; ok {
 			delete(c.entries, k)
 		}
 	}
-	c.mu.Unlock()
 	return
 }
 
+// Len reports the number of in-flight entries. Test/observability helper; like
+// the rest of the cache it must be called at the boundary (no batch in flight).
 func (c *VersionedCache) Len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	return len(c.entries)
 }
 
@@ -216,13 +222,12 @@ type ReapplySpec struct {
 // original order, the rebuild reproduces exactly the state the survivors would
 // have had if the invalidated batches had never applied. The cache only ever
 // holds in-flight writes (committed reads come from the query view), so
-// rebuilding from empty is complete. Runs under the write lock so no concurrent
-// reader ever observes a partially-rebuilt cache.
+// rebuilding from empty is complete. Runs at the batch boundary on the executor
+// goroutine (like every other entries mutation), so no concurrent reader ever
+// observes a partially-rebuilt cache.
 func (c *VersionedCache) Rebuild(batches []ReapplySpec) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.entries = make(map[string]entry, len(c.entries))
 	for _, b := range batches {
-		c.applyLocked(b.TxID, b.RWS)
+		c.apply(b.TxID, b.RWS)
 	}
 }

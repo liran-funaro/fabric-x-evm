@@ -52,10 +52,13 @@ type stageCand struct {
 //
 // Concurrency contract (mirrors VersionedCache): get/stage run concurrently on
 // warm-pass workers DURING a batch and only ever read the entries map or append
-// to the staging map; the entries map is structurally mutated (admit / evict /
-// capacity-trim) ONLY by maintain, called once per cycle at the batch boundary
-// on the executor goroutine, when no reader is in flight. Never mutate entries
-// mid-batch.
+// to the staging map (staged, guarded by stageMu); the entries map is
+// structurally mutated (admit / evict / capacity-trim) ONLY by maintain, called
+// once per cycle at the batch boundary on the executor goroutine, when no reader
+// is in flight. Reads and structural writes therefore never overlap, and the
+// happens-before edge comes for free from the executor's wg.Wait() + go-spawn,
+// so entries needs no lock. uses is an atomic because it IS bumped concurrently
+// (get) yet read at the boundary (maintain). Never mutate entries mid-batch.
 //
 // Staleness / correctness: an admitted record is served in place of a query
 // read, so its version is journaled into the MVCC read-set exactly as if read
@@ -75,7 +78,9 @@ type ReadOnlyCache struct {
 	capacity  int
 	threshold uint64
 
-	mu      sync.RWMutex // guards entries; structural writes only at the boundary
+	// entries is structurally mutated only at the batch boundary (maintain) on
+	// the executor goroutine and read concurrently only during a batch (get), so
+	// it needs no lock -- see the Concurrency contract above.
 	entries map[string]*roEntry
 
 	stageMu sync.Mutex // guards staged; appended concurrently during a batch
@@ -100,11 +105,10 @@ func newReadOnlyCache(capacity int, threshold uint64) *ReadOnlyCache {
 }
 
 // get returns a copy of the cached record for key and records a use, or false
-// on a miss. Safe under concurrent callers (read lock + atomic bump).
+// on a miss. Safe under concurrent callers: entries is read-only during a batch
+// (see the Concurrency contract) and uses is atomic.
 func (c *ReadOnlyCache) get(key string) (*blocks.WriteRecord, bool) {
-	c.mu.RLock()
 	e, ok := c.entries[key]
-	c.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}
@@ -143,8 +147,8 @@ func (c *ReadOnlyCache) maintain(evictKeys []string) {
 	c.staged = make(map[string]*stageCand)
 	c.stageMu.Unlock()
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	// entries is mutated only here at the boundary on the executor goroutine, so
+	// the structural changes below need no lock (see the Concurrency contract).
 
 	// 1. Evictions from self-writes (staleness guard).
 	for _, k := range evictKeys {
@@ -183,9 +187,8 @@ func (c *ReadOnlyCache) maintain(evictKeys []string) {
 	}
 }
 
-// len reports the number of resident entries (test/observability helper).
+// len reports the number of resident entries (test/observability helper; call
+// at the boundary, no batch in flight).
 func (c *ReadOnlyCache) len() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	return len(c.entries)
 }

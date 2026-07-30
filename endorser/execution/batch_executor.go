@@ -347,9 +347,13 @@ func (e *EVMEngine) newState(reader ReadStore) (ExtendedStateDB, error) {
 // overlayReader layers an in-memory, batch-local write set over an underlying
 // snapshot ReadStore, so the authoritative pass sees earlier transactions'
 // writes in this batch as if they were already committed.
+//
+// It is created per-batch and used ONLY by the serial authoritative pass on the
+// single executor goroutine (Get during each tx, apply after each tx, strictly
+// in sequence); the concurrent warm pass never touches it. writes therefore
+// needs no lock.
 type overlayReader struct {
 	under  ReadStore
-	mu     sync.Mutex
 	writes map[string]*blocks.WriteRecord
 }
 
@@ -376,9 +380,7 @@ func (o *overlayReader) Get(ns, key string) (*blocks.WriteRecord, error) {
 		return nil, err
 	}
 
-	o.mu.Lock()
 	rec, overlaid := o.writes[key]
-	o.mu.Unlock()
 	if !overlaid {
 		return under, nil
 	}
@@ -397,9 +399,9 @@ func (o *overlayReader) Get(ns, key string) (*blocks.WriteRecord, error) {
 func (o *overlayReader) Close() error { return nil }
 
 // apply records tx's write-set so later Get calls in this batch observe it.
+// Called serially after each tx in the authoritative pass (no lock needed; see
+// overlayReader).
 func (o *overlayReader) apply(rws blocks.ReadWriteSet) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
 	for _, w := range rws.Writes {
 		o.writes[w.Key] = &blocks.WriteRecord{Key: w.Key, Value: w.Value, IsDelete: w.IsDelete}
 	}

@@ -23,8 +23,6 @@ func rws(reads []blocks.KVRead, writes []blocks.KVWrite) blocks.ReadWriteSet {
 // batch owns a key's cache entry -- Read only returns the WriteRecord, not the
 // writerTx. Same-package test-only helper.
 func (c *VersionedCache) readEntry(key string) (entry, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
 	e, ok := c.entries[key]
 	return e, ok
 }
@@ -204,42 +202,69 @@ func TestVersionedCache_RebuildFromNoneClearsCache(t *testing.T) {
 	}
 }
 
-// Concurrent-access stress test: many goroutines hammer Read, ApplyWrites,
-// NoteCommitted, NoteInvalidated, DrainEvictions, and Len on one shared cache
-// at once. In production, warm-pass workers read the cache concurrently with
-// the executor mutating it and notification handlers queueing evictions — this
-// mirrors that concurrency shape. No ordering assertions: this is a pure data
-// race check, meant to be run with -race.
+// Concurrent-access stress test reflecting the cache's real concurrency
+// contract (see VersionedCache): entries is READ concurrently only DURING a
+// batch (many warm-pass workers) and MUTATED only at the batch boundary on the
+// single executor goroutine, the two phases separated by a join. Only the
+// eviction queue (NoteCommitted/NoteInvalidated) is touched asynchronously by
+// notification handlers, so it runs continuously alongside both phases -- those
+// handlers touch only the evictMu-guarded queues, never entries. No ordering
+// assertions: this is a pure data-race check, meant to be run with -race.
 func TestVersionedCache_ConcurrentAccess(t *testing.T) {
 	c := NewVersionedCache()
-	const goroutines = 8
-	const iterations = 500
+	const readers = 8
+	const rounds = 200
 	const keySpace = 16
 
-	var wg sync.WaitGroup
-	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
-		go func(g int) {
-			defer wg.Done()
-			for i := 0; i < iterations; i++ {
-				txID := fmt.Sprintf("tx-%d-%d", g, i)
-				key := fmt.Sprintf("k%d", i%keySpace)
-				switch i % 6 {
-				case 0:
-					c.ApplyWrites(txID, rws(nil, []blocks.KVWrite{{Key: key, Value: []byte("v")}}))
-				case 1:
-					c.Read(key)
-				case 2:
-					c.NoteCommitted(txID)
-				case 3:
-					c.NoteInvalidated(txID)
-				case 4:
-					c.DrainEvictions()
-				case 5:
-					c.Len()
-				}
+	// Async notification handlers: queue commits/invalidations the whole time,
+	// concurrent with both batch reads and boundary mutation.
+	stop := make(chan struct{})
+	var notifiers sync.WaitGroup
+	notifiers.Add(2)
+	go func() {
+		defer notifiers.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				c.NoteCommitted(fmt.Sprintf("tx-c-%d", i))
 			}
-		}(g)
+		}
+	}()
+	go func() {
+		defer notifiers.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				c.NoteInvalidated(fmt.Sprintf("tx-i-%d", i))
+			}
+		}
+	}()
+
+	for r := 0; r < rounds; r++ {
+		// Batch phase: many concurrent readers, no writer in flight.
+		var batch sync.WaitGroup
+		batch.Add(readers)
+		for g := 0; g < readers; g++ {
+			go func() {
+				defer batch.Done()
+				for i := 0; i < keySpace; i++ {
+					c.Read(fmt.Sprintf("k%d", i))
+				}
+			}()
+		}
+		batch.Wait() // join warm workers before mutating (mirrors executor's wg.Wait())
+
+		// Boundary phase: single goroutine mutates entries.
+		c.DrainEvictions()
+		c.ApplyWrites(fmt.Sprintf("tx-w-%d", r),
+			rws(nil, []blocks.KVWrite{{Key: fmt.Sprintf("k%d", r%keySpace), Value: []byte("v")}}))
+		c.Len()
 	}
-	wg.Wait()
+
+	close(stop)
+	notifiers.Wait()
 }
