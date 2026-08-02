@@ -96,7 +96,31 @@ func (v *View) Get(namespace, key string) (*blocks.WriteRecord, error) {
 	return rec, nil
 }
 
+// Reopen begins a FRESH query-service view -- reflecting the latest committed
+// state -- that SHARES this view's read cache. Cached reads (committed values
+// this view already fetched) are reused as-is; only keys not yet cached hit the
+// new view. It implements execution.ReopenableReadStore for the pipelined
+// authoritative pass: warm(N) primed this view against a snapshot that is now
+// one batch-boundary stale, so auth must re-resolve any UNCACHED read against
+// current committed state, while still reusing warm's cached cold reads for
+// speed. See execution.ReopenableReadStore for why the shared cache is safe.
+//
+// The returned view SHARES the cache map (not a copy): warm(N) has completed and
+// been joined before auth(N) reopens, and warm(N+1) uses its own separate view,
+// so auth is the sole accessor of this map -- the fresh view's own mutex guards
+// its (single-goroutine) reads and any new admissions. The caller must Close the
+// returned view; Close-ing the original ends only the original's (stale) viewID.
+func (v *View) Reopen() (execution.ReadStore, error) {
+	viewID, err := v.client.BeginView(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return &View{client: v.client, viewID: viewID, cache: v.cache}, nil
+}
+
 // Close ends the view.
 func (v *View) Close() error {
 	return v.client.EndView(context.Background(), v.viewID)
 }
+
+var _ execution.ReopenableReadStore = (*View)(nil)

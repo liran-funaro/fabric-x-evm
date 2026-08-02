@@ -61,7 +61,7 @@ type Gateway struct {
 
 	NotifyTimeout time.Duration `mapstructure:"notify-timeout" yaml:"notify-timeout"` // client-side backstop before the pipelined executor resolves an in-flight batch by fallback/rollback if no commit/abort notification arrives; <=0 defaults to 60s (see core.Gateway.SetCommitTimeout)
 
-	Pipelined bool `mapstructure:"pipelined" yaml:"pipelined"` // overlap the concurrent warm pass of batch N+1 with the serial authoritative pass of batch N; default false (serial). SAFE ONLY for low cross-batch key conflict: 1.2-1.5x on disjoint-key traffic but a livelock/throughput collapse on hot-key traffic (see core.Gateway.SetPipelined and report/pipeline_report.html).
+	Pipelined bool `mapstructure:"pipelined" yaml:"pipelined"` // overlap the concurrent warm pass of batch N+1 with the serial authoritative pass of batch N; default false (serial). Correct on all workloads (auth reopens a fresh committed view -> identical in effect to serial); a workload-dependent throughput trade the admin sets per deployment (wins on low cross-batch key conflict; the naive hot-key auth-refetch cost is removed by deferred committed-write eviction -- see core.VersionedCache.DrainEvictionsDeferred; post-fix throughput being re-measured). See core.Gateway.SetPipelined and report/pipeline_report.html.
 }
 
 // DB holds the database paths for the gateway.

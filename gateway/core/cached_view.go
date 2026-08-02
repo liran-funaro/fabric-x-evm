@@ -7,6 +7,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 package core
 
 import (
+	"fmt"
+
 	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 )
@@ -55,4 +57,27 @@ func (v *cachedView) Get(namespace, key string) (*blocks.WriteRecord, error) {
 	return rec, err
 }
 
+// Reopen produces a fresh cachedView layered over a fresh underlying view
+// (latest committed state) while keeping the SAME live cross-batch cache
+// (in-flight write-cache + read-only MFU). It implements
+// execution.ReopenableReadStore so the pipelined authoritative pass reads
+// current committed state instead of warm's now-stale pinned view: the live
+// write-cache still shadows in-flight hot keys, the underlying reopened view
+// reuses warm's already-fetched cold reads, and any key neither cached nor
+// in-flight is re-resolved against the fresh view. The underlying view must be
+// reopenable (query.View is; the production read path always is).
+func (v *cachedView) Reopen() (execution.ReadStore, error) {
+	ru, ok := v.under.(execution.ReopenableReadStore)
+	if !ok {
+		return nil, fmt.Errorf("cached view: underlying read store %T is not reopenable", v.under)
+	}
+	freshUnder, err := ru.Reopen()
+	if err != nil {
+		return nil, err
+	}
+	return &cachedView{cache: v.cache, under: freshUnder}, nil
+}
+
 func (v *cachedView) Close() error { return v.under.Close() }
+
+var _ execution.ReopenableReadStore = (*cachedView)(nil)

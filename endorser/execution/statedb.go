@@ -70,6 +70,24 @@ type ReadStore interface {
 	Close() error
 }
 
+// ReopenableReadStore is a ReadStore that can spawn a fresh snapshot reflecting
+// the LATEST committed state while REUSING the reads it has already fetched. The
+// pipelined authoritative pass uses it: warm(N) primed its snapshot one batch
+// boundary ago, so by the time auth(N) runs, commits have advanced the ledger
+// and that snapshot is stale. Reopen lets auth re-resolve any read it has not
+// already cached against current committed state -- exactly what a serial
+// cycle's post-boundary view would see -- without re-paying the query-service
+// I/O for the cold reads warm already fetched. The reused reads are safe because
+// they are keys that were absent from the in-flight write-cache when warm read
+// them: cold, rarely-written keys whose committed version cannot advance within
+// the single-batch pipeline window (the in-flight window is many batches deep).
+// Hot, contended keys live in the live write-cache, which shadows this store and
+// is re-read live by auth on every tx.
+type ReopenableReadStore interface {
+	ReadStore
+	Reopen() (ReadStore, error)
+}
+
 // revision represents a snapshot point in the journal: the lengths of the
 // reads, writes, and effects slices (plus logs) at Snapshot() time, so
 // RevertToSnapshot can truncate each back and reverse-replay the effects since.

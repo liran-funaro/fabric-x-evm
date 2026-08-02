@@ -252,6 +252,23 @@ func (r *Reader) Get(namespace, key string) (*blocks.WriteRecord, error) {
 	return nil, nil
 }
 
+// Reopen returns a fresh Reader pinned to the store's LATEST committed snapshot,
+// implementing execution.ReopenableReadStore so the pipelined authoritative pass
+// reads current committed state rather than warm's now-stale snapshot. Unlike
+// query.View, a Reader has no per-view read cache (LightKVS reads are in-memory
+// map lookups), so there is nothing to reuse -- the fresh Reader simply observes
+// the newest snapshot. The original Reader is untouched; the caller Closes the
+// returned one.
+func (r *Reader) Reopen() (execution.ReadStore, error) {
+	if r.Snapshot == nil {
+		return nil, errors.New("reader is closed")
+	}
+	return &Reader{
+		Snapshot: r.Kvs.Current.Load(),
+		Kvs:      r.Kvs,
+	}, nil
+}
+
 // Close releases the reader's reference to its snapshot.
 // After Close(), the reader cannot be used for further Get operations.
 // This allows Go's GC to clean up the snapshot if no other readers reference it.
@@ -259,6 +276,8 @@ func (r *Reader) Close() error {
 	r.Snapshot = nil
 	return nil
 }
+
+var _ execution.ReopenableReadStore = (*Reader)(nil)
 
 // Update atomically applies a batch of updates to the store.
 // All updates are applied together in a single new snapshot.

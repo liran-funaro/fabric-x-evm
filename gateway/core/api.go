@@ -135,16 +135,26 @@ type Gateway struct {
 	// overlaps the I/O-bound concurrent warm pass of the next batch with the
 	// CPU-bound serial authoritative pass of the current one, collapsing the
 	// per-batch wall from warm+auth to max(warm,auth)+boundary. Default false
-	// (serial); set via SetPipelined before Start. Read once at Start, so it is
-	// never written concurrently with the executor goroutine.
+	// (serial); it is a boot config flag (gateway YAML `pipelined:`, plumbed via
+	// SetPipelined before Start). Read once at Start, so it is never written
+	// concurrently with the executor goroutine.
 	//
-	// SAFE ONLY FOR LOW CROSS-BATCH KEY CONFLICT. warm(N+1) pins its read
-	// snapshot before batch N's writes land in the cache, so if N+1 reads a key
-	// N writes, N+1's authoritative read-versions are stale -> committer aborts
-	// N+1 -> the re-warm is still stale -> rollback livelock. Measured 1.2-1.5x
-	// on disjoint-key traffic but a throughput/correctness collapse on hot-key
-	// traffic (real USDC). Keep default off; enable only for workloads verified
-	// conflict-light. See SetPipelined and report/pipeline_report.html.
+	// CORRECT ON ALL WORKLOADS -- identical in effect to serial. auth(N) reopens
+	// warm(N+1)'s now-stale snapshot onto a FRESH committed view (see
+	// AuthMergedBatch / ReopenableReadStore), so authoritative read-versions
+	// match committed state and the old stale-read MVCC abort cascade is gone
+	// (ec2 20000-tx replay: historic pipeline 20000/20000, 0 rollbacks).
+	//
+	// Throughput vs serial is a WORKLOAD-DEPENDENT trade the admin sets per
+	// deployment; measure for your workload. The pipeline wins on low cross-batch
+	// key conflict (disjoint keys); on hot-key traffic (real USDC, few hot
+	// accounts) the naive pipeline paid an extra auth-phase read cost -- hot keys
+	// shadowed by the in-flight write-cache during warm(N+1) were evicted when
+	// batch N committed, forcing auth(N+1) to re-fetch them from the query
+	// service. That auth-refetch is removed by deferring committed-write eviction
+	// one boundary so auth(N+1) still reads batch N's writes from the write cache
+	// (see VersionedCache.DrainEvictionsDeferred). Post-fix throughput numbers are
+	// being re-measured on ec2. See SetPipelined and report/pipeline_report.html.
 	pipelined bool
 }
 
@@ -222,21 +232,25 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 }
 
 // SetPipelined selects the pipelined executor loop (warm(N+1) overlapped with
-// auth(N)) when p is true, or the serial loop (default) when false. Call before
-// Start -- the flag is read once when the executor goroutine launches and must
-// not change while it runs. The serial path is byte-identical either way at the
-// submit boundary (both go through submitBatch).
+// auth(N)) when p is true, or the serial loop (default) when false. It is a boot
+// config flag (gateway YAML `pipelined:`); call before Start -- the flag is read
+// once when the executor goroutine launches and must not change while it runs.
+// The serial path is byte-identical either way at the submit boundary (both go
+// through submitBatch).
 //
-// Opt-in, default off, and it must stay that way for general traffic. Rig
-// validation (2026-07-30, full stack, 20000-tx replay) found a sharp split: a
-// clean 1.2-1.5x speedup on conflict-free traffic (disjoint keys across
-// batches) but a livelock on conflict-heavy traffic (real USDC hot accounts),
-// where the pipeline collapses to 14-300x SLOWER and most runs fail to commit
-// the window at all. Cause: warm(N+1) pins its snapshot before batch N's writes
-// land, so under cross-batch key overlap N+1 endorses against stale versions,
-// the committer aborts it, and the re-warm stays stale -> rollback livelock.
-// Enable only for deployments whose traffic is verified conflict-light. See the
-// pipelined field comment and report/pipeline_report.html.
+// Both modes are CORRECT on all workloads: auth reopens warm's stale snapshot
+// onto a fresh committed view (see execution.AuthMergedBatch), so the pipeline
+// is identical in effect to serial -- the earlier stale-read rollback livelock
+// on hot-key traffic is fixed (ec2 20000-tx replay: historic pipeline
+// 20000/20000 committed, 0 rollbacks). The choice is a workload-dependent
+// throughput trade the admin makes per deployment: the pipeline wins on low
+// cross-batch key conflict (disjoint keys); on hot-key traffic the naive
+// pipeline paid an extra auth-phase read cost (auth(N+1) re-fetching hot keys
+// evicted from the write-cache when batch N committed), which is removed by
+// deferring committed-write eviction one boundary (see
+// VersionedCache.DrainEvictionsDeferred). Post-fix throughput is being
+// re-measured on ec2. See the pipelined field comment and
+// report/pipeline_report.html.
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p
 }

@@ -124,6 +124,55 @@ func TestVersionedCache_EvictOnLatestWriterInvalidate(t *testing.T) {
 	}
 }
 
+// In pipeline mode, a committed batch's writes are held for ONE extra boundary
+// so the immediately-following authoritative pass still reads them from the
+// write cache. First DrainEvictionsDeferred after the commit keeps k; the
+// second drops it. Invalidations are never deferred (see the next test).
+func TestVersionedCache_DeferredCommittedEvictionHoldsOneBoundary(t *testing.T) {
+	c := NewVersionedCache()
+	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v1")}}))
+	c.NoteCommitted("tx1")
+
+	// Boundary 1: tx1 just committed -> its write is HELD, not yet evicted.
+	if inv := c.DrainEvictionsDeferred(); len(inv) != 0 {
+		t.Fatalf("want no invalidations, got %v", inv)
+	}
+	if _, ok := c.Read("k"); !ok {
+		t.Fatal("k evicted at the commit boundary; must be held one extra boundary")
+	}
+	if got := c.Len(); got != 1 {
+		t.Fatalf("want Len()==1 (k held), got %d", got)
+	}
+
+	// Boundary 2: the held committed set is now applied -> k evicted.
+	if inv := c.DrainEvictionsDeferred(); len(inv) != 0 {
+		t.Fatalf("want no invalidations, got %v", inv)
+	}
+	if _, ok := c.Read("k"); ok {
+		t.Fatal("k not evicted at the boundary after the hold")
+	}
+	if got := c.Len(); got != 0 {
+		t.Fatalf("want Len()==0 after deferred eviction, got %d", got)
+	}
+}
+
+// Invalidated writes must never be visible to auth, so DrainEvictionsDeferred
+// drops them on the SAME boundary (no one-boundary hold), and returns them so
+// the caller can rebuild the cache from survivors.
+func TestVersionedCache_DeferredInvalidationIsImmediate(t *testing.T) {
+	c := NewVersionedCache()
+	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v1")}}))
+	c.NoteInvalidated("tx1")
+
+	inv := c.DrainEvictionsDeferred()
+	if len(inv) != 1 || inv[0] != "tx1" {
+		t.Fatalf("want invalidated=[tx1], got %v", inv)
+	}
+	if _, ok := c.Read("k"); ok {
+		t.Fatal("invalidated write must be evicted immediately, not deferred")
+	}
+}
+
 // Deletes are recorded (IsDelete) and versioned like writes.
 func TestVersionedCache_Delete(t *testing.T) {
 	c := NewVersionedCache()

@@ -326,10 +326,15 @@ func (g *Gateway) drainAndWarm(ctx context.Context) *WarmedBatch {
 func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *WarmedBatch {
 	// Boundary prep: apply queued commit/abort evictions (rebuilding the cache
 	// from survivors if any invalidation dropped a key an earlier survivor also
-	// wrote) and run the read-only cache's MFU maintenance, exactly as the serial
-	// cycle does at its top. Safe here: no warm reads are in flight, so these
-	// structural cache mutations never race a concurrent warm.
-	if _, invalidated := g.cache.DrainEvictions(); len(invalidated) > 0 {
+	// wrote) and run the read-only cache's MFU maintenance. Safe here: no warm
+	// reads are in flight, so these structural cache mutations never race a
+	// concurrent warm. Unlike the serial cycle, this uses the DEFERRED drain:
+	// invalidations still drop immediately, but a committed batch's writes are
+	// held one extra boundary so auth(N+1) -- whose warm pass ran one iteration
+	// ago and therefore never primed those keys into the query-view read cache --
+	// still reads them from this write cache rather than re-fetching from the
+	// query service (see VersionedCache.DrainEvictionsDeferred).
+	if invalidated := g.cache.DrainEvictionsDeferred(); len(invalidated) > 0 {
 		g.rebuildCacheFromInflight()
 	}
 	g.cache.MaintainReadOnly()

@@ -45,6 +45,11 @@ type VersionedCache struct {
 	committed   []string
 	invalidated []string
 
+	// committedHeld is the one-boundary delay buffer for committed-write eviction
+	// on the pipelined path (see DrainEvictionsDeferred). Touched only at the
+	// boundary on the executor goroutine, so it needs no lock.
+	committedHeld []string
+
 	// ro is the optional cross-batch read-only cache for hot, rarely-written
 	// committed records (nil unless EnableReadOnlyCache was called). It sits
 	// BELOW this in-flight write cache in the read path (write-cache ->
@@ -179,24 +184,68 @@ func (c *VersionedCache) DrainEvictions() (committed, invalidated []string) {
 	committed, invalidated = c.committed, c.invalidated
 	c.committed, c.invalidated = nil, nil
 	c.evictMu.Unlock()
-	if len(committed) == 0 && len(invalidated) == 0 {
+	c.dropByWriter(committed, invalidated)
+	return
+}
+
+// DrainEvictionsDeferred is the pipelined-path variant of DrainEvictions. It
+// applies invalidations immediately (an aborted write must never be visible to
+// the authoritative pass), but holds each committed batch's writes for ONE extra
+// boundary before evicting them. This preserves the pipeline's read-layering
+// invariant: auth(N+1) runs one iteration after warm(N+1), which primed the
+// query-view read cache while N's writes were still served from THIS write cache
+// (so warm never fetched/primed them). Without the hold, the top-of-iteration
+// eviction would drop N's just-committed writes before auth(N+1) reads them,
+// forcing a fresh query-service fetch -- a new miss in the auth phase. Holding
+// them one boundary lets auth(N+1) read them here. Reading a committed batch's
+// entry is identical in effect to reading committed state: its spec version
+// equals the committed version, so the recorded MVCC read-version matches
+// committed and no abort results.
+//
+// Returns the invalidated set only; committed evictions no longer drive a
+// rebuild. Call ONLY at a batch boundary on the executor goroutine.
+//
+// Cascade interaction (rare, perf-only): committed batches leave the in-flight
+// registry immediately (resolveInflight), so a rebuildCacheFromInflight after an
+// invalidation reconstructs from survivors and does not restore a held-committed
+// batch's writes. auth then re-reads those keys from the query view at their
+// committed version -- correct, just a cache miss. Invalidations are ~0 on the
+// workloads this targets, so this residual is immaterial.
+func (c *VersionedCache) DrainEvictionsDeferred() (invalidated []string) {
+	c.evictMu.Lock()
+	committedNow := c.committed
+	invalidated = c.invalidated
+	c.committed, c.invalidated = nil, nil
+	c.evictMu.Unlock()
+	// Apply the committed set held from the PREVIOUS boundary plus all
+	// invalidations now; hold this boundary's committed set for the next call.
+	c.dropByWriter(c.committedHeld, invalidated)
+	c.committedHeld = committedNow
+	return invalidated
+}
+
+// dropByWriter deletes every cache entry whose writerTx is in any of the given
+// TxID sets. Runs at the boundary on the executor goroutine, so the scan needs
+// no lock (see VersionedCache).
+func (c *VersionedCache) dropByWriter(sets ...[]string) {
+	n := 0
+	for _, s := range sets {
+		n += len(s)
+	}
+	if n == 0 {
 		return
 	}
-	drop := make(map[string]struct{}, len(committed)+len(invalidated))
-	for _, id := range committed {
-		drop[id] = struct{}{}
+	drop := make(map[string]struct{}, n)
+	for _, s := range sets {
+		for _, id := range s {
+			drop[id] = struct{}{}
+		}
 	}
-	for _, id := range invalidated {
-		drop[id] = struct{}{}
-	}
-	// entries is mutated only here at the boundary on the executor goroutine, so
-	// the drop scan needs no lock (see VersionedCache).
 	for k, e := range c.entries {
 		if _, ok := drop[e.writerTx]; ok {
 			delete(c.entries, k)
 		}
 	}
-	return
 }
 
 // Len reports the number of in-flight entries. Test/observability helper; like

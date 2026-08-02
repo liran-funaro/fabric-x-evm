@@ -113,6 +113,15 @@ type WarmedBatch struct {
 	timing  bool // evm.batch at debug level: measure read load per phase
 	counted *countingReader
 
+	// Pipelined authoritative pass only (set by AuthMergedBatch when the reader
+	// is reopenable). warm's snapshot is one batch boundary stale by auth time,
+	// so auth reads a FRESH view (authReader) reflecting current committed state
+	// -- reusing warm's cold reads via the shared read cache (see
+	// ReopenableReadStore). Nil for the serial path, which reuses readSrc.
+	authReader  ReadStore       // fresh reopened snapshot; closed by Close
+	authSrc     ReadStore       // authReader, or a countingReader wrapping it (debug timing)
+	authCounted *countingReader // counts the auth pass's reads on authReader (debug timing)
+
 	snapDur       time.Duration
 	warmDur       time.Duration
 	warmReads     int64
@@ -130,6 +139,11 @@ func (wb *WarmedBatch) Close() error {
 	wb.closeOnce.Do(func() {
 		if wb.reader != nil {
 			_ = wb.reader.Close()
+		}
+		// The pipelined auth pass reads a fresh reopened view (a distinct
+		// query-service view) that must be ended too, or it leaks.
+		if wb.authReader != nil {
+			_ = wb.authReader.Close()
 		}
 	})
 	return nil
@@ -290,7 +304,13 @@ func (e *EVMEngine) authBatch(wb *WarmedBatch) ([]endorsement.ExecutionResult, e
 	defer wb.Close()
 
 	txs := wb.txs
+	// The pipelined path reopens warm's stale snapshot onto a fresh view and
+	// sets authSrc (see AuthMergedBatch); the serial path leaves it nil and
+	// reuses warm's still-fresh view.
 	readSrc := wb.readSrc
+	if wb.authSrc != nil {
+		readSrc = wb.authSrc
+	}
 
 	// Authoritative pass: sequential, each tx against the snapshot plus an
 	// overlay carrying every earlier tx's writes from this batch.
@@ -361,8 +381,15 @@ func (e *EVMEngine) authBatch(wb *WarmedBatch) ([]endorsement.ExecutionResult, e
 	// single line that says which phase dominates and why. Guarded by wb.timing:
 	// only reached when evm.batch is at debug level (counted is non-nil).
 	if wb.timing {
+		// Serial reuses warm's counted reader, so auth reads are the delta since
+		// the warm/auth boundary. The pipelined path reads a separate reopened
+		// reader (authCounted), whose own totals ARE the auth reads.
 		authReads := wb.counted.n.Load() - wb.warmReads
 		authReadNanos := wb.counted.nanos.Load() - wb.warmReadNanos
+		if wb.authCounted != nil {
+			authReads = wb.authCounted.n.Load()
+			authReadNanos = wb.authCounted.nanos.Load()
+		}
 		batchLogger.Debugf("ENDORSE-TIMING n=%d snapshot=%s warm=%s{reads=%d readtime=%s} auth=%s{reads=%d readtime=%s cpu=%s}",
 			len(txs),
 			wb.snapDur.Round(time.Microsecond),
@@ -410,6 +437,28 @@ func (e *EVMEngine) authBatch(wb *WarmedBatch) ([]endorsement.ExecutionResult, e
 // PerTxOutcome per sub-tx. For the same txs it is byte-identical to
 // ExecuteMergedBatch(txs), only with the warm pass already run separately.
 func (e *EVMEngine) AuthMergedBatch(ctx context.Context, wb *WarmedBatch) (endorsement.ExecutionResult, []PerTxOutcome, error) {
+	// Pipelined authoritative pass: warm's snapshot was opened one batch boundary
+	// ago (WarmBatch(N) overlaps auth(N-1)), so by now commits have advanced the
+	// ledger and it is stale. Reopen it onto a FRESH view reflecting current
+	// committed state, so auth reads exactly what a serial cycle's post-boundary
+	// view would -- eliminating the stale-read MVCC aborts that livelock the
+	// pipeline on conflict-heavy traffic -- while reusing warm's already-fetched
+	// cold reads via the shared read cache (see ReopenableReadStore). This makes
+	// pipelined auth read-identical to serial auth. Stores that cannot reopen
+	// (e.g. the in-memory test KVS) fall back to reusing warm's view.
+	if r, ok := wb.reader.(ReopenableReadStore); ok {
+		fresh, err := r.Reopen()
+		if err != nil {
+			return endorsement.ExecutionResult{}, nil, err
+		}
+		wb.authReader = fresh // closed by wb.Close()
+		wb.authSrc = fresh
+		if wb.timing {
+			wb.authCounted = &countingReader{under: fresh}
+			wb.authSrc = wb.authCounted
+		}
+	}
+
 	results, err := e.authBatch(wb)
 	if err != nil {
 		return endorsement.ExecutionResult{}, nil, err
