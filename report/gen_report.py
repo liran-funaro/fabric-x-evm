@@ -163,6 +163,8 @@ def build_html(R):
     .cap{font-size:12px;color:#6b7580;margin:2px 0 10px}
     .note{background:#f7f9fc;border-left:3px solid #2f6fed;padding:10px 14px;margin:14px 0;font-size:14px;border-radius:0 6px 6px 0}
     .warn{background:#fdf5f4;border-left:3px solid #c0392b;padding:10px 14px;margin:14px 0;font-size:14px;border-radius:0 6px 6px 0}
+    .win{background:#f4fbf6;border-left:3px solid #1a9a52;padding:10px 14px;margin:14px 0;font-size:14px;border-radius:0 6px 6px 0}
+    .caution{background:#fff8ec;border-left:3px solid #e8710a;padding:10px 14px;margin:14px 0;font-size:14px;border-radius:0 6px 6px 0}
     .good{color:#1a9a52;font-weight:600} .bad{color:#c0392b;font-weight:600}
     code{background:#f0f2f4;padding:1px 5px;border-radius:4px;font-size:12.5px}
     footer{margin-top:56px;color:#96a0aa;font-size:12px;border-top:1px solid #eef0f2;padding-top:12px}
@@ -179,11 +181,16 @@ def build_html(R):
     for ds in R["datasets"]:
         h = R["headline"][ds]
         v = verdict.get(ds, {})
-        if v.get("safe"):
+        # The KPI is the headline AT THE CHOSEN operating batch size, so it is
+        # gated on headline_safe (committed at chosen bs), not the strict
+        # all-batch-size `safe`. A dataset can win cleanly here yet still
+        # livelock at other batch sizes -- that caveat lives in the banner and
+        # the batch-size scan, not this card.
+        if v.get("headline_safe", v.get("safe")):
             spd = h["on"] / h["off"] if h["off"] else 0
             out.append(f"<div class='card ok'><div class='n'>{spd:.2f}×</div>"
-                       f"<div class='l'><b>{ds}</b>: pipeline speedup<br>({_fmt(h['off'])} → {_fmt(h['on'])} tx/s) "
-                       f"· 20000/20000</div></div>")
+                       f"<div class='l'><b>{ds}</b>: pipeline speedup at bs={R['meta']['chosen_bs']}<br>"
+                       f"({_fmt(h['off'])} → {_fmt(h['on'])} tx/s) · 20000/20000</div></div>")
         else:
             out.append(f"<div class='card fail'><div class='n'>FAILS</div>"
                        f"<div class='l'><b>{ds}</b>: livelock under MVCC conflict<br>"
@@ -192,9 +199,23 @@ def build_html(R):
     out.append("</div>")
 
     # Verdict banner -- the one-line takeaway, stated before anything else.
+    # Prose comes from R["bottom_line"]; the banner is green when every dataset
+    # passes the correctness gate, red otherwise.
     syn_safe = verdict.get("synthetic", {}).get("safe")
     hist_safe = verdict.get("historic", {}).get("safe")
-    if syn_safe and hist_safe is False:
+    bl = R.get("bottom_line")
+    if bl:
+        # Three-way: green when every dataset commits at EVERY batch size;
+        # amber ("caution") when every dataset commits at the chosen operating
+        # point but at least one livelocks at some other batch size (the
+        # threshold case); red when a dataset fails even at the chosen point.
+        all_safe = all(verdict.get(ds, {}).get("safe") for ds in R["datasets"])
+        head_safe = all(verdict.get(ds, {}).get("headline_safe",
+                                                 verdict.get(ds, {}).get("safe"))
+                        for ds in R["datasets"])
+        cls = "win" if all_safe else "caution" if head_safe else "warn"
+        out.append(f"<div class='{cls}'>{bl}</div>")
+    elif syn_safe and hist_safe is False:
         out.append("<div class='warn'><b>Bottom line:</b> the pipeline is a clean win on the conflict-free "
                    "synthetic workload but <b>fails</b> on the conflict-heavy historic workload. It stays gated "
                    "behind <code>Gateway.Pipelined</code> with a <b>default of off</b>.</div>")
@@ -220,8 +241,12 @@ def build_html(R):
          ("pipelined (on)", COL_ON, [R["headline"][d]["on"] for d in groups])],
         "Throughput — serial vs pipelined", "EVM tx/s", width=520, height=340)
     out.append(f"<div class='charts'>{bar}</div>")
-    # Caption flags any dataset whose pipelined bar failed the correctness gate.
-    failed = [ds for ds in groups if not verdict.get(ds, {}).get("safe")]
+    # Caption flags any dataset whose pipelined bar (at the chosen bs) failed
+    # the correctness gate. Uses headline_safe: the bars are at the chosen bs,
+    # so a dataset that commits there but livelocks at other batch sizes is not
+    # flagged here (that caveat is in the batch-size scan below).
+    failed = [ds for ds in groups
+              if not verdict.get(ds, {}).get("headline_safe", verdict.get(ds, {}).get("safe"))]
     if failed:
         parts = "; ".join(
             f"<b>{ds}</b> pipelined = {_fmt(R['headline'][ds]['on'])} tx/s but only "
@@ -266,11 +291,17 @@ def build_html(R):
             out.append(f"<tr{cls}><td class='l'>{r['bs']}</td><td>{_fmt(r['off'])}</td><td>{_fmt(r['on'])}</td>"
                        f"<td>{sp}</td><td>{ok}</td><td>{rbc}</td></tr>")
         out.append("</table>")
+        # Per-dataset threshold note (e.g. historic livelocks below the floor).
+        note = R.get("batch_note", {}).get(ds)
+        if note:
+            out.append(f"<div class='caution'>{note}</div>")
 
-    # Root cause (only meaningful when a dataset failed; render whenever present)
-    if R.get("root_cause"):
-        out.append("<h2>Root cause — why the pipeline fails on conflict-heavy workloads</h2>")
-        for p in R["root_cause"]:
+    # Mechanism -- how the pipeline stays correct AND fast under MVCC conflict
+    # (the auth read-layering fix). Falls back to the legacy root_cause key.
+    mech = R.get("mechanism") or R.get("root_cause")
+    if mech:
+        out.append("<h2>Mechanism — how auth stays correct and fast under MVCC conflict</h2>")
+        for p in mech:
             out.append(f"<p>{p}</p>")
 
     # WW scan (optional)
@@ -279,9 +310,10 @@ def build_html(R):
         out.append("<p>Why this parameter: the warm pass primes the per-view read cache concurrently before the "
                    "serial authoritative pass. Too few workers under-overlap I/O; too many add EVM-construction and "
                    "GC churn. We confirm the code default (warm workers = batch size) is at/near the throughput knee "
-                   "under the pipeline. This scan is run on the <b>synthetic</b> workload only — the workload where "
-                   "the pipeline is usable; on the historic workload the pipeline livelocks regardless of "
-                   "warm-worker count, so tuning it there is moot.</p>")
+                   "under the pipeline. This scan is run on the <b>synthetic</b> workload only, where the pipeline "
+                   "commits cleanly at every batch size; the warm-worker knee is a conflict-free property the auth "
+                   "read-layering fix does not move. The historic operating point is governed instead by the "
+                   "batch-size correctness floor (see the batch-size scan), not by warm concurrency.</p>")
         for ds in R["datasets"]:
             if ds not in R["ww_scan"]:
                 continue

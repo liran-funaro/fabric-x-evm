@@ -139,22 +139,35 @@ type Gateway struct {
 	// SetPipelined before Start). Read once at Start, so it is never written
 	// concurrently with the executor goroutine.
 	//
-	// CORRECT ON ALL WORKLOADS -- identical in effect to serial. auth(N) reopens
-	// warm(N+1)'s now-stale snapshot onto a FRESH committed view (see
-	// AuthMergedBatch / ReopenableReadStore), so authoritative read-versions
-	// match committed state and the old stale-read MVCC abort cascade is gone
-	// (ec2 20000-tx replay: historic pipeline 20000/20000, 0 rollbacks).
+	// IDENTICAL IN EFFECT TO SERIAL -- but only within one batch boundary.
+	// auth(N) reopens warm(N+1)'s now-stale snapshot onto a FRESH committed view
+	// (see AuthMergedBatch / ReopenableReadStore), so authoritative read-versions
+	// match committed state and the old stale-read MVCC abort cascade is gone for
+	// reads that resolve within the pipeline's depth-1 window.
 	//
-	// Throughput vs serial is a WORKLOAD-DEPENDENT trade the admin sets per
-	// deployment; measure for your workload. The pipeline wins on low cross-batch
-	// key conflict (disjoint keys); on hot-key traffic (real USDC, few hot
-	// accounts) the naive pipeline paid an extra auth-phase read cost -- hot keys
-	// shadowed by the in-flight write-cache during warm(N+1) were evicted when
-	// batch N committed, forcing auth(N+1) to re-fetch them from the query
-	// service. That auth-refetch is removed by deferring committed-write eviction
-	// one boundary so auth(N+1) still reads batch N's writes from the write cache
-	// (see VersionedCache.DrainEvictionsDeferred). Post-fix throughput numbers are
-	// being re-measured on ec2. See SetPipelined and report/pipeline_report.html.
+	// The naive pipeline also paid an extra auth-phase READ cost on hot-key
+	// traffic: hot keys served from the in-flight write-cache during warm(N+1)
+	// were evicted the moment batch N committed, forcing auth(N+1) to re-fetch
+	// them from the query service -- a new miss in the auth phase. Two mechanisms
+	// remove it so auth(N+1) reads batch N's writes from the write cache
+	// regardless of eviction timing: committed writes are held one extra boundary
+	// (VersionedCache.DrainEvictionsDeferred) AND auth replays a frozen per-batch
+	// snapshot of the warm-pass write-set as a read fallback below the live cache
+	// (VersionedCache.SnapshotEntries -> cachedView.warmWrites).
+	//
+	// RESIDUAL (depth-1): both mechanisms extend exactly ONE boundary, so a hot
+	// key written by batch N, NOT rewritten by N+1, and read by N+2 falls outside
+	// the window -- auth(N+2) then reads a version that can be stale vs committed
+	// and aborts. Immaterial when hot keys are rewritten every batch; on
+	// conflict-heavy traffic with SMALL batches it reopens the abort livelock.
+	//
+	// Measured on ec2 (32-core, full stack, 20000-tx replay, batch size 128-4096):
+	// synthetic (conflict-free) is a WIN at every batch size (1.17-1.49x, all
+	// 20000/20000, 0 rb). Historic (hot-key USDC) LIVELOCKS at bs<=256 (e.g. bs=128:
+	// 975/20000 committed, 2682 rolled-back batches, 16 tx/s) and is a clean win at
+	// bs>=512 (1.04-1.28x); at bs=1024 both commit 20000/20000, 0 rollbacks (~1.25x).
+	// Default stays false (serial) as the conservative baseline; if enabled, keep
+	// bs>=512 (see report/pipeline_report.html). See SetPipelined.
 	pipelined bool
 }
 
@@ -238,18 +251,19 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // The serial path is byte-identical either way at the submit boundary (both go
 // through submitBatch).
 //
-// Both modes are CORRECT on all workloads: auth reopens warm's stale snapshot
-// onto a fresh committed view (see execution.AuthMergedBatch), so the pipeline
-// is identical in effect to serial -- the earlier stale-read rollback livelock
-// on hot-key traffic is fixed (ec2 20000-tx replay: historic pipeline
-// 20000/20000 committed, 0 rollbacks). The choice is a workload-dependent
-// throughput trade the admin makes per deployment: the pipeline wins on low
-// cross-batch key conflict (disjoint keys); on hot-key traffic the naive
-// pipeline paid an extra auth-phase read cost (auth(N+1) re-fetching hot keys
-// evicted from the write-cache when batch N committed), which is removed by
-// deferring committed-write eviction one boundary (see
-// VersionedCache.DrainEvictionsDeferred). Post-fix throughput is being
-// re-measured on ec2. See the pipelined field comment and
+// auth reopens warm's stale snapshot onto a fresh committed view (see
+// execution.AuthMergedBatch) and replays batch N's writes for one boundary, so
+// the pipeline is identical in effect to serial for reads within that depth-1
+// window: the earlier stale-read rollback livelock is fixed and the follow-on
+// auth-phase refetch cost removed (committed writes held one boundary + a frozen
+// warm-write snapshot replayed in auth; see the pipelined field comment). The
+// coverage is NOT unconditional, though -- a hot key written by N, skipped by
+// N+1, read by N+2 falls outside depth-1, so on conflict-heavy traffic with
+// small batches the abort livelock returns. Measured on ec2 (20000-tx replay,
+// batch size 128-4096): synthetic wins at every batch size (1.17-1.49x);
+// historic livelocks at bs<=256 and is a clean win at bs>=512 (1.04-1.28x; at
+// bs=1024 both 20000/20000, 0 rollbacks, ~1.25x). Default stays false; if
+// enabled, keep bs>=512. See the pipelined field comment and
 // report/pipeline_report.html.
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p

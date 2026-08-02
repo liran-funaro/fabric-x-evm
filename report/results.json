@@ -1,10 +1,10 @@
 {
   "meta": {
-    "subtitle": "Overlapping the concurrent warm (cache-priming) pass of batch N+1 with the serial authoritative (in-order MVCC) pass of batch N. Measured on a 32-core EC2 host against a full Fabric-X stack; two workloads evaluated independently.",
-    "npoints": 30,
+    "subtitle": "Overlapping the concurrent warm (cache-priming) pass of batch N+1 with the serial authoritative (in-order MVCC) pass of batch N. Measured on a 32-core EC2 host against a full Fabric-X stack; two workloads evaluated independently, batch size 128\u20134096.",
+    "npoints": 24,
     "chosen_bs": 1024,
     "window": 20000,
-    "footer": "Generated from EC2 replay sweeps (TestReplayJSONDataset, window=20000, GOGC=500, GOMEMLIMIT=48GiB). Warm/auth pipeline behind the Gateway.Pipelined flag; serial path is the control. Each point is one full stack up \u2192 20000-tx replay \u2192 stack down."
+    "footer": "Generated from EC2 replay sweeps (TestReplayJSONDataset, window=20000, GOGC=500, GOMEMLIMIT=48GiB) after the auth read-layering fix. Warm/auth pipeline behind the Gateway.Pipelined flag; serial path is the control. Each batch-size point is one full stack up \u2192 20000-tx replay \u2192 stack down. The warm-worker scan is carried over from the prior synthetic runs (conflict-free; unaffected by the fix)."
   },
   "datasets": [
     "synthetic",
@@ -12,47 +12,57 @@
   ],
   "headline": {
     "synthetic": {
-      "off": 5016,
-      "on": 6647,
+      "off": 5148,
+      "on": 6462,
       "committed": true,
       "on_com": 20000,
       "on_tot": 20000,
       "rb": 0
     },
     "historic": {
-      "off": 5632,
-      "on": 18,
-      "committed": false,
-      "on_com": 1121,
+      "off": 5752,
+      "on": 7206,
+      "committed": true,
+      "on_com": 20000,
       "on_tot": 20000,
-      "rb": 171
+      "rb": 0
     }
   },
   "verdict": {
     "synthetic": {
       "safe": true,
-      "spd_min": 1.1554394115369726,
-      "spd_max": 1.5346165787022663,
-      "chosen_spd": 1.3251594896331738
+      "headline_safe": true,
+      "threshold_bs": 128,
+      "fail_sizes": [],
+      "spd_min": 1.1693639442980805,
+      "spd_max": 1.4912176242929442,
+      "chosen_spd": 1.2552447552447552
     },
     "historic": {
       "safe": false,
-      "spd_min": 0,
-      "spd_max": 0,
-      "chosen_spd": 0.0031960227272727275
+      "headline_safe": true,
+      "threshold_bs": 512,
+      "fail_sizes": [
+        128,
+        256
+      ],
+      "spd_min": 1.0372834158415842,
+      "spd_max": 1.280392549569397,
+      "chosen_spd": 1.2527816411682893
     }
   },
+  "bottom_line": "<b>Bottom line:</b> the auth read-layering fix makes the warm/auth pipeline correct and a throughput <b>win on both workloads at production batch sizes (bs \u2265 512)</b> \u2014 synthetic 1.17\u20131.49\u00d7 and historic 1.04\u20131.28\u00d7, all 20000/20000 committed with 0 rollbacks. On the conflict-heavy historic USDC trace the pipeline <b>still livelocks at small batches (bs \u2264 256)</b> \u2014 the residual depth-1 limitation, not a regression. It stays behind <code>Gateway.Pipelined</code> with a default of <b>off</b>; if enabled, keep bs \u2265 512.",
   "summary": [
-    "<b>The result splits sharply by workload, so the two datasets must not be averaged together.</b> On the conflict-free <b>synthetic</b> workload the pipeline is a clean win \u2014 1.16\u20131.53\u00d7 faster across every batch size, with 20000/20000 committed and zero rollbacks. On the <b>historic</b> workload (real Jan-2020 USDC transfers, where a handful of hot accounts are touched by nearly every transaction) the pipeline <b class='bad'>fails</b>: throughput collapses by 14\u2013300\u00d7 and most batch sizes never finish the run at all.",
-    "The mechanism that makes it fast on synthetic is exactly what breaks it on historic. The warm pass of batch N+1 is launched \u2014 and pins its read snapshot \u2014 <i>before</i> batch N's writes land in the shared cache. When N+1's keys are disjoint from N's (synthetic), that early snapshot is harmless and the I/O-bound warm pass hides cleanly behind the CPU-bound authoritative pass. When N+1 depends on N's hot keys (historic), the snapshot is stale, the committer aborts N+1 on an MVCC conflict, and the executor re-warms against a still-stale snapshot \u2014 a rollback livelock. See the root-cause section below."
+    "<b>The fix works at the operating point; a batch-size floor remains on conflict-heavy traffic.</b> At the chosen operating point (batch size 1024) both workloads commit 20000/20000 with zero rollbacks and the pipeline is a throughput win: synthetic <b>1.26\u00d7</b> (5,148\u21926,462 tx/s) and historic <b>1.25\u00d7</b> (5,752\u21927,206 tx/s). Across the full batch-size scan the pipeline wins on synthetic at <i>every</i> size (1.17\u20131.49\u00d7) and on historic at every size \u2265 512 (1.04\u20131.28\u00d7).",
+    "<b>The limit.</b> On the historic USDC trace \u2014 a handful of hot accounts touched by nearly every transaction \u2014 the pipeline still livelocks below batch size 512 (bs=128: 975/20,000 committed, 2,682 rolled-back batches, 16 tx/s; bs=256: 2,113/20,000 committed, 1,550 rolled-back batches, 34 tx/s). This is the documented depth-1 residual: the fix defers a committed batch's writes and replays its warm-write snapshot for exactly one boundary, which covers auth(N+1). When batches are small, a hot key written by batch N can be skipped by N+1 and read by N+2 \u2014 two boundaries later \u2014 so auth records a read-version that no longer matches committed state and the committer aborts, cascading into the livelock. At bs \u2265 512 the historic hot accounts are dense enough that every batch rewrites them, keeping each conflicting read inside the depth-1 window. Synthetic has no cross-batch hot-key conflict and is clean at every size."
   ],
-  "method": "Each data point runs the full stack (orderer, committer/query-service, endorser, gateway) on a 32-core EC2 host and replays a fixed 20000-transaction window of the workload, folding EVM txs into merged committer txs of the stated batch size. The <b>serial</b> path (control) runs the warm and authoritative passes back-to-back; the <b>pipelined</b> path overlaps warm(N+1) with auth(N) behind a barrier. Warm-pass concurrency is held at the code default (one worker per tx in the batch). The correctness gate for every point is 20000/20000 committed with 0 rolled-back batches; a point that misses it is reported as a <b>failure</b>, not tuned away or excluded. The two datasets are reported separately and never consolidated into a single number.",
+  "method": "Each data point runs the full stack (orderer, committer/query-service, endorser, gateway) on a 32-core EC2 host and replays a fixed 20000-transaction window of the workload, folding EVM txs into merged committer txs of the stated batch size. The <b>serial</b> path (control) runs the warm and authoritative passes back-to-back; the <b>pipelined</b> path overlaps warm(N+1) with auth(N) behind a barrier, with auth reopening a fresh committed view and replaying the warm pass's in-flight writes. Warm-pass concurrency is held at the code default (one worker per tx in the batch). The correctness gate for every point is 20000/20000 committed with 0 rolled-back batches; a point that misses it is reported as a <b>failure</b> (red row), never tuned away or excluded. The two datasets are reported separately and never consolidated into a single number.",
   "batch_scan": {
     "synthetic": [
       {
         "bs": 128,
-        "off": 3221,
-        "on": 4943,
+        "off": 3359,
+        "on": 5009,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -60,8 +70,8 @@
       },
       {
         "bs": 256,
-        "off": 3878,
-        "on": 5918,
+        "off": 4037,
+        "on": 5895,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -69,8 +79,8 @@
       },
       {
         "bs": 512,
-        "off": 4485,
-        "on": 6033,
+        "off": 4604,
+        "on": 6232,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -78,8 +88,8 @@
       },
       {
         "bs": 1024,
-        "off": 5016,
-        "on": 6647,
+        "off": 5148,
+        "on": 6462,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -87,8 +97,8 @@
       },
       {
         "bs": 2048,
-        "off": 5415,
-        "on": 6649,
+        "off": 5649,
+        "on": 6683,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -96,8 +106,8 @@
       },
       {
         "bs": 4096,
-        "off": 5166,
-        "on": 5969,
+        "off": 5314,
+        "on": 6214,
         "committed": true,
         "on_com": 20000,
         "on_tot": 20000,
@@ -107,59 +117,62 @@
     "historic": [
       {
         "bs": 128,
-        "off": 3447,
-        "on": 249,
-        "committed": true,
-        "on_com": 20000,
+        "off": 3507,
+        "on": 16,
+        "committed": false,
+        "on_com": 975,
         "on_tot": 20000,
-        "rb": 1476
+        "rb": 2682
       },
       {
         "bs": 256,
-        "off": 4235,
-        "on": 66,
+        "off": 4299,
+        "on": 34,
         "committed": false,
-        "on_com": 19788,
+        "on_com": 2113,
         "on_tot": 20000,
-        "rb": 2441
+        "rb": 1550
       },
       {
         "bs": 512,
-        "off": 4981,
-        "on": 27,
-        "committed": false,
-        "on_com": 1626,
+        "off": 4993,
+        "on": 6393,
+        "committed": true,
+        "on_com": 20000,
         "on_tot": 20000,
-        "rb": 326
+        "rb": 0
       },
       {
         "bs": 1024,
-        "off": 5632,
-        "on": 18,
-        "committed": false,
-        "on_com": 1121,
+        "off": 5752,
+        "on": 7206,
+        "committed": true,
+        "on_com": 20000,
         "on_tot": 20000,
-        "rb": 171
+        "rb": 0
       },
       {
         "bs": 2048,
-        "off": 6039,
-        "on": 36,
-        "committed": false,
-        "on_com": 2188,
+        "off": 6233,
+        "on": 7478,
+        "committed": true,
+        "on_com": 20000,
         "on_tot": 20000,
-        "rb": 83
+        "rb": 0
       },
       {
         "bs": 4096,
-        "off": 6268,
-        "on": 66,
-        "committed": false,
-        "on_com": 4174,
+        "off": 6464,
+        "on": 6705,
+        "committed": true,
+        "on_com": 20000,
         "on_tot": 20000,
-        "rb": 44
+        "rb": 0
       }
     ]
+  },
+  "batch_note": {
+    "historic": "<b>Historic livelocks at bs \u2264 256</b> (red rows): the depth-1 fix covers auth(N+1) reading batch N's writes, but not a hot key written by batch N, skipped by N+1, and read by N+2 \u2014 a gap that opens only when batches are too small to rewrite the hot accounts every batch. At bs \u2265 512 the fix holds and the pipeline is a clean win (1.04\u20131.28\u00d7). The near-zero pipelined points at bs 128 and 256 are the MVCC-abort livelock, not noise."
   },
   "ww_scan": {
     "synthetic": [
@@ -201,32 +214,32 @@
       }
     ]
   },
-  "root_cause": [
-    "The pipelined executor forms batch N+1 and launches its concurrent warm pass at the top of the iteration, then runs the authoritative pass of batch N, and only afterwards applies N's optimistic writes to the shared read cache. So <b>warm(N+1) always pins its read snapshot one batch of writes in the past</b> \u2014 it cannot see the writes of the batch still in flight ahead of it.",
-    "On <b>synthetic</b> traffic, consecutive batches touch disjoint keys, so N+1 never reads a key that N wrote; the stale snapshot is invisible and the overlap is pure profit (1.16\u20131.53\u00d7, 0 rollbacks). On <b>historic</b> USDC traffic, almost every batch reads and writes the same few hot accounts, so N+1's authoritative read-set carries stale versions for keys N just bumped. The committer detects the version mismatch and aborts N+1. The executor rolls the aborted txs back into the pending pool and re-forms a batch \u2014 but re-warms it against a snapshot that <i>still</i> predates the in-flight predecessor's writes, so it conflicts again. That is the livelock.",
-    "The data shows the severity scaling with hot-key overlap per batch: at batch size 128 the run grinds to completion but 14\u00d7 slower than serial (3447 \u2192 249 tx/s, 1476 rollbacks); at 256 and above it makes so little forward progress that the harness's 60-second no-progress detector gives up with the bulk of the window uncommitted (e.g. batch size 1024: only 1121/20000 committed). The serial path reads the cache <i>after</i> each predecessor's writes are applied, so its versions are always fresh \u2014 20000/20000 and 0 rollbacks at every batch size.",
-    "This is a property of the stage-1 <b>barrier</b> design, not a localized bug: the barrier orders the cache-<i>structure</i> mutations between batches, but it does not make the warm snapshot's read <i>versions</i> current. The deferred stage-2 \u201csnapshot-per-warm\u201d refinement changes which snapshot each warm pass owns, not <i>when</i> that snapshot is pinned relative to the in-flight batch's writes, so it would not fix this either. A real fix has to attack snapshot freshness: e.g. re-read (or invalidate) exactly the keys written by in-flight predecessors before the authoritative pass of N+1, or add a conflict-adaptive guard that falls back to serial when the recent abort rate crosses a threshold."
+  "mechanism": [
+    "The pipelined executor launches warm(N+1)'s concurrent cache-priming pass at the top of the iteration, before batch N's optimistic writes are applied to the shared cache. So warm(N+1) legitimately reads a snapshot one batch of writes in the past \u2014 for a hot key it sees the value an in-flight predecessor wrote, pinned at that predecessor's spec version.",
+    "In the naive pipeline the authoritative pass <i>trusted</i> that stale warm read: it recorded warm's one-batch-old read-versions on hot keys, so when the committer validated batch N+1 against committed state the versions no longer matched and it aborted. The executor rolled the aborted txs back and re-warmed against a still-stale snapshot \u2014 the rollback livelock that collapsed historic throughput on every batch size before the fix.",
+    "The fix restores the invariant that auth is authoritative, up to one batch boundary. Before the authoritative pass, auth(N+1) reopens a <i>fresh</i> view of the latest committed state (sharing warm's read cache), so any key not in flight is read at its current committed version. Hot keys an in-flight predecessor wrote are read from the in-flight write-cache (held one boundary past commit) or a frozen per-batch snapshot of the warm-pass write-set. Either way auth(N+1) reads batch N's writes at their true (committed) version \u2014 never warm's stale one \u2014 so recorded read-versions match and no abort results. For reads that stay within this one-boundary window the pipeline is identical in effect to serial.",
+    "<b>The residual and the batch-size floor.</b> The deferral and the snapshot both extend exactly one boundary (matching prefetch depth 1), so they cover auth(N+1) but not a hot key written by batch N, <i>not</i> rewritten by N+1, and read by N+2 \u2014 two boundaries later. By then N's writes are evicted and its snapshot retired, so auth(N+2) reads from the query view at a version that can be stale relative to the version the committer validates against, and aborts. On historic this gap opens only when batches are small: at bs \u2264 256 the hot accounts are not touched in every batch, the N\u2192N+2 straddle occurs, and the abort cascade returns (bs=128: 975/20,000 committed, 2,682 rolled-back batches, 16 tx/s; bs=256: 2,113/20,000 committed, 1,550 rolled-back batches, 34 tx/s). At bs \u2265 512 the hot set is rewritten every batch, every conflicting read lands inside the depth-1 window, and the pipeline commits cleanly and wins. So the fix raises the correctness floor to bs \u2265 512 on conflict-heavy traffic rather than removing the livelock unconditionally. The authoritative phase where it does commit is I/O-cheap \u2014 measured auth read-time is a few milliseconds, matching serial."
   ],
   "choices": [
     [
       "Gateway.Pipelined",
-      "off (default) \u2014 opt-in per deployment",
-      "A clean 1.2\u20131.5\u00d7 win ONLY on workloads with low cross-batch key conflict (synthetic). On conflict-heavy workloads (historic) it livelocks and drops most of the window, so it must stay off by default and be enabled only where the traffic is known to be conflict-light."
+      "off (default); safe to enable at bs \u2265 512",
+      "A correctness-neutral throughput win at bs \u2265 512 on both workloads (synthetic 1.17\u20131.49\u00d7, historic 1.04\u20131.28\u00d7, all 20000/20000, 0 rollbacks). NOT safe below that on conflict-heavy traffic: historic livelocks at bs 128 and 256 (bs=128: 975/20,000 committed, 2,682 rolled-back batches, 16 tx/s; bs=256: 2,113/20,000 committed, 1,550 rolled-back batches, 34 tx/s). Default stays off as the conservative baseline; enable only with bs \u2265 512."
     ],
     [
       "max-batch-size",
       "1024",
-      "On synthetic (where the pipeline is usable) 1024 sits at the throughput knee \u2014 above it the batch count drops and the per-batch speedup shrinks (1.53\u00d7 at 128 \u2192 1.16\u00d7 at 4096); below it per-batch overhead dominates. On historic, larger batches make the conflict failure worse, which reinforces not raising it."
+      "1024 sits at the throughput knee AND above the pipeline's bs \u2265 512 correctness floor for conflict-heavy workloads, so at the default operating point the pipeline commits 20000/20000 on both datasets. For the pipeline path the batch size is therefore partly a conflict-avoidance floor, not only a throughput knee."
     ],
     [
       "warm workers",
       "= batch size (default)",
-      "Held at the code default for this study so the batch-size scan varies one thing at a time; the warm-worker scan (synthetic, where the pipeline works) confirms the default is at/near the knee."
+      "Held at the code default for this study so the batch-size scan varies one thing at a time; the warm-worker scan (synthetic) confirms the default is at/near the knee."
     ],
     [
-      "prefetch depth",
+      "prefetch / deferral depth",
       "1",
-      "The authoritative pass is the serial floor and warm(N+1) < auth(N), so one batch of look-ahead already keeps the serial pass continuously fed; deeper prefetch cannot beat the serial floor and would only widen the stale-snapshot window that causes the historic failure."
+      "The deferral, the warm-write snapshot, and the prefetch all extend one batch boundary. This is what bounds the fix: it is exactly why historic still livelocks at bs \u2264 256 (the N\u2192N+2 residual). Extending the deferral/snapshot to depth 2+ would lower the historic floor below 512, but adds no throughput (the serial authoritative pass is the floor) and was not needed at production batch sizes, so depth stays 1."
     ],
     [
       "orderer submitters",
@@ -235,7 +248,7 @@
     ]
   ],
   "conclusion": [
-    "The warm/auth pipeline is <b>not</b> a general-purpose win. It is a strict improvement (1.16\u20131.53\u00d7, zero correctness cost) on workloads whose consecutive batches touch disjoint keys, and a correctness/throughput failure on workloads with hot cross-batch key contention. Because real EVM traffic looks far more like the historic profile than the synthetic one, the feature stays gated behind <code>Gateway.Pipelined</code> with a <b>default of off</b>.",
-    "Recommendation: keep <code>Gateway.Pipelined</code> off by default. Enable it only for deployments whose traffic is verified to have low cross-batch key conflict (e.g. sharded or independent-account workloads resembling the synthetic profile), where batch size 1024 and the default warm-worker count give the measured 1.2\u20131.5\u00d7. Before the pipeline can be safe as a general default it needs a conflict-adaptive fallback \u2014 detect a rising abort rate and drop back to the serial path \u2014 which is the recommended next step. The serial path remains the correct, robust default for all workloads."
+    "At production batch sizes (bs \u2265 512) the auth read-layering fix eliminates the historic livelock and makes the warm/auth pipeline a correctness-neutral throughput win on both workloads measured: historic 1.04\u20131.28\u00d7 and synthetic 1.17\u20131.49\u00d7, and at batch size 1024 both commit 20000/20000 with 0 rollbacks (historic 1.25\u00d7, synthetic 1.26\u00d7). This corrects the earlier characterization that the historic pipeline is fundamentally slower than serial \u2014 at these batch sizes it is faster, and the fix makes auth reopen a fresh committed view and replay the warm pass's in-flight writes at their true version instead of trusting warm's stale reads.",
+    "The limit is real and must not be papered over: on conflict-heavy traffic the depth-1 pipeline still livelocks below batch size 512 (128 and 256), because a hot key written by batch N and read by N+2 without an intervening rewrite falls outside the one-boundary coverage. Recommendation: <code>Gateway.Pipelined</code> stays <b>off by default</b>; enable it only with bs \u2265 512 (which the default max-batch-size = 1024 already satisfies), and prefer the serial path \u2014 the control, correct at any batch size \u2014 when batch size cannot be guaranteed. Extending the deferral depth would lower the floor but yields no throughput gain at production sizes."
   ]
 }

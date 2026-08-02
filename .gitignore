@@ -50,3 +50,6 @@ integration/perf/*.json
 
 # unit-test coverage profile (uploaded to Codecov in CI)
 coverage.out
+
+# Python bytecode cache (report generators under report/)
+__pycache__/
