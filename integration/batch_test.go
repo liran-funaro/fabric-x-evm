@@ -782,3 +782,91 @@ func TestBatchGenuineAbort(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, big.NewInt(0).Mul(value, big.NewInt(2)), recipientBal, "recipient got exactly 2*value")
 }
+
+// TestBatchPipelinedHotKeyNoStaleReadCascade is the end-to-end guard for the
+// pipelined-auth read fix. It drives a HOT-KEY, IN-ORDER workload -- N sequential
+// value transfers from one funded sender to one recipient, so every batch reads
+// and writes the same sender and recipient accounts -- through the pipelined
+// executor at the smallest batch size (one EVM tx per committer batch), with the
+// production single-submitter ordering. Because submission is in nonce order and
+// there is NO external (non-EVM) traffic, the authoritative pass must always read
+// state consistent with what the committer validates against, so NOT ONE batch
+// may MVCC-abort: node.CascadeCount() must stay 0 while real pipelining occurs
+// (MaxInflightObserved >= 2, i.e. the executor overlaps warm(N+1) with auth(N)
+// and does not serialize on commit).
+//
+// Scope: this is the end-to-end assertion that the SHIPPED pipeline does not
+// self-abort on hot-key in-order traffic. It is NOT the deterministic reproduction
+// of the stale-read bug: in a tight in-order chain the live in-flight write cache
+// shadows the hot keys during the warm pass, so the async-commit-window timing
+// that surfaces a stale reopened read is not forced in-process (verified: this
+// test stays green even with the View.Reopen shared-cache bug reintroduced). The
+// deterministic root-cause reproduction lives at the unit layer
+// (endorser/query.TestViewReopenReflectsLatestCommittedForCachedKey, which is RED
+// on that bug); the definitive scale proof is the ec2 replay (all batch sizes
+// commit fully with 0 rollbacks). The fix makes auth reopen onto a FRESH committed
+// view carrying no stale reads, so pipelined auth is read-identical to serial auth
+// at any prefetch depth (see execution.AuthMergedBatch / ReopenableReadStore,
+// query.View.Reopen).
+func TestBatchPipelinedHotKeyNoStaleReadCascade(t *testing.T) {
+	// Pipelined executor + single ordered submitter (the production clamp): warm(N+1)
+	// overlaps auth(N), and dependent batches reach the orderer in nonce order.
+	th, err := NewLocalTestHarness(t, TestLogger{T: t}, evmConfig(""), "", "fabric-x",
+		map[string]any{"Gateway.Pipelined": true, "Gateway.SubmitterCount": 1})
+	require.NoError(t, err)
+	t.Cleanup(func() { th.Stop() })
+
+	node := th.Gateways[0]
+	node.SetMaxBatchSize(1) // one EVM tx per committer batch -> N txs == N pipelined batches
+	ec, err := NewNativeEthClient(node)
+	require.NoError(t, err)
+	ctx := t.Context()
+
+	_, recipient := newBatchSender(t)
+	priv, addr := newBatchSender(t)
+	primer, err := th.NewStatePrimer()
+	require.NoError(t, err)
+	require.NoError(t, primer.SetBalance(addr, big.NewInt(1_000_000_000)).Commit(ctx, true))
+
+	const n = 40
+	value := big.NewInt(1000)
+	txs := make([]*types.Transaction, n)
+	for i := range txs {
+		txs[i] = signedValueTransfer(t, th.ethChainConfig, priv, uint64(i), recipient, value)
+	}
+
+	// Submit all in nonce order WITHOUT awaiting each commit, so the executor keeps
+	// several batches in flight (the async commit window) -- the regime where a
+	// stale-read auth would abort. Then wait for every tx to commit.
+	for _, tx := range txs {
+		require.NoErrorf(t, ec.SendTransaction(ctx, tx), "SendTransaction(nonce %d)", tx.Nonce())
+	}
+	for _, tx := range txs {
+		waitForCommitT(t, ec, tx)
+	}
+
+	// The core invariant: no batch was MVCC-aborted, so the gateway never cascaded.
+	require.Equal(t, 0, node.CascadeCount(),
+		"in-order hot-key pipelined traffic must not produce a single stale-read abort")
+	require.Eventually(t, func() bool { return node.InflightLen() == 0 },
+		10*time.Second, 5*time.Millisecond, "in-flight registry must drain")
+
+	// Real pipelining actually happened (otherwise the 0-cascade result is vacuous).
+	require.GreaterOrEqualf(t, node.MaxInflightObserved(), 2,
+		"executor must overlap batches (MaxInflightObserved=%d)", node.MaxInflightObserved())
+
+	// Every transfer applied exactly once: all receipts successful, nonce advanced to
+	// n, and the recipient received exactly n*value.
+	for _, tx := range txs {
+		receipt, err := ec.TransactionReceipt(ctx, tx.Hash())
+		require.NoErrorf(t, err, "TransactionReceipt(%s)", tx.Hash())
+		require.Equalf(t, types.ReceiptStatusSuccessful, receipt.Status, "tx %s status", tx.Hash())
+	}
+	finalNonce, err := ec.NonceAt(ctx, addr, nil)
+	require.NoError(t, err)
+	require.Equal(t, uint64(n), finalNonce, "sender nonce must advance to n (every tx applied once)")
+
+	recipientBal, err := ec.BalanceAt(ctx, recipient, nil)
+	require.NoError(t, err)
+	require.Equal(t, big.NewInt(0).Mul(value, big.NewInt(n)), recipientBal, "recipient got exactly n*value")
+}

@@ -23,18 +23,24 @@ type entry struct {
 // later batch can execute on them before they commit. It holds ONLY in-flight
 // writes (cold committed reads are served by the per-batch query view). Bounded
 // by the executor's in-flight window; entries drop when their writer commits.
-// Concurrency contract: entries (and roEvictPending) are STRUCTURALLY MUTATED
-// only at the batch boundary on the single executor goroutine -- ApplyWrites,
-// DrainEvictions, Rebuild, and MaintainReadOnly all run there, between batches,
-// when no warm-pass worker is in flight. They are READ concurrently only during
-// a batch (Read, on warm-pass workers). Reads and writes therefore never
-// overlap, and the happens-before edge is supplied for free by the executor's
-// wg.Wait() (joins all warm workers before the boundary mutates) and the
-// go-spawn that starts the next batch (boundary writes -> spawn -> next batch's
-// reads). No mutex guards entries; adding a writer OUTSIDE the boundary would
-// break this invariant and require reintroducing one. Only committed/invalidated
-// (queued asynchronously by notification handlers) need their own lock.
+//
+// Concurrency: entries is STRUCTURALLY MUTATED only at the batch boundary on the
+// single executor goroutine (ApplyWrites, DrainEvictions/Deferred, Rebuild), but
+// it is READ from goroutines that are NOT synchronized with that boundary. Two
+// classes of reader exist: warm-pass workers during a batch, AND -- crucially --
+// RPC handler goroutines running transaction validation (SendTransaction ->
+// ValidateTx -> Gateway.NonceAt/BalanceAt -> cachedView.Get -> Read), which fire
+// whenever a client submits and can land at the exact instant the executor is
+// mutating entries. Those RPC reads have no wg.Wait()/go-spawn happens-before
+// edge to the boundary, so entries is guarded by mu: readers (Read, Len) take
+// RLock and the boundary mutators take Lock. The write side is single-writer
+// (executor goroutine only), so RLock holders never contend with each other and
+// the exclusive Lock is taken only briefly at the boundary. committed/invalidated
+// stay under the separate evictMu (queued asynchronously by notification
+// handlers); committedHeld and roEvictPending are touched only at the boundary on
+// the executor goroutine and need no lock.
 type VersionedCache struct {
+	mu      sync.RWMutex // guards entries against concurrent RPC-validation reads
 	entries map[string]entry
 
 	// committed/invalidated TxIDs queued by notification handlers off the
@@ -77,7 +83,9 @@ func (c *VersionedCache) EnableReadOnlyCache(capacity int, threshold uint64) {
 }
 
 func (c *VersionedCache) Read(key string) (*blocks.WriteRecord, bool) {
+	c.mu.RLock()
 	e, ok := c.entries[key]
+	c.mu.RUnlock()
 	if !ok {
 		return nil, false
 	}
@@ -91,7 +99,9 @@ func (c *VersionedCache) Read(key string) (*blocks.WriteRecord, bool) {
 // which is correct for read-modify-write workloads (every written key is read
 // first). A key already cached takes cachedSpec+1.
 func (c *VersionedCache) ApplyWrites(txID string, r blocks.ReadWriteSet) {
+	c.mu.Lock()
 	c.apply(txID, r)
+	c.mu.Unlock()
 	// Queue this batch's written keys for read-only-cache eviction at the next
 	// boundary: once these commit, their committed version advances, so any
 	// read-only entry for them would be stale. Evicting one boundary after the
@@ -138,10 +148,10 @@ func (c *VersionedCache) MaintainReadOnly() {
 	c.ro.maintain(evict)
 }
 
-// apply records tx's writes into c.entries at deterministic spec versions. Runs
-// only at the batch boundary on the executor goroutine -- via ApplyWrites, or
-// via Rebuild re-applying survivors -- so it needs no lock (see VersionedCache).
-// See ApplyWrites for the spec-version rules.
+// apply records tx's writes into c.entries at deterministic spec versions. The
+// caller MUST hold c.mu for writing (ApplyWrites and Rebuild both do); apply
+// mutates and reads c.entries directly and takes no lock itself. See ApplyWrites
+// for the spec-version rules.
 func (c *VersionedCache) apply(txID string, r blocks.ReadWriteSet) {
 	readVer := make(map[string]*blocks.Version, len(r.Reads))
 	for _, rd := range r.Reads {
@@ -225,8 +235,9 @@ func (c *VersionedCache) DrainEvictionsDeferred() (invalidated []string) {
 }
 
 // dropByWriter deletes every cache entry whose writerTx is in any of the given
-// TxID sets. Runs at the boundary on the executor goroutine, so the scan needs
-// no lock (see VersionedCache).
+// TxID sets. Runs at the boundary on the executor goroutine; it takes c.mu for
+// writing because concurrent RPC-validation Reads may be in flight (see
+// VersionedCache).
 func (c *VersionedCache) dropByWriter(sets ...[]string) {
 	n := 0
 	for _, s := range sets {
@@ -241,49 +252,21 @@ func (c *VersionedCache) dropByWriter(sets ...[]string) {
 			drop[id] = struct{}{}
 		}
 	}
+	c.mu.Lock()
 	for k, e := range c.entries {
 		if _, ok := drop[e.writerTx]; ok {
 			delete(c.entries, k)
 		}
 	}
+	c.mu.Unlock()
 }
 
-// Len reports the number of in-flight entries. Test/observability helper; like
-// the rest of the cache it must be called at the boundary (no batch in flight).
+// Len reports the number of in-flight entries. Test/observability helper; takes
+// the read lock so it is safe to call while RPC-validation reads are in flight.
 func (c *VersionedCache) Len() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return len(c.entries)
-}
-
-// SnapshotEntries returns a frozen, independent copy of the current in-flight
-// write cache: one WriteRecord per key (value + spec version), detached from the
-// live cache so later ApplyWrites/eviction never mutate it. Returns nil when
-// empty. Like Read/DrainEvictions it touches c.entries, so it must be called
-// only at a batch boundary on the executor goroutine, when no warm-pass worker
-// is in flight (see VersionedCache's concurrency contract).
-//
-// The pipelined executor takes this snapshot at each warm launch and hands it to
-// the batch's authoritative pass (see cachedView.warmWrites): it is exactly the
-// write-cache view the warm pass could read. By auth time the batches it
-// captured may have committed and evicted from the live cache, and warm never
-// primed those keys into the query view (it served them from the write cache),
-// so the reopened committed view would re-fetch them cold. Replaying them from
-// this frozen copy at their spec version -- which equals the committed version
-// for a committed batch, so the recorded MVCC read-version matches committed --
-// confines pipeline-induced cache misses to the warm phase, never the auth
-// phase. (A captured batch that later ABORTS is safe too: the replayed value's
-// stale read-version fails MVCC validation at commit, so that batch simply
-// re-tries -- never a wrong commit; and its retry re-snapshots a clean cache.
-// Invalidations are ~0 on the workloads this targets.)
-func (c *VersionedCache) SnapshotEntries() map[string]*blocks.WriteRecord {
-	if len(c.entries) == 0 {
-		return nil
-	}
-	m := make(map[string]*blocks.WriteRecord, len(c.entries))
-	for k, e := range c.entries {
-		rec := e.rec // copy the record; shares the immutable Value bytes (as Read does)
-		m[k] = &rec
-	}
-	return m
 }
 
 // ReapplySpec is one in-flight batch's writes for a cache rebuild, given in
@@ -304,9 +287,12 @@ type ReapplySpec struct {
 // have had if the invalidated batches had never applied. The cache only ever
 // holds in-flight writes (committed reads come from the query view), so
 // rebuilding from empty is complete. Runs at the batch boundary on the executor
-// goroutine (like every other entries mutation), so no concurrent reader ever
-// observes a partially-rebuilt cache.
+// goroutine (like every other entries mutation); it holds c.mu for writing across
+// the whole swap-and-reapply so a concurrent RPC-validation reader never observes
+// a partially-rebuilt cache.
 func (c *VersionedCache) Rebuild(batches []ReapplySpec) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.entries = make(map[string]entry, len(c.entries))
 	for _, b := range batches {
 		c.apply(b.TxID, b.RWS)

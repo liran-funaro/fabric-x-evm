@@ -97,25 +97,31 @@ func (v *View) Get(namespace, key string) (*blocks.WriteRecord, error) {
 }
 
 // Reopen begins a FRESH query-service view -- reflecting the latest committed
-// state -- that SHARES this view's read cache. Cached reads (committed values
-// this view already fetched) are reused as-is; only keys not yet cached hit the
-// new view. It implements execution.ReopenableReadStore for the pipelined
-// authoritative pass: warm(N) primed this view against a snapshot that is now
-// one batch-boundary stale, so auth must re-resolve any UNCACHED read against
-// current committed state, while still reusing warm's cached cold reads for
-// speed. See execution.ReopenableReadStore for why the shared cache is safe.
+// state -- with its OWN empty read cache. It implements
+// execution.ReopenableReadStore for the pipelined authoritative pass: warm(N)
+// primed its view against a snapshot that, by auth(N) time, is stale (in-flight
+// predecessor batches have since committed and advanced the ledger). The auth
+// pass must therefore read a NEW view and re-resolve every read against current
+// committed state -- it must NOT reuse the warm pass's cached reads, because a
+// key warm cold-read at some version can be advanced by an in-flight commit
+// before auth records its MVCC read-version; a shared cache would serve that
+// stale version and the committer would abort the batch under exact-equality
+// MVCC. (Safe cross-batch reuse of hot cold reads is provided separately, at the
+// gateway layer, by the write-eviction-safe read-only cache in VersionedCache --
+// which the reopened cachedView keeps -- not by sharing this per-view map.)
 //
-// The returned view SHARES the cache map (not a copy): warm(N) has completed and
-// been joined before auth(N) reopens, and warm(N+1) uses its own separate view,
-// so auth is the sole accessor of this map -- the fresh view's own mutex guards
-// its (single-goroutine) reads and any new admissions. The caller must Close the
-// returned view; Close-ing the original ends only the original's (stale) viewID.
+// The caller must Close the returned view; Close-ing the original ends only the
+// original's (stale) viewID.
 func (v *View) Reopen() (execution.ReadStore, error) {
 	viewID, err := v.client.BeginView(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return &View{client: v.client, viewID: viewID, cache: v.cache}, nil
+	return &View{
+		client: v.client,
+		viewID: viewID,
+		cache:  make(map[string]*blocks.WriteRecord),
+	}, nil
 }
 
 // Close ends the view.

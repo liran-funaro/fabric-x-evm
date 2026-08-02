@@ -149,23 +149,6 @@ func (wb *WarmedBatch) Close() error {
 	return nil
 }
 
-// SetWarmWrites installs the frozen warm-pass write snapshot onto this batch's
-// read store, so the authoritative pass can replay -- at their spec version --
-// the in-flight keys the warm pass read from the cross-batch write cache before
-// they committed and evicted (see WarmWriteReplayer). The pipelined executor
-// calls it once, AFTER WarmBatch has returned (its warm workers already joined),
-// so warm never observes the snapshot; only the reopened auth view does, because
-// cachedView.Reopen carries it. No-op if the read store cannot replay (e.g. a
-// remote endorser, whose read cache is out of process) or the snapshot is empty.
-func (wb *WarmedBatch) SetWarmWrites(w map[string]*blocks.WriteRecord) {
-	if wb == nil || len(w) == 0 {
-		return
-	}
-	if r, ok := wb.reader.(WarmWriteReplayer); ok {
-		r.SetWarmWrites(w)
-	}
-}
-
 // WarmBatch opens one query-service snapshot for the batch and runs the
 // concurrent warm pass against it (results discarded), priming the snapshot
 // view's read cache before the authoritative pass. It returns the STILL-OPEN
@@ -457,11 +440,14 @@ func (e *EVMEngine) AuthMergedBatch(ctx context.Context, wb *WarmedBatch) (endor
 	// Pipelined authoritative pass: warm's snapshot was opened one batch boundary
 	// ago (WarmBatch(N) overlaps auth(N-1)), so by now commits have advanced the
 	// ledger and it is stale. Reopen it onto a FRESH view reflecting current
-	// committed state, so auth reads exactly what a serial cycle's post-boundary
-	// view would -- eliminating the stale-read MVCC aborts that livelock the
-	// pipeline on conflict-heavy traffic -- while reusing warm's already-fetched
-	// cold reads via the shared read cache (see ReopenableReadStore). This makes
-	// pipelined auth read-identical to serial auth. Stores that cannot reopen
+	// committed state, carrying NONE of warm's already-fetched reads (see
+	// ReopenableReadStore), so auth re-resolves every read against current
+	// committed state -- exactly what a serial cycle's post-boundary view would --
+	// eliminating the stale-read MVCC aborts that livelock the pipeline on
+	// conflict-heavy traffic. This makes pipelined auth read-identical to serial
+	// auth at any prefetch depth. Safe reuse of warm's hot cold reads is provided
+	// separately, by the write-eviction-safe read-only cache below the view, not by
+	// carrying this view's stale reads across the reopen. Stores that cannot reopen
 	// (e.g. the in-memory test KVS) fall back to reusing warm's view.
 	if r, ok := wb.reader.(ReopenableReadStore); ok {
 		fresh, err := r.Reopen()

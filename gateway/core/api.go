@@ -139,35 +139,30 @@ type Gateway struct {
 	// SetPipelined before Start). Read once at Start, so it is never written
 	// concurrently with the executor goroutine.
 	//
-	// IDENTICAL IN EFFECT TO SERIAL -- but only within one batch boundary.
-	// auth(N) reopens warm(N+1)'s now-stale snapshot onto a FRESH committed view
-	// (see AuthMergedBatch / ReopenableReadStore), so authoritative read-versions
-	// match committed state and the old stale-read MVCC abort cascade is gone for
-	// reads that resolve within the pipeline's depth-1 window.
+	// IDENTICAL IN EFFECT TO SERIAL, at ANY prefetch depth. auth(N) does not read
+	// warm(N+1)'s pinned snapshot: it reopens onto a FRESH committed view (see
+	// AuthMergedBatch / ReopenableReadStore), and that view carries NO stale read
+	// cache of its own (query.View.Reopen opens an empty one). So the authoritative
+	// read path is exactly: the live cross-batch in-flight write cache (shadows
+	// hot keys still in flight), then the write-eviction-safe read-only MFU cache
+	// (VersionedCache.readOnlyGet, evicted on any write to a key), then the fresh
+	// committed view. Every one of those layers reflects state at or newer than
+	// the committed version an authoritative read must see, so recorded MVCC
+	// read-versions match committed and the old stale-read abort cascade cannot
+	// occur -- regardless of how many batches are in flight. This removes the
+	// former depth-1 correctness bound entirely; with no external (non-EVM)
+	// traffic the pipeline never livelocks at any batch size.
 	//
-	// The naive pipeline also paid an extra auth-phase READ cost on hot-key
-	// traffic: hot keys served from the in-flight write-cache during warm(N+1)
-	// were evicted the moment batch N committed, forcing auth(N+1) to re-fetch
-	// them from the query service -- a new miss in the auth phase. Two mechanisms
-	// remove it so auth(N+1) reads batch N's writes from the write cache
-	// regardless of eviction timing: committed writes are held one extra boundary
-	// (VersionedCache.DrainEvictionsDeferred) AND auth replays a frozen per-batch
-	// snapshot of the warm-pass write-set as a read fallback below the live cache
-	// (VersionedCache.SnapshotEntries -> cachedView.warmWrites).
+	// VersionedCache.DrainEvictionsDeferred (holding a committed batch's writes one
+	// extra boundary) is kept purely as a read-locality optimization -- a committed
+	// batch's spec version equals its committed version, so serving its write from
+	// the cache is identical in effect to reading committed state -- NOT as a
+	// correctness requirement; auth is correct without it via the read-only cache
+	// and the fresh view above.
 	//
-	// RESIDUAL (depth-1): both mechanisms extend exactly ONE boundary, so a hot
-	// key written by batch N, NOT rewritten by N+1, and read by N+2 falls outside
-	// the window -- auth(N+2) then reads a version that can be stale vs committed
-	// and aborts. Immaterial when hot keys are rewritten every batch; on
-	// conflict-heavy traffic with SMALL batches it reopens the abort livelock.
-	//
-	// Measured on ec2 (32-core, full stack, 20000-tx replay, batch size 128-4096):
-	// synthetic (conflict-free) is a WIN at every batch size (1.17-1.49x, all
-	// 20000/20000, 0 rb). Historic (hot-key USDC) LIVELOCKS at bs<=256 (e.g. bs=128:
-	// 975/20000 committed, 2682 rolled-back batches, 16 tx/s) and is a clean win at
-	// bs>=512 (1.04-1.28x); at bs=1024 both commit 20000/20000, 0 rollbacks (~1.25x).
-	// Default stays false (serial) as the conservative baseline; if enabled, keep
-	// bs>=512 (see report/pipeline_report.html). See SetPipelined.
+	// Default stays false (serial) as the conservative baseline. Throughput is
+	// being re-measured on ec2 after this read-path fix; see SetPipelined and
+	// report/pipeline_report.html for the current numbers.
 	pipelined bool
 }
 
@@ -251,20 +246,16 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // The serial path is byte-identical either way at the submit boundary (both go
 // through submitBatch).
 //
-// auth reopens warm's stale snapshot onto a fresh committed view (see
-// execution.AuthMergedBatch) and replays batch N's writes for one boundary, so
-// the pipeline is identical in effect to serial for reads within that depth-1
-// window: the earlier stale-read rollback livelock is fixed and the follow-on
-// auth-phase refetch cost removed (committed writes held one boundary + a frozen
-// warm-write snapshot replayed in auth; see the pipelined field comment). The
-// coverage is NOT unconditional, though -- a hot key written by N, skipped by
-// N+1, read by N+2 falls outside depth-1, so on conflict-heavy traffic with
-// small batches the abort livelock returns. Measured on ec2 (20000-tx replay,
-// batch size 128-4096): synthetic wins at every batch size (1.17-1.49x);
-// historic livelocks at bs<=256 and is a clean win at bs>=512 (1.04-1.28x; at
-// bs=1024 both 20000/20000, 0 rollbacks, ~1.25x). Default stays false; if
-// enabled, keep bs>=512. See the pipelined field comment and
-// report/pipeline_report.html.
+// auth reopens warm's stale snapshot onto a FRESH committed view (see
+// execution.AuthMergedBatch / ReopenableReadStore) that carries no stale read
+// cache, so authoritative reads resolve against the live in-flight write cache,
+// the write-eviction-safe read-only cache, and current committed state -- never
+// a pinned-stale version. The pipeline is therefore identical in effect to
+// serial at ANY prefetch depth (not just depth-1): with no external (non-EVM)
+// traffic the stale-read MVCC abort cascade cannot occur and the pipeline never
+// livelocks, at any batch size. See the pipelined field comment. Default stays
+// false; throughput is being re-measured on ec2 after this read-path fix (see
+// report/pipeline_report.html).
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p
 }

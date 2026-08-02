@@ -262,32 +262,6 @@ type WarmedBatch struct {
 // executor can Release their pending-pool reservation at the boundary.
 func (w *WarmedBatch) Txs() []*types.Transaction { return w.txs }
 
-// warmWriteSetter is the optional capability a per-endorser warmed handle
-// exposes to accept the frozen warm-pass write snapshot (see
-// execution.WarmedBatch.SetWarmWrites). The embedded endorser's handle is an
-// *execution.WarmedBatch and implements it; a remote endorser's handle does not
-// (its read cache lives out of process), so the fan-out simply skips it.
-type warmWriteSetter interface {
-	SetWarmWrites(map[string]*blocks.WriteRecord)
-}
-
-// SetWarmWrites hands the frozen warm-pass write snapshot to every per-endorser
-// handle that can accept it. The pipelined executor calls this right after
-// WarmBatch so the batch's authoritative pass can replay the in-flight keys the
-// warm pass read from the write cache even after they commit and evict (see
-// execution.WarmedBatch.SetWarmWrites and cachedView.warmWrites). A nil/empty
-// snapshot, or a handle that cannot accept it, is a no-op.
-func (w *WarmedBatch) SetWarmWrites(snap map[string]*blocks.WriteRecord) {
-	if w == nil || len(snap) == 0 {
-		return
-	}
-	for _, h := range w.per {
-		if s, ok := h.(warmWriteSetter); ok {
-			s.SetWarmWrites(snap)
-		}
-	}
-}
-
 // Close releases every per-endorser warmed handle. It is safe to call more than
 // once and after AuthBatch (the endorser handles' Close is idempotent), so the
 // executor can Close defensively on any abandon/error/shutdown path.

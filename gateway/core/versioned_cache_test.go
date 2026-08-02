@@ -173,48 +173,6 @@ func TestVersionedCache_DeferredInvalidationIsImmediate(t *testing.T) {
 	}
 }
 
-// SnapshotEntries returns an independent point-in-time copy of the in-flight
-// write cache: each key's current WriteRecord (value + spec version), frozen so
-// that later ApplyWrites/eviction on the cache do NOT mutate it. This is the
-// warm-pass write view the pipelined auth pass replays as a fallback (see
-// cachedView.warmWrites).
-func TestVersionedCache_SnapshotEntriesIsIndependentCopy(t *testing.T) {
-	c := NewVersionedCache()
-	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v1")}})) // ver 0
-	c.ApplyWrites("tx2", rws(nil, []blocks.KVWrite{{Key: "j", Value: []byte("j1")}})) // ver 0
-
-	snap := c.SnapshotEntries()
-	if len(snap) != 2 {
-		t.Fatalf("want 2 entries in snapshot, got %d", len(snap))
-	}
-	if rec := snap["k"]; rec == nil || string(rec.Value) != "v1" || rec.Version != 0 {
-		t.Fatalf("snapshot[k] = %+v, want {v1,ver0}", rec)
-	}
-
-	// Mutate the cache AFTER snapshotting: overwrite k, then commit+evict j.
-	c.ApplyWrites("tx3", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v2")}})) // k -> ver 1
-	c.NoteCommitted("tx2")
-	c.DrainEvictions() // evicts j from the live cache
-
-	// The snapshot is frozen: still k=v1@0, and j is still present in it.
-	if rec := snap["k"]; rec == nil || string(rec.Value) != "v1" || rec.Version != 0 {
-		t.Fatalf("snapshot[k] changed to %+v; must stay {v1,ver0}", rec)
-	}
-	if rec := snap["j"]; rec == nil || string(rec.Value) != "j1" {
-		t.Fatalf("snapshot[j] = %+v; live-cache eviction must not touch the frozen snapshot", rec)
-	}
-}
-
-// SnapshotEntries of an empty cache returns nil -- a cheap no-op for the serial
-// and single-tx paths, and for the pipeline's first warm before any write is
-// in flight.
-func TestVersionedCache_SnapshotEntriesEmptyIsNil(t *testing.T) {
-	c := NewVersionedCache()
-	if snap := c.SnapshotEntries(); snap != nil {
-		t.Fatalf("want nil snapshot for empty cache, got %v", snap)
-	}
-}
-
 // Deletes are recorded (IsDelete) and versioned like writes.
 func TestVersionedCache_Delete(t *testing.T) {
 	c := NewVersionedCache()
@@ -353,10 +311,54 @@ func TestVersionedCache_ConcurrentAccess(t *testing.T) {
 		c.DrainEvictions()
 		c.ApplyWrites(fmt.Sprintf("tx-w-%d", r),
 			rws(nil, []blocks.KVWrite{{Key: fmt.Sprintf("k%d", r%keySpace), Value: []byte("v")}}))
-		c.SnapshotEntries() // pipelined warm-launch capture: boundary-only, like Read's siblings
 		c.Len()
 	}
 
 	close(stop)
 	notifiers.Wait()
+}
+
+// TestVersionedCache_ConcurrentReadWithBoundaryMutation models the RPC
+// transaction-validation read path, which the original "reads happen only on
+// warm-pass workers, joined before the boundary" contract overlooked. A
+// SendTransaction RPC runs ValidateTx -> Gateway.NonceAt/BalanceAt ->
+// cachedView.Get -> VersionedCache.Read on an RPC handler goroutine that is NOT
+// synchronized with the executor's batch boundary, so it can call Read at the
+// exact instant the executor's ApplyWrites/DrainEvictions is mutating entries.
+// Unlike TestVersionedCache_ConcurrentAccess (which joins its readers before the
+// boundary phase, mirroring the warm-pass wg.Wait()), this test deliberately
+// leaves the reader running with NO join to the writer, so -race observes the
+// unguarded entries map access unless entries is mutex-protected.
+func TestVersionedCache_ConcurrentReadWithBoundaryMutation(t *testing.T) {
+	c := NewVersionedCache()
+	const keySpace = 32
+
+	stop := make(chan struct{})
+	var reader sync.WaitGroup
+	reader.Add(1)
+	go func() {
+		defer reader.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				c.Read(fmt.Sprintf("k%d", i%keySpace))
+			}
+		}
+	}()
+
+	// Executor goroutine: apply + commit + drain in a tight loop, concurrent
+	// with the never-joined reader above.
+	for r := 0; r < 2000; r++ {
+		txID := fmt.Sprintf("tx-%d", r)
+		c.ApplyWrites(txID,
+			rws(nil, []blocks.KVWrite{{Key: fmt.Sprintf("k%d", r%keySpace), Value: []byte("v")}}))
+		c.NoteCommitted(txID)
+		c.DrainEvictions()
+		c.Len()
+	}
+
+	close(stop)
+	reader.Wait()
 }

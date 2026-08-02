@@ -38,78 +38,35 @@ func (r *reopenableFakeReader) Reopen() (execution.ReadStore, error) {
 	return &fakeReader{data: r.reopened}, nil
 }
 
-// The frozen warm-pass write snapshot is consulted after a live-cache MISS and
-// before the underlying view, so auth can replay an in-flight write the warm
-// pass saw even once it has committed and evicted from the live cache.
-func TestCachedView_WarmWritesServedAfterLiveCacheMiss(t *testing.T) {
-	under := &fakeReader{data: map[string]*blocks.WriteRecord{
-		"k": {Key: "k", Value: []byte("committed-old"), Version: 3},
-	}}
-	v := &cachedView{cache: NewVersionedCache(), under: under} // live cache empty (k evicted)
-	v.SetWarmWrites(map[string]*blocks.WriteRecord{
-		"k": {Key: "k", Value: []byte("warm-inflight"), Version: 4},
-	})
-	rec, _ := v.Get("ns", "k")
-	if rec == nil || string(rec.Value) != "warm-inflight" || rec.Version != 4 {
-		t.Fatalf("want warmWrites fallback {warm-inflight,4}, got %+v", rec)
-	}
-}
-
-// The live write cache shadows the frozen snapshot: a key still in flight is
-// served from the live cache, never from warmWrites.
-func TestCachedView_LiveCacheShadowsWarmWrites(t *testing.T) {
-	cache := NewVersionedCache()
-	cache.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("live")}})) // ver 0
-	v := &cachedView{cache: cache, under: &fakeReader{data: map[string]*blocks.WriteRecord{}}}
-	v.SetWarmWrites(map[string]*blocks.WriteRecord{
-		"k": {Key: "k", Value: []byte("stale-warm"), Version: 9},
-	})
-	rec, _ := v.Get("ns", "k")
-	if rec == nil || string(rec.Value) != "live" || rec.Version != 0 {
-		t.Fatalf("live cache must shadow warmWrites; got %+v", rec)
-	}
-}
-
-// A key absent from warmWrites falls through to the underlying view.
-func TestCachedView_WarmWritesMissFallsThroughToUnder(t *testing.T) {
-	under := &fakeReader{data: map[string]*blocks.WriteRecord{
-		"k": {Key: "k", Value: []byte("committed"), Version: 3},
-	}}
-	v := &cachedView{cache: NewVersionedCache(), under: under}
-	v.SetWarmWrites(map[string]*blocks.WriteRecord{
-		"other": {Key: "other", Value: []byte("x"), Version: 1},
-	})
-	rec, _ := v.Get("ns", "k")
-	if rec == nil || string(rec.Value) != "committed" {
-		t.Fatalf("want committed from under, got %+v", rec)
-	}
-}
-
-// Reopen carries the frozen warm-pass snapshot onto the fresh view (so the
-// pipelined auth pass, which reads the REOPENED view, still replays it) while
-// resolving uncaptured keys against the fresh underlying committed state.
-func TestCachedView_ReopenCarriesWarmWrites(t *testing.T) {
+// Reopen re-resolves keys against the FRESH reopened underlying view (latest
+// committed state), NOT against warm's now-stale pinned snapshot. This is the
+// crux of the pipelined-auth read fix: a key advanced by an in-flight commit
+// since warm read it must be re-fetched at its current committed version, so
+// pipelined auth is read-identical to serial auth at any prefetch depth. The
+// live cross-batch write cache is still shared across Reopen (an in-flight hot
+// key stays shadowed); only the per-view stale read cache is dropped.
+func TestCachedView_ReopenResolvesAgainstFreshUnder(t *testing.T) {
 	under := &reopenableFakeReader{
 		fakeReader: &fakeReader{data: map[string]*blocks.WriteRecord{"k": {Key: "k", Value: []byte("v-stale"), Version: 3}}},
-		reopened:   map[string]*blocks.WriteRecord{"k": {Key: "k", Value: []byte("v-fresh"), Version: 3}},
+		reopened:   map[string]*blocks.WriteRecord{"k": {Key: "k", Value: []byte("v-fresh"), Version: 4}},
 	}
-	v := &cachedView{cache: NewVersionedCache(), under: under}
-	v.SetWarmWrites(map[string]*blocks.WriteRecord{
-		"h": {Key: "h", Value: []byte("warm-h"), Version: 7},
-	})
+	cache := NewVersionedCache()
+	cache.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "h", Value: []byte("live-h")}})) // ver 0
+	v := &cachedView{cache: cache, under: under}
 	fresh, err := v.Reopen()
 	if err != nil {
 		t.Fatalf("Reopen: %v", err)
 	}
-	// h is carried across Reopen from the frozen snapshot...
+	// The shared live write cache still shadows an in-flight hot key across Reopen.
 	rec, _ := fresh.Get("ns", "h")
-	if rec == nil || string(rec.Value) != "warm-h" || rec.Version != 7 {
-		t.Fatalf("Reopen must carry warmWrites; got %+v", rec)
+	if rec == nil || string(rec.Value) != "live-h" || rec.Version != 0 {
+		t.Fatalf("Reopen must keep the shared live write cache; got %+v", rec)
 	}
-	// ...and k resolves against the FRESH reopened underlying view.
+	// A key not in the live cache resolves against the FRESH reopened under at its
+	// current committed version -- never warm's stale pinned value.
 	rec, _ = fresh.Get("ns", "k")
-	if rec == nil || string(rec.Value) != "v-fresh" {
-		t.Fatalf("want v-fresh from reopened under, got %+v", rec)
+	if rec == nil || string(rec.Value) != "v-fresh" || rec.Version != 4 {
+		t.Fatalf("want {v-fresh,4} from reopened under, got %+v", rec)
 	}
 }
 

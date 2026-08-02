@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/hyperledger/fabric-x-evm/endorser/execution"
 	"github.com/hyperledger/fabric-x-evm/endorser/query"
 )
 
@@ -74,5 +75,67 @@ func TestViewGetMapsRowAndCachesAndCloses(t *testing.T) {
 	}
 	if !c.ended.Load() {
 		t.Fatalf("Close did not call EndView")
+	}
+}
+
+// A reopened view must reflect the LATEST committed state, even for a key the
+// original (warm-pass) view already fetched and cached. The pipelined
+// authoritative pass reopens the warm view before recording MVCC read-versions;
+// if the reopen serves a value the warm view cached BEFORE a concurrent
+// in-flight batch committed an advance to that key, auth records a stale
+// read-version and the committer aborts it under exact-equality MVCC. The
+// authoritative pass must use a NEW view, not the warm pass's cached reads.
+//
+// Timeline (single hot key, no external/non-EVM traffic):
+//  1. warm(N) cold-reads k at the then-committed version 5 and caches it.
+//  2. an in-flight predecessor batch commits, advancing k to version 6.
+//  3. auth(N) reopens the warm view and reads k -> MUST observe version 6.
+//
+// RED while Reopen shares the warm view's cache (returns the stale 5); GREEN
+// once Reopen opens a fresh view with its own cache and re-resolves k.
+func TestViewReopenReflectsLatestCommittedForCachedKey(t *testing.T) {
+	c := &stubClient{
+		data: map[string][]byte{"k": []byte("v5")},
+		vers: map[string]uint64{"k": 5},
+	}
+	store := query.NewStore(c, "evm")
+	rs, err := store.NewSnapshot(0)
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+
+	// (1) warm pass cold-reads k at committed version 5 (now cached in the view).
+	rec, err := rs.Get("evm", "k")
+	if err != nil {
+		t.Fatalf("warm Get: %v", err)
+	}
+	if rec == nil || rec.Version != 5 {
+		t.Fatalf("warm record = %+v, want version 5", rec)
+	}
+
+	// (2) an in-flight predecessor commits, advancing k to version 6.
+	c.data["k"] = []byte("v6")
+	c.vers["k"] = 6
+
+	// (3) the authoritative pass reopens the view and reads k. It must see the
+	// current committed version 6, not the stale 5 the warm view cached.
+	reopenable, ok := rs.(execution.ReopenableReadStore)
+	if !ok {
+		t.Fatalf("View does not implement ReopenableReadStore")
+	}
+	auth, err := reopenable.Reopen()
+	if err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+	defer auth.Close()
+
+	got, err := auth.Get("evm", "k")
+	if err != nil {
+		t.Fatalf("auth Get: %v", err)
+	}
+	if got == nil || got.Version != 6 || string(got.Value) != "v6" {
+		t.Fatalf("reopened view served %+v; want value v6 version 6 (current committed). "+
+			"A stale version here means the auth pass reused the warm pass's cached read "+
+			"instead of a fresh view -> auth records a stale MVCC read-version -> spurious abort", got)
 	}
 }

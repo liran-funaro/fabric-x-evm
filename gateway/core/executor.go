@@ -300,11 +300,6 @@ func (g *Gateway) drainAndWarm(ctx context.Context) *WarmedBatch {
 		g.waitForWork(ctx)
 		return nil
 	}
-	// Freeze the write-cache view this warm pass is about to read (executor
-	// goroutine, no warm in flight) so the batch's authoritative pass can replay
-	// it once these in-flight writes commit and evict from the live cache -- see
-	// core.WarmedBatch.SetWarmWrites / cachedView.warmWrites.
-	warmSnap := g.cache.SnapshotEntries()
 	warmed, err := g.endorsers.WarmBatch(ctx, txs)
 	if err != nil {
 		logger.Errorf("pipelined warm failed (%d txs): %v", len(txs), err)
@@ -312,7 +307,6 @@ func (g *Gateway) drainAndWarm(ctx context.Context) *WarmedBatch {
 		g.backoff(ctx)
 		return nil
 	}
-	warmed.SetWarmWrites(warmSnap)
 	return warmed
 }
 
@@ -356,21 +350,8 @@ func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *W
 	var warmFut chan warmResult
 	if len(txsNext) > 0 {
 		warmFut = make(chan warmResult, 1)
-		// Freeze the write-cache view warm(N+1) is about to read, HERE on the
-		// executor goroutine (previous warm joined at the last barrier, this warm
-		// not yet launched, auth(N) not yet started, no boundary write pending):
-		// this snapshot is exactly warm(N+1)'s write-cache view. auth(N+1) replays
-		// it next iteration, after N+1's in-flight predecessors commit and evict
-		// (see core.WarmedBatch.SetWarmWrites / cachedView.warmWrites). Installed
-		// inside the goroutine AFTER WarmBatch returns, so warm's own workers --
-		// already joined by then -- never observe it; only the reopened auth view
-		// does.
-		warmSnap := g.cache.SnapshotEntries()
 		go func() {
 			wb, err := g.endorsers.WarmBatch(ctx, txsNext)
-			if err == nil {
-				wb.SetWarmWrites(warmSnap)
-			}
 			warmFut <- warmResult{wb: wb, err: err}
 		}()
 	}

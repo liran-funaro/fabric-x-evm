@@ -70,38 +70,24 @@ type ReadStore interface {
 	Close() error
 }
 
-// ReopenableReadStore is a ReadStore that can spawn a fresh snapshot reflecting
-// the LATEST committed state while REUSING the reads it has already fetched. The
-// pipelined authoritative pass uses it: warm(N) primed its snapshot one batch
-// boundary ago, so by the time auth(N) runs, commits have advanced the ledger
-// and that snapshot is stale. Reopen lets auth re-resolve any read it has not
-// already cached against current committed state -- exactly what a serial
-// cycle's post-boundary view would see -- without re-paying the query-service
-// I/O for the cold reads warm already fetched. The reused reads are safe because
-// they are keys that were absent from the in-flight write-cache when warm read
-// them: cold, rarely-written keys whose committed version cannot advance within
-// the single-batch pipeline window (the in-flight window is many batches deep).
-// Hot, contended keys live in the live write-cache, which shadows this store and
-// is re-read live by auth on every tx.
+// ReopenableReadStore is a ReadStore that can spawn a FRESH snapshot reflecting
+// the LATEST committed state, with NO reads carried over from the store it was
+// reopened from. The pipelined authoritative pass uses it: warm(N) primed its
+// snapshot one batch boundary ago, so by the time auth(N) runs, in-flight
+// predecessor batches have committed and advanced the ledger and that snapshot
+// is stale. Reopen gives auth a clean view so it re-resolves every read against
+// current committed state -- exactly what a serial cycle's post-boundary view
+// would see. It must NOT reuse warm's already-fetched reads: a key warm
+// cold-read at some version can be advanced by an in-flight commit before auth
+// records its MVCC read-version, and reusing the stale value would make the
+// committer abort the batch under exact-equality MVCC (the stale-read livelock).
+// Safe cross-batch reuse of hot reads is provided elsewhere -- by the live
+// in-flight write-cache (which shadows this store and is re-read live per tx) and
+// the write-eviction-safe read-only cache -- not by carrying this store's reads
+// across a reopen.
 type ReopenableReadStore interface {
 	ReadStore
 	Reopen() (ReadStore, error)
-}
-
-// WarmWriteReplayer is an optional capability of a ReadStore (the gateway's
-// cachedView). It installs a FROZEN snapshot of the speculative in-flight writes
-// the warm pass saw, as a read fallback consulted below the live write cache.
-// In the pipeline, warm(N) served some hot keys from the cross-batch write cache
-// and so never fetched/primed them into the query view; by the time auth(N) runs
-// those batches may have committed and been evicted from the live cache, and the
-// reopened committed view would re-fetch them cold. The frozen snapshot lets
-// auth read them at their spec version -- which equals the committed version for
-// a committed batch, so the MVCC read-version matches committed -- with no fresh
-// query-service round-trip, confining pipeline-induced cache misses to the warm
-// phase. Stores that never evict mid-flight (the in-memory test KVS) need not
-// implement it; installing then is simply skipped.
-type WarmWriteReplayer interface {
-	SetWarmWrites(w map[string]*blocks.WriteRecord)
 }
 
 // revision represents a snapshot point in the journal: the lengths of the
