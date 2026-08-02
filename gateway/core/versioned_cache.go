@@ -254,6 +254,38 @@ func (c *VersionedCache) Len() int {
 	return len(c.entries)
 }
 
+// SnapshotEntries returns a frozen, independent copy of the current in-flight
+// write cache: one WriteRecord per key (value + spec version), detached from the
+// live cache so later ApplyWrites/eviction never mutate it. Returns nil when
+// empty. Like Read/DrainEvictions it touches c.entries, so it must be called
+// only at a batch boundary on the executor goroutine, when no warm-pass worker
+// is in flight (see VersionedCache's concurrency contract).
+//
+// The pipelined executor takes this snapshot at each warm launch and hands it to
+// the batch's authoritative pass (see cachedView.warmWrites): it is exactly the
+// write-cache view the warm pass could read. By auth time the batches it
+// captured may have committed and evicted from the live cache, and warm never
+// primed those keys into the query view (it served them from the write cache),
+// so the reopened committed view would re-fetch them cold. Replaying them from
+// this frozen copy at their spec version -- which equals the committed version
+// for a committed batch, so the recorded MVCC read-version matches committed --
+// confines pipeline-induced cache misses to the warm phase, never the auth
+// phase. (A captured batch that later ABORTS is safe too: the replayed value's
+// stale read-version fails MVCC validation at commit, so that batch simply
+// re-tries -- never a wrong commit; and its retry re-snapshots a clean cache.
+// Invalidations are ~0 on the workloads this targets.)
+func (c *VersionedCache) SnapshotEntries() map[string]*blocks.WriteRecord {
+	if len(c.entries) == 0 {
+		return nil
+	}
+	m := make(map[string]*blocks.WriteRecord, len(c.entries))
+	for k, e := range c.entries {
+		rec := e.rec // copy the record; shares the immutable Value bytes (as Read does)
+		m[k] = &rec
+	}
+	return m
+}
+
 // ReapplySpec is one in-flight batch's writes for a cache rebuild, given in
 // submission order (oldest first).
 type ReapplySpec struct {

@@ -88,6 +88,22 @@ type ReopenableReadStore interface {
 	Reopen() (ReadStore, error)
 }
 
+// WarmWriteReplayer is an optional capability of a ReadStore (the gateway's
+// cachedView). It installs a FROZEN snapshot of the speculative in-flight writes
+// the warm pass saw, as a read fallback consulted below the live write cache.
+// In the pipeline, warm(N) served some hot keys from the cross-batch write cache
+// and so never fetched/primed them into the query view; by the time auth(N) runs
+// those batches may have committed and been evicted from the live cache, and the
+// reopened committed view would re-fetch them cold. The frozen snapshot lets
+// auth read them at their spec version -- which equals the committed version for
+// a committed batch, so the MVCC read-version matches committed -- with no fresh
+// query-service round-trip, confining pipeline-induced cache misses to the warm
+// phase. Stores that never evict mid-flight (the in-memory test KVS) need not
+// implement it; installing then is simply skipped.
+type WarmWriteReplayer interface {
+	SetWarmWrites(w map[string]*blocks.WriteRecord)
+}
+
 // revision represents a snapshot point in the journal: the lengths of the
 // reads, writes, and effects slices (plus logs) at Snapshot() time, so
 // RevertToSnapshot can truncate each back and reverse-replay the effects since.

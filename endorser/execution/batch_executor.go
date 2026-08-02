@@ -149,6 +149,23 @@ func (wb *WarmedBatch) Close() error {
 	return nil
 }
 
+// SetWarmWrites installs the frozen warm-pass write snapshot onto this batch's
+// read store, so the authoritative pass can replay -- at their spec version --
+// the in-flight keys the warm pass read from the cross-batch write cache before
+// they committed and evicted (see WarmWriteReplayer). The pipelined executor
+// calls it once, AFTER WarmBatch has returned (its warm workers already joined),
+// so warm never observes the snapshot; only the reopened auth view does, because
+// cachedView.Reopen carries it. No-op if the read store cannot replay (e.g. a
+// remote endorser, whose read cache is out of process) or the snapshot is empty.
+func (wb *WarmedBatch) SetWarmWrites(w map[string]*blocks.WriteRecord) {
+	if wb == nil || len(w) == 0 {
+		return
+	}
+	if r, ok := wb.reader.(WarmWriteReplayer); ok {
+		r.SetWarmWrites(w)
+	}
+}
+
 // WarmBatch opens one query-service snapshot for the batch and runs the
 // concurrent warm pass against it (results discarded), priming the snapshot
 // view's read cache before the authoritative pass. It returns the STILL-OPEN
