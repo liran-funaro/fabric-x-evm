@@ -19,6 +19,11 @@ COMPOSE ?= docker compose
 #   HOST_DATA=1: overlay compose.fabric-x.hostdata.yaml to bind those same volumes
 #     to ./data on the host, so a developer/agent can inspect persisted state.
 HOST_DATA ?=
+# DEMO=1: overlay compose.fabric-x.demo.yaml for the client demo video run --
+#   persists the Prometheus TSDB to $EVM_PERF_DATA/demo/prometheus-data (so the
+#   video is re-renderable after teardown), raises retention to 30d, and adds
+#   grafana-image-renderer. See docs/evm-design-impl/demo-video.md.
+DEMO ?=
 # --project-directory $(CURDIR) keeps every ./-relative volume mount in the
 # compose files resolving from the repo root, even though the compose files now
 # live under config/compose/.
@@ -26,6 +31,9 @@ COMPOSE_FULL_FILES := --project-directory $(CURDIR) -f config/compose/compose.fa
 ifeq ($(HOST_DATA),1)
 COMPOSE_FULL_FILES += -f config/compose/compose.fabric-x.hostdata.yaml
 export DATA_ROOT := $(CURDIR)/data
+endif
+ifeq ($(DEMO),1)
+COMPOSE_FULL_FILES += -f config/compose/compose.fabric-x.demo.yaml
 endif
 
 .PHONY: build
@@ -200,6 +208,15 @@ start-full:
 		data/orderers/party4-router data/orderers/party4-batcher \
 		data/orderers/party4-consenter data/orderers/party4-assembler \
 		data/committer-org1/db data/committer-org1/sidecar-ledger; fi
+	@# DEMO mode binds the Prometheus TSDB to a host path so it survives `down -v`.
+	@# Prometheus runs as nobody (65534) and will not open a root-owned directory,
+	@# so create and chown it before `up`.
+	@if [ "$(DEMO)" = "1" ]; then \
+		test -n "$$EVM_PERF_DATA" || { echo "Error: DEMO=1 requires EVM_PERF_DATA to be set"; exit 1; }; \
+		echo "Preparing demo TSDB at $$EVM_PERF_DATA/demo/prometheus-data (chown 65534)..."; \
+		mkdir -p "$$EVM_PERF_DATA/demo/prometheus-data"; \
+		$(DOCKER) run --rm -v "$$EVM_PERF_DATA/demo/prometheus-data":/v busybox chown -R 65534:65534 /v; \
+	fi
 	@# Container-local mode: docker creates named volumes owned by root, but every
 	@# service runs as $(UID):$(GID) (see `user:` in compose), so pre-create the
 	@# volumes and chown them to that user before the DB/orderers initialize.

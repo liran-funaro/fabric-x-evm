@@ -1,0 +1,64 @@
+# Demo overlay -- applied by `DEMO=1 make start-full` on top of
+# compose.fabric-x.full.yaml. It exists for the client demo video
+# (docs/evm-design-impl/demo-video.md) and does two things:
+#
+#   1. Makes the run's metrics outlive the run. The base file keeps 1h of TSDB
+#      with no data mount, and `make stop-full` runs `down -v`, so an overnight
+#      run's early hours would be discarded and the rest deleted on teardown.
+#      A BIND mount (not a named volume) survives `down -v`, which keeps the
+#      video re-renderable for weeks without re-running the experiment.
+#
+#   2. Adds grafana-image-renderer so the render pipeline can turn the stored
+#      TSDB into PNG frames. It is only exercised AFTER the experiment finishes,
+#      so it never competes for CPU with the measurement.
+#
+# Opt-in on purpose: ordinary measured runs keep today's throwaway monitoring so
+# a stale TSDB can never be mistaken for a fresh run's data.
+#
+# Note: compose REPLACES `command` and `environment` wholesale per service rather
+# than merging them, so both are restated in full below.
+services:
+  prometheus:
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-remote-write-receiver"
+    volumes:
+      - ./config/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - ./testdata/crypto:/tls:ro,Z
+      # Prometheus runs as nobody (65534); `make start-full` chowns this path
+      # before `up`, or the container fails to open its TSDB.
+      - ${EVM_PERF_DATA}/demo/prometheus-data:/prometheus:Z
+
+  grafana:
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      # Land on the client dashboard rather than the committer one.
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/evm-demo.json
+      - GF_RENDERING_SERVER_URL=http://renderer:8081/render
+      - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
+      - GF_LOG_FILTERS=rendering:debug
+    volumes:
+      - ./config/monitoring/grafana/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro,Z
+      - ./config/monitoring/grafana/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro,Z
+      - ./config/monitoring/grafana/committer.json:/var/lib/grafana/dashboards/committer.json:ro,Z
+      - ./config/monitoring/grafana/orderer.json:/var/lib/grafana/dashboards/orderer.json:ro,Z
+      - ./config/monitoring/grafana/evm-loadgen.json:/var/lib/grafana/dashboards/evm-loadgen.json:ro,Z
+      - ./config/monitoring/grafana/evm-demo.json:/var/lib/grafana/dashboards/evm-demo.json:ro,Z
+
+  renderer:
+    image: grafana/grafana-image-renderer:3.12.6
+    pull_policy: missing
+    restart: unless-stopped
+    container_name: renderer
+    environment:
+      - ENABLE_METRICS=false
+      # A full 1920x1080 dashboard with 9 panels can take a few seconds; the
+      # default 30s is tight when frames render 6-way parallel.
+      - RENDERING_TIMEOUT=120
+      - RENDERING_MODE=default
+    networks:
+      - fabric-x

@@ -161,6 +161,17 @@ scrape_configs:
   # The test runs on the host, accessible via host.docker.internal
   # ---------------------------------------------------------------------------
   - job_name: "loadgen"
+    # 1s (vs the 5s global) so a 1x real-time demo video has a distinct frame
+    # every 2s -- frames closer together than the scrape interval would render
+    # identical data. See
+    # docs/evm-design-impl/specs/2026-08-04-client-demo-video-design.md.
+    #
+    # This job only: it is a single target with ~30 series, and every metric the
+    # demo dashboard reads (gateway_* included) is registered in the loadgen's
+    # own registry, so nothing else needs finer resolution. Putting the ~24
+    # orderer/committer targets at 1s would add scrape overhead during the
+    # measured run for no benefit.
+    scrape_interval: 1s
     static_configs:
       - targets: ["host.docker.internal:2112"]
     # Note: Requires iptables rule to allow Docker containers to access host
