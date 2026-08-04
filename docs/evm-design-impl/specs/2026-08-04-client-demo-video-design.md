@@ -39,7 +39,12 @@ artifact for anyone who won't sit through it.
 | Frames rendered | ~14 400 (8 h) | ~2 160 |
 | Time step per frame | uniform 2 s | ramp 1 s → ~25 s |
 | Sliding window | 15 min | 15 min |
-| Size | measured in the smoke run; expect ~100–400 MB | ~15–30 MB |
+| Size | **measured: 5.1 MB per 20 min** (≈15 MB/h, so ~90 MB for 8 h) | a few MB |
+
+The size estimate above was originally ~100–400 MB for 8 h; the measured figure
+is roughly 10× smaller. A dashboard at 0.5 fps content is almost entirely
+duplicate frames, which x264 codes as near-empty P-frames. Nothing needs
+shrinking.
 
 **`demo-full.mp4` is real time and unedited in pace** — the presenter speeds up
 or scrubs in their own player as needed, and nothing about the timeline is

@@ -244,6 +244,21 @@ duration_of() {
 # "12,345,678". Python groups regardless of locale.
 group() { python3 -c "print(f'{int(\"$1\"):,}')"; }
 
+# Card wording. "0.5-hour continuous run" reads badly, so use minutes below 90
+# and hours above. Two forms: adjectival ("30-minute run") and nominal
+# ("over 30 minutes").
+human_dur() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+s, form = float(sys.argv[1]), sys.argv[2]
+if s < 5400:
+    n, unit = f"{s/60:.0f}", "minute"
+else:
+    n, unit = f"{s/3600:.1f}", "hour"
+print(f"{n}-{unit}" if form == "adj" else f"{n} {unit}s")
+PY
+}
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -289,7 +304,8 @@ else
   log "WARNING: no replay log at $REPLAY_LOG_PATH; skipping the totals cross-check"
 fi
 
-HOURS=$(python3 -c "print(f'{$RUN_SECONDS/3600:.1f}')")
+DUR_ADJ=$(human_dur "$RUN_SECONDS" adj)
+DUR_NOUN=$(human_dur "$RUN_SECONDS" noun)
 
 for mode in "${MODES[@]}"; do
   case "$mode" in
@@ -309,13 +325,13 @@ for mode in "${MODES[@]}"; do
     "Sustained throughput on a real Ethereum workload" \
     "Jan-2020 USDC transfer trace — 151,045 transactions replayed continuously" \
     "4-party BFT ordering — 32 vCPU / 61 GB" \
-    "${HOURS}-hour continuous run$([ "$mode" = highlight ] && echo ' — highlights' || echo ' — real time, unedited')")
+    "${DUR_ADJ} continuous run$([ "$mode" = highlight ] && echo ' — highlights' || echo ' — real time, unedited')")
   make_card "$DEMO_DIR/title-$mode.mp4" "$out_fps" 4 "$tdir" "$n"
 
   cdir="$DEMO_DIR/cards/close-$mode"
   n=$(write_card_text "$cdir" \
     "$(group "${T[COMMITTED]}") transactions" \
-    "committed over ${HOURS} hours" \
+    "committed over ${DUR_NOUN}" \
     "$(group "${T[TX_PER_SECOND]}") EVM transactions / second sustained" \
     "$(group "${T[BATCHES]}") BFT-ordered committer transactions" \
     "${T[ROLLED_BACK]} rolled-back batches — ${T[ABORTED]} aborted transactions")

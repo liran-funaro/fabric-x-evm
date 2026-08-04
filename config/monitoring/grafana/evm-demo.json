@@ -55,7 +55,7 @@
               }
             ]
           },
-          "unit": "ops"
+          "unit": "locale"
         },
         "overrides": []
       },
@@ -68,7 +68,7 @@
       "id": 2,
       "options": {
         "colorMode": "none",
-        "graphMode": "area",
+        "graphMode": "none",
         "justifyMode": "auto",
         "orientation": "auto",
         "reduceOptions": {
@@ -109,7 +109,7 @@
           "color": {
             "mode": "thresholds"
           },
-          "decimals": 2,
+          "decimals": 0,
           "mappings": [],
           "thresholds": {
             "mode": "absolute",
@@ -120,7 +120,7 @@
               }
             ]
           },
-          "unit": "short"
+          "unit": "locale"
         },
         "overrides": []
       },
