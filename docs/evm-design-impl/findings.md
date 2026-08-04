@@ -323,3 +323,39 @@ committer MVCC-aborts it, the cascade re-executes and re-commits it. **Key
 insight:** even with the receipt bug present, the ledger state was always correct
 (final nonce and balance right) — it was a receipt/query-layer bug, not a
 double-spend.
+
+---
+
+## 10. Run length is disk-bound, not time-bound (measured 2026-08-04)
+
+A full-stack run writes **~6.3–6.5 KB of disk per committed EVM transaction**,
+i.e. **~2.1 GB/min (~125 GB/h) at the ~5.7k tx/s headline**. `ec2` has a single
+100 GB disk (~88 GB free after `clean-x`), so with ~12 GB of headroom the budget
+is a fixed **~12 million EVM transactions per run**.
+
+What is finite is the **transaction count, not the wall-clock time**, so duration
+and throughput trade off directly:
+
+| Rate | Max duration |
+|------|-------------:|
+| unpaced (~5,700 tx/s) | ~35–40 min |
+| ~1,000 tx/s | ~3.5 h |
+| ~460 tx/s | 8 h |
+
+**Where it goes:** 9 synchronized copies of the block data — 4 orderer batchers +
+4 assemblers + the committer sidecar ledger, each growing in lockstep (~1.3 GB
+per copy per 5 min at full rate). Postgres (`committer-db`) stays ~400 MB: the
+historic trace touches a bounded ~151k accounts, so **state is bounded while
+history is not**. Container logs are irrelevant (~43 MB). That 9× replication is
+the 4-party BFT property itself, and there is **no ledger pruning/retention
+setting** in `testdata/shared_config.yaml` or the orderer config, so it cannot be
+traded away.
+
+**Implication:** any request for a multi-hour run at full throughput needs a
+bigger volume — it is not a tuning problem. Compute the duration from the disk
+budget (`usable_GB / 2.1 GB-per-min`) rather than picking a wall-clock target.
+For deliberately long runs, `-target-tps` paces submission below the ceiling
+(default 0 = unpaced, so every number above stays comparable).
+
+Discovered while producing the client demo video
+([demo-video.md](demo-video.md)); it is a property of the stack, not of the demo.
