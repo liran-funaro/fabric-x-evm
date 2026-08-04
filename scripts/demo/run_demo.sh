@@ -73,9 +73,7 @@ log "preflight"
 for f in "USDC_dataset.${DATASET}.json.gz" "USDC_contract.json"; do
   [ -f "$EVM_PERF_DATA/$f" ] || { echo "error: missing $EVM_PERF_DATA/$f (run scripts/setup.sh)" >&2; exit 1; }
 done
-avail=$(free_gb)
-[ "${avail:-0}" -ge 20 ] || { echo "error: only ${avail}G free on / -- need >=20G" >&2; exit 1; }
-log "disk: ${avail}G free"
+log "disk before teardown: $(free_gb)G free (the teardown below reclaims the previous run's volumes)"
 command -v docker >/dev/null || { echo "error: docker not found" >&2; exit 1; }
 go version >/dev/null || { echo "error: go not on PATH" >&2; exit 1; }
 
@@ -98,6 +96,14 @@ if [ -d "$TSDB_DIR" ]; then
   docker run --rm -v "$EVM_PERF_DATA/demo":/d busybox sh -c 'rm -rf /d/prometheus-data' \
     || { echo "error: could not clear $TSDB_DIR" >&2; exit 1; }
 fi
+
+# Disk is checked HERE, not in preflight: `stop-full` (down -v) is what reclaims
+# the previous run's ledger volumes, so a check before it would reject a viable
+# run whenever the last run left the disk full -- which is the normal state.
+avail=$(free_gb)
+[ "${avail:-0}" -ge 20 ] || {
+  echo "error: only ${avail}G free after teardown -- need >=20G" >&2; exit 1; }
+log "disk after teardown: ${avail}G free"
 
 DEMO=1 make clean-x init-x start-full
 
