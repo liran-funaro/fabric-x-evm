@@ -48,7 +48,9 @@ done
 mkdir -p "$OUT_DIR"
 export PROM
 
-log() { printf '[render %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+# stderr, so a function whose stdout is captured (render_frames returns a count)
+# still shows its progress. A 100-minute render with no output looks like a hang.
+log() { printf '[render %s] %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 
 # --------------------------------------------------------------------------- #
 # ffmpeg / ffprobe run inside a container: ec2 has no ffmpeg, and installing one
@@ -101,6 +103,14 @@ render_frames() {
   n=$(wc -l < "$dir/schedule.txt" | tr -d ' ')
   log "$mode: $n frames -> $dir"
 
+  # A 100-minute frame render with no output is indistinguishable from a hang.
+  ( while :; do
+      sleep 30
+      have=$(find "$dir" -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+      log "  $mode: $have/$n frames"
+      [ "$have" -ge "$n" ] && break
+    done ) & local progress_pid=$!
+
   # Emit "index from to" so each worker knows its own output name; existing
   # frames are skipped so an interrupted render resumes instead of restarting.
   nl -ba -w1 -s' ' "$dir/schedule.txt" \
@@ -117,7 +127,8 @@ render_frames() {
         done
         echo "FRAME FAILED idx=$idx from=$from to=$to" >&2
         exit 1
-      ' || { echo "error: one or more frames failed to render" >&2; return 1; }
+      ' || { kill "$progress_pid" 2>/dev/null; echo "error: one or more frames failed to render" >&2; return 1; }
+  kill "$progress_pid" 2>/dev/null || true
 
   # A blank or error PNG must never reach the video, so verify every frame
   # exists and is plausibly an image before spending an hour encoding.
@@ -249,7 +260,7 @@ for mode in "${MODES[@]}"; do
     *) echo "unknown mode: $mode" >&2; exit 2 ;;
   esac
 
-  render_frames "$mode" "$START" "$END" >/dev/null
+  render_frames "$mode" "$START" "$END" >/dev/null   # progress goes to stderr
 
   body="$DEMO_DIR/body-$mode.mp4"
   encode_body "$mode" "$content_fps" "$out_fps" "$body"
