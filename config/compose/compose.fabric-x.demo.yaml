@@ -41,6 +41,17 @@ services:
       - GF_RENDERING_SERVER_URL=http://renderer:8081/render
       - GF_RENDERING_CALLBACK_URL=http://grafana:3000/
       - GF_LOG_FILTERS=rendering:debug
+      # Grafana 11.6 preinstalls grafana-lokiexplore-app. On a host without
+      # plugin-catalog egress the install silently fails, but the frontend still
+      # tries to preload its module.js -- that 404 throws an uncaught browser
+      # exception, so the renderer's page never reaches "panelsRendered" and
+      # EVERY render times out. Clearing the preinstall list is the fix.
+      - GF_PLUGINS_PREINSTALL_DISABLED=true
+      - GF_PLUGINS_PREINSTALL=
+      # No outbound calls during a render; they only add latency here.
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
     volumes:
       - ./config/monitoring/grafana/grafana-datasource.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro,Z
       - ./config/monitoring/grafana/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro,Z

@@ -115,6 +115,8 @@ slow-moving dashboard.
 | `PANEL GATE FAILED … no data` for one expression | A metric was renamed. Cross-check `integration/perf/metrics.go` against `config/monitoring/grafana/evm-demo.json` |
 | Prometheus won't start under `DEMO=1` | TSDB dir not owned by `nobody`. `docker run --rm -v "$EVM_PERF_DATA/demo/prometheus-data":/v busybox chown -R 65534:65534 /v` |
 | `error: Grafana /render failed` | Renderer container missing — the stack was started without `DEMO=1` |
+| Every render times out; renderer logs show `404 … grafana-lokiexplore-app/module.js` then `Timeout … step: panelsRendered` | Grafana 11.6 preinstalls that plugin; without plugin-catalog egress its install fails but the frontend still preloads it, and the 404 throws an uncaught browser exception so the page never finishes. Fixed by `GF_PLUGINS_PREINSTALL_DISABLED=true` + empty `GF_PLUGINS_PREINSTALL` in the demo overlay |
+| Dashboard edits don't take effect | Single-file bind mounts pin an inode, and a plain `rsync`/`mv` replaces it, so the container keeps serving the old file. Sync with `rsync --inplace`, or recreate the container: `DEMO=1 docker compose … up -d --force-recreate grafana`. Check what Grafana actually serves with `curl -s localhost:3000/api/dashboards/uid/evm-demo` |
 | `FRAME FAILED` / frames under 5 kB | Renderer timeout. Lower `PARALLEL` (default 6) or raise `RENDERING_TIMEOUT` in the demo overlay |
 | `FAIL: body is Ns for a Ms run` | The real-time invariant broke. Do **not** ship it; the frame step and content fps have drifted apart in `demo_lib.py` |
 | `no commit headroom for 5m0s` | The stack wedged; the feeder stopped so the stall path could report. Read `replay.log` |

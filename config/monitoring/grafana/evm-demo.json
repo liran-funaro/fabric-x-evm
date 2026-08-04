@@ -608,7 +608,7 @@
         ]
       },
       "gridPos": {
-        "h": 7,
+        "h": 9,
         "w": 8,
         "x": 0,
         "y": 17
@@ -694,7 +694,7 @@
         ]
       },
       "gridPos": {
-        "h": 7,
+        "h": 9,
         "w": 8,
         "x": 8,
         "y": 17
@@ -795,7 +795,7 @@
         ]
       },
       "gridPos": {
-        "h": 7,
+        "h": 9,
         "w": 8,
         "x": 16,
         "y": 17
@@ -857,7 +857,9 @@
     "from": "now-15m",
     "to": "now"
   },
-  "timepicker": {},
+  "timepicker": {
+    "hidden": true
+  },
   "timezone": "utc",
   "title": "EVM on Fabric-X \u2014 Client Demo",
   "uid": "evm-demo",
