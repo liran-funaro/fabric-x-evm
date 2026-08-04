@@ -489,7 +489,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Two-phase executor pass durations. WARM fires only in the pipelined executor (concurrent prime pass); AUTH is the serial authoritative pass (serial ExecuteBatch or pipelined AuthBatch) -- the per-batch CPU floor.",
+      "description": "Two-phase executor pass durations, split by execution mode. SERIAL (default) issues one fused ExecuteBatch -> the ENDORSE series (warm+auth combined, the per-batch CPU floor). PIPELINED issues separate RPCs -> the WARM series (concurrent prime pass) + the AUTH series (AuthBatch). Only one mode's series is populated per run; warm/auth are flat-empty under serial and endorse is flat-empty under pipeline.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -548,8 +548,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(gateway_warm_phase_seconds_bucket[$__rate_interval])) by (le))",
-          "legendFormat": "warm p50",
+          "expr": "histogram_quantile(0.50, sum(rate(gateway_endorse_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "endorse p50 (serial)",
           "range": true,
           "refId": "A"
         },
@@ -559,8 +559,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(gateway_warm_phase_seconds_bucket[$__rate_interval])) by (le))",
-          "legendFormat": "warm p99",
+          "expr": "histogram_quantile(0.99, sum(rate(gateway_endorse_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "endorse p99 (serial)",
           "range": true,
           "refId": "B"
         },
@@ -570,8 +570,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum(rate(gateway_auth_phase_seconds_bucket[$__rate_interval])) by (le))",
-          "legendFormat": "auth p50",
+          "expr": "histogram_quantile(0.50, sum(rate(gateway_warm_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "warm p50 (pipeline)",
           "range": true,
           "refId": "C"
         },
@@ -581,13 +581,35 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum(rate(gateway_auth_phase_seconds_bucket[$__rate_interval])) by (le))",
-          "legendFormat": "auth p99",
+          "expr": "histogram_quantile(0.99, sum(rate(gateway_warm_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "warm p99 (pipeline)",
           "range": true,
           "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum(rate(gateway_auth_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "auth p50 (pipeline)",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum(rate(gateway_auth_phase_seconds_bucket[$__rate_interval])) by (le))",
+          "legendFormat": "auth p99 (pipeline)",
+          "range": true,
+          "refId": "F"
         }
       ],
-      "title": "Warm vs Auth phase latency",
+      "title": "Endorse (serial) / Warm+Auth (pipeline) phase latency",
       "type": "timeseries"
     },
     {

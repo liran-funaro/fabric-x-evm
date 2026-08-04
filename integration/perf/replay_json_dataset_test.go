@@ -352,11 +352,13 @@ func runReplayTest(
 		// COMMITTED vs invalidated notifications), not via a core hook.
 		gwcore.RecordWarmPhaseDuration = metrics.RecordWarmPhase
 		gwcore.RecordAuthPhaseDuration = metrics.RecordAuthPhase
+		gwcore.RecordEndorsePhaseDuration = metrics.RecordEndorsePhase
 		gwcore.RecordCommitLatency = metrics.RecordCommitLatency
 		gwcore.RecordSpecAbort = metrics.RecordSpecAbort
 		defer func() {
 			gwcore.RecordWarmPhaseDuration = nil
 			gwcore.RecordAuthPhaseDuration = nil
+			gwcore.RecordEndorsePhaseDuration = nil
 			gwcore.RecordCommitLatency = nil
 			gwcore.RecordSpecAbort = nil
 		}()

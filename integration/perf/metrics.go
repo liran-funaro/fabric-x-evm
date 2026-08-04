@@ -47,13 +47,15 @@ type LoadgenMetrics struct {
 	txQueueWaitingListSize       prometheus.Gauge
 
 	// Gateway two-phase executor metrics (fed by the nil-guarded core hooks:
-	// RecordWarmPhaseDuration / RecordAuthPhaseDuration / RecordSpecAbort, plus
-	// the commit-path timing + rollback count surfaced from the replay test).
-	warmPhaseLatency   prometheus.Histogram    // concurrent WARM pass wall-clock (pipelined only)
-	authPhaseLatency   prometheus.Histogram    // AUTHORITATIVE pass wall-clock (serial ExecuteBatch / pipelined AuthBatch)
-	commitLatency      prometheus.Histogram    // committer round-trip per batch
-	batchesRolledBack  prometheus.Counter      // MVCC rollback cascades (batches rolled back + re-batched)
-	specAbort          *prometheus.CounterVec  // spec-version aborts by dominant stale-read class
+	// RecordWarmPhaseDuration / RecordAuthPhaseDuration / RecordEndorsePhaseDuration
+	// / RecordSpecAbort, plus the commit-path timing + rollback count surfaced from
+	// the replay test).
+	warmPhaseLatency    prometheus.Histogram   // concurrent WARM pass wall-clock (pipelined only)
+	authPhaseLatency    prometheus.Histogram   // AUTHORITATIVE pass wall-clock (pipelined AuthBatch only)
+	endorsePhaseLatency prometheus.Histogram   // fused ExecuteBatch wall-clock, warm+auth combined (serial only)
+	commitLatency       prometheus.Histogram   // committer round-trip per batch
+	batchesRolledBack   prometheus.Counter     // MVCC rollback cascades (batches rolled back + re-batched)
+	specAbort           *prometheus.CounterVec // spec-version aborts by dominant stale-read class
 
 	registry *prometheus.Registry
 	server   *http.Server
@@ -136,7 +138,12 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		}),
 		authPhaseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "gateway_auth_phase_seconds",
-			Help:    "Duration of the AUTHORITATIVE pass per batch (serial ExecuteBatch or pipelined AuthBatch) in seconds",
+			Help:    "Duration of the AUTHORITATIVE pass per batch (pipelined AuthBatch only; serial uses gateway_endorse_phase_seconds) in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20), // 1ms to ~524s
+		}),
+		endorsePhaseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gateway_endorse_phase_seconds",
+			Help:    "Duration of the serial executor's fused ExecuteBatch per batch (warm+auth combined; serial only) in seconds",
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20), // 1ms to ~524s
 		}),
 		commitLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -174,6 +181,7 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		m.txQueueWaitingListSize,
 		m.warmPhaseLatency,
 		m.authPhaseLatency,
+		m.endorsePhaseLatency,
 		m.commitLatency,
 		m.batchesRolledBack,
 		m.specAbort,
@@ -292,10 +300,17 @@ func (m *LoadgenMetrics) RecordWarmPhase(d time.Duration) {
 }
 
 // RecordAuthPhase observes the duration of one AUTHORITATIVE pass. Assigned to
-// core.RecordAuthPhaseDuration; fires on both the serial (ExecuteBatch) and
-// pipelined (AuthBatch) executors.
+// core.RecordAuthPhaseDuration; fires only on the pipelined executor (AuthBatch).
+// The serial executor's fused pass is recorded via RecordEndorsePhase instead.
 func (m *LoadgenMetrics) RecordAuthPhase(d time.Duration) {
 	m.authPhaseLatency.Observe(d.Seconds())
+}
+
+// RecordEndorsePhase observes the duration of the serial executor's fused
+// ExecuteBatch (warm+auth combined). Assigned to core.RecordEndorsePhaseDuration;
+// fires only on the serial (default) executor.
+func (m *LoadgenMetrics) RecordEndorsePhase(d time.Duration) {
+	m.endorsePhaseLatency.Observe(d.Seconds())
 }
 
 // RecordCommitLatency observes the committer round-trip latency for one batch.

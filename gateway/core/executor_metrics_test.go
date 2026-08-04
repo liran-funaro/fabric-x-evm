@@ -23,20 +23,23 @@ import (
 func resetPhaseHooks() {
 	RecordWarmPhaseDuration = nil
 	RecordAuthPhaseDuration = nil
+	RecordEndorsePhaseDuration = nil
 	RecordCommitLatency = nil
 	RecordSpecAbort = nil
 }
 
-// TestExecutorRecordsAuthPhaseSerial: the serial executeCycle runs the combined
-// authoritative ExecuteBatch, so RecordAuthPhaseDuration fires (once) and, since
-// the serial path has no separate warm pass, RecordWarmPhaseDuration does NOT.
-func TestExecutorRecordsAuthPhaseSerial(t *testing.T) {
+// TestExecutorRecordsEndorsePhaseSerial: the serial executeCycle runs the single
+// fused ExecuteBatch (warm+auth back-to-back server-side), so it records the
+// COMBINED endorse cost via RecordEndorsePhaseDuration and fires NEITHER the
+// warm nor the auth split (those exist only on the pipelined path).
+func TestExecutorRecordsEndorsePhaseSerial(t *testing.T) {
 	defer resetPhaseHooks()
-	var warmCalls, authCalls atomic.Int64
+	var warmCalls, authCalls, endorseCalls atomic.Int64
 	RecordWarmPhaseDuration = func(time.Duration) { warmCalls.Add(1) }
-	RecordAuthPhaseDuration = func(d time.Duration) {
+	RecordAuthPhaseDuration = func(time.Duration) { authCalls.Add(1) }
+	RecordEndorsePhaseDuration = func(d time.Duration) {
 		require.GreaterOrEqual(t, d, time.Duration(0))
-		authCalls.Add(1)
+		endorseCalls.Add(1)
 	}
 
 	stub := &stubEndorser{execResp: okBatchResponse()}
@@ -46,16 +49,18 @@ func TestExecutorRecordsAuthPhaseSerial(t *testing.T) {
 	_, done := runCycleAndCapture(t, g)
 	<-done
 
-	require.GreaterOrEqual(t, authCalls.Load(), int64(1), "serial cycle should record an auth-phase duration")
+	require.GreaterOrEqual(t, endorseCalls.Load(), int64(1), "serial cycle should record a combined endorse-phase duration")
 	require.Equal(t, int64(0), warmCalls.Load(), "serial cycle has no separate warm pass")
+	require.Equal(t, int64(0), authCalls.Load(), "serial cycle has no separate auth pass; the fused RPC is recorded as endorse")
 }
 
 // TestExecutorRecordsWarmAndAuthPhasePipelined: the pipelined path warms a batch
 // (drainAndWarm -> WarmBatch) then authorizes it (pipelineIteration -> AuthBatch),
-// so both RecordWarmPhaseDuration and RecordAuthPhaseDuration fire.
+// so RecordWarmPhaseDuration and RecordAuthPhaseDuration fire but the serial-only
+// RecordEndorsePhaseDuration does NOT.
 func TestExecutorRecordsWarmAndAuthPhasePipelined(t *testing.T) {
 	defer resetPhaseHooks()
-	var warmCalls, authCalls atomic.Int64
+	var warmCalls, authCalls, endorseCalls atomic.Int64
 	RecordWarmPhaseDuration = func(d time.Duration) {
 		require.GreaterOrEqual(t, d, time.Duration(0))
 		warmCalls.Add(1)
@@ -64,6 +69,7 @@ func TestExecutorRecordsWarmAndAuthPhasePipelined(t *testing.T) {
 		require.GreaterOrEqual(t, d, time.Duration(0))
 		authCalls.Add(1)
 	}
+	RecordEndorsePhaseDuration = func(time.Duration) { endorseCalls.Add(1) }
 
 	stub := &stubEndorser{execResp: okBatchResponse()}
 	g := newExecutorTestGateway(stub)
@@ -76,6 +82,7 @@ func TestExecutorRecordsWarmAndAuthPhasePipelined(t *testing.T) {
 
 	g.pipelineIteration(ctx, warmed)
 	require.GreaterOrEqual(t, authCalls.Load(), int64(1), "auth pass should record a duration")
+	require.Equal(t, int64(0), endorseCalls.Load(), "pipelined path splits warm/auth; it does not record a fused endorse")
 }
 
 // TestExecutorRecordsCommitLatency: a batch that commits (a COMMITTED

@@ -27,11 +27,23 @@ import (
 var RecordWarmPhaseDuration func(d time.Duration)
 
 // RecordAuthPhaseDuration, when non-nil, is called with the wall-clock duration
-// of each AUTHORITATIVE pass: AuthBatch in the pipelined executor, and the
-// combined ExecuteBatch in the serial executor (where the whole pass is
-// authoritative -- there is no overlap to hide behind). This is the serial CPU
-// floor both executors pay per batch.
+// of each AUTHORITATIVE pass (AuthBatch). Only the pipelined executor has a
+// distinct auth pass that overlaps the concurrent warm pass; the serial
+// executor's single fused ExecuteBatch is recorded under
+// RecordEndorsePhaseDuration instead (warm and auth are not separable there).
+// It runs on the executor goroutine, concurrent with the background warm
+// goroutine that fires RecordWarmPhaseDuration, so recorders must be safe for
+// concurrent use (Prometheus histograms are).
 var RecordAuthPhaseDuration func(d time.Duration)
+
+// RecordEndorsePhaseDuration, when non-nil, is called with the wall-clock
+// duration of the serial executor's single fused ExecuteBatch RPC. That RPC runs
+// the warm and authoritative passes back-to-back server-side in one call, so the
+// sample is neither a pure warm nor a pure auth timing but the COMBINED endorse
+// cost -- the serial CPU floor per batch. Only the serial (default) executor
+// calls this; the pipelined executor issues separate WarmBatch/AuthBatch RPCs
+// and records them via RecordWarmPhaseDuration + RecordAuthPhaseDuration instead.
+var RecordEndorsePhaseDuration func(d time.Duration)
 
 // RecordCommitLatency, when non-nil, is called once per committed batch with the
 // submit->commit-notification wall time (the same sample fed to CommitLatencyStats).

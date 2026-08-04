@@ -136,10 +136,13 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
-	authStart := time.Now()
+	// Serial path: one fused ExecuteBatch runs warm+auth back-to-back server-side,
+	// so its wall-clock is the COMBINED endorse cost, recorded under the endorse
+	// hook (not warm/auth -- those splits exist only on the pipelined path).
+	endorseStart := time.Now()
 	end, included, terminal, rws, err := g.endorsers.ExecuteBatch(ctx, batch)
-	if RecordAuthPhaseDuration != nil {
-		RecordAuthPhaseDuration(time.Since(authStart))
+	if RecordEndorsePhaseDuration != nil {
+		RecordEndorsePhaseDuration(time.Since(endorseStart))
 	}
 	if err != nil {
 		logger.Errorf("batch endorse failed (%d txs): %v", len(batch), err)

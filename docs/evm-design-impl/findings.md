@@ -81,6 +81,20 @@ DB/disk/CPU/connection saturation. See [[evm-qs-db-resource-discovery]] and
 [[evm-lock-profiling-findings]] (which also **disproved** a redundant-cache-lock
 hypothesis — do not pursue a lock-removal/COW refactor; those RLocks cost ~0).
 
+**Two measurement lenses — don't conflate them.** The warm/auth split above is
+the *endorser's* server-side `ENDORSE-TIMING` debug log. The *gateway's*
+Prometheus phase histograms are mode-dependent, because the serial executor
+issues one fused `ExecuteBatch` gRPC (warm+auth happen back-to-back inside the
+endorser, one call) while the pipelined executor issues separate
+`WarmBatch`/`AuthBatch` RPCs:
+- **serial (default)** → `gateway_endorse_phase_seconds` (the combined
+  warm+auth cost, ≈165–190 ms/batch on ec2); `gateway_warm_phase_seconds` and
+  `gateway_auth_phase_seconds` are **empty**.
+- **pipelined (`-pipeline`)** → `gateway_warm_phase_seconds` +
+  `gateway_auth_phase_seconds`; `gateway_endorse_phase_seconds` is **empty**.
+So on the default (serial) dashboard the populated series is *endorse*, not
+warm/auth — the gateway cannot split a single fused RPC.
+
 ---
 
 ## 4. Committed optimizations (branch `bft-redesign`, not pushed)

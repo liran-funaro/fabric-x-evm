@@ -67,9 +67,9 @@ from repo root. Monitoring config is under `config/monitoring/`.
   with `-enable-metrics`.
 - **Grafana** — http://localhost:3000 — open the **EVM / Loadgen** dashboard
   (`config/monitoring/grafana/evm-loadgen.json`, uid `evm-loadgen`). Panels:
-  EVM tx/s, committer tx/s (batches), in-flight/outstanding, warm vs auth
-  phase latency, commit latency, rollback rate, spec-version aborts by class,
-  queue sizes.
+  EVM tx/s, committer tx/s (batches), in-flight/outstanding, phase latency
+  (endorse for serial / warm+auth for `-pipeline`), commit latency, rollback
+  rate, spec-version aborts by class, queue sizes.
 
 ---
 
@@ -80,6 +80,7 @@ The harness chdirs to `integration/`, so `-gateway-config` and its internal
 
 ```bash
 # SYNTHETIC (conflict-free ceiling)
+PERF_REPLAY_WINDOW_SIZE=50000 \
 go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
   ./integration/perf/... \
   -gateway-config ../config/gateway/fabx-full.yaml \
@@ -87,13 +88,23 @@ go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
 
 # HISTORIC (high-conflict) — fresh stack first (state accumulates on a live chain)
 make stop-full clean-x && make clean-x init-x start-full
+PERF_REPLAY_WINDOW_SIZE=50000 \
 go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
   ./integration/perf/... \
   -gateway-config ../config/gateway/fabx-full.yaml \
   -dataset historic -max-batch-size 1024 -enable-metrics
 ```
 
+> **`PERF_REPLAY_WINDOW_SIZE` — set it, or you measure a smoke run.** The test
+> windows the dataset to this many transfers before replaying. **Unset it
+> defaults to `3000`** (a fast smoke run, *not* a headline number); the
+> documented ec2 headlines use **`50000`**; **`0` = the whole dataset**
+> (400 000 synthetic / 151 045 historic — long). Watch the `Loaded N transfers`
+> vs the windowed count in the log to confirm what actually ran.
+
 Key flags (`integration/perf/replay_json_dataset_test.go`):
+- `PERF_REPLAY_WINDOW_SIZE=N` (env) — transfers replayed after windowing;
+  unset = `3000` (smoke), `50000` = documented headline, `0` = whole dataset.
 - `-dataset synthetic|historic|<path>` — the workload (**run both**).
 - `-max-batch-size N` — max EVM txs per merged committer tx; `0` = unbounded
   drain-all. Best steady config is 512–1024 (throughput is flat above ~1024).
@@ -128,15 +139,19 @@ From the test log:
 
 From Grafana (screenshot or note the steady-state values):
 - EVM tx/s and committer tx/s (batches) — the two headline throughputs.
-- Warm vs auth phase latency (p50/p99), commit latency.
+- Phase latency (p50/p99): **serial populates `endorse`** (the fused warm+auth
+  RPC, ≈165–190 ms/batch on ec2); **`-pipeline` populates `warm` + `auth`** and
+  leaves `endorse` empty. Only one mode's series is live per run — a flat-empty
+  warm/auth panel under serial is expected, not a bug. Plus commit latency.
 - Rollback rate and spec-version aborts by class (should be flat/zero for
   serial synthetic; non-zero abort classes are the signal when testing the
   pipeline).
 
 Metric names (Prometheus): `loadgen_transaction_committed_total` (EVM tx/s via
 `rate(...)`), `loadgen_batch_committed_total` (committer tx/s),
-`gateway_warm_phase_seconds`, `gateway_auth_phase_seconds`,
-`gateway_commit_latency_seconds`, `gateway_batches_rolled_back_total`,
+`gateway_endorse_phase_seconds` (serial fused warm+auth),
+`gateway_warm_phase_seconds` + `gateway_auth_phase_seconds` (`-pipeline` split
+only), `gateway_commit_latency_seconds`, `gateway_batches_rolled_back_total`,
 `gateway_spec_abort_total{class}`.
 
 ---
@@ -188,7 +203,8 @@ bash scripts/setup.sh
 for ds in synthetic historic; do
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full
-  GOGC=500 GOMEMLIMIT=48GiB go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
+  PERF_REPLAY_WINDOW_SIZE=50000 GOGC=500 GOMEMLIMIT=48GiB \
+  go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
     ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \
     -dataset "$ds" -max-batch-size 1024 -enable-metrics 2>&1 | tee "$EVM_PERF_DATA/results/replay_$ds.log"
 done
