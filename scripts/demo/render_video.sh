@@ -25,7 +25,11 @@ GRAFANA="${GRAFANA:-http://localhost:3000}"
 FFMPEG_IMAGE="${FFMPEG_IMAGE:-jrottenberg/ffmpeg:7.1-ubuntu}"
 PARALLEL="${PARALLEL:-6}"
 
-DEMO_DIR="$EVM_PERF_DATA/demo"
+# DEMO_LABEL scopes every artifact to one run. Without it a second run would
+# silently reuse the first run's frames -- the resume logic skips files that
+# already exist, and those frames are of a completely different time window.
+DEMO_LABEL="${DEMO_LABEL:-}"
+DEMO_DIR="$EVM_PERF_DATA/demo${DEMO_LABEL:+/$DEMO_LABEL}"
 OUT_DIR="$DEMO_DIR/video"
 
 # Font path INSIDE the ffmpeg container. The image already ships DejaVu, so the

@@ -20,6 +20,8 @@ DURATION=""
 OUTSTANDING=100000
 DATASET=historic
 BATCH_SIZE=1024
+TARGET_TPS=0
+LABEL=""
 DO_RENDER=1
 MIN_FREE_GB=10
 
@@ -29,6 +31,8 @@ while [ $# -gt 0 ]; do
     --outstanding) OUTSTANDING="$2"; shift 2 ;;
     --dataset)     DATASET="$2"; shift 2 ;;
     --batch-size)  BATCH_SIZE="$2"; shift 2 ;;
+    --target-tps)  TARGET_TPS="$2"; shift 2 ;;
+    --label)       LABEL="$2"; shift 2 ;;
     --no-render)   DO_RENDER=0; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -36,7 +40,12 @@ done
 [ -n "$DURATION" ] || { echo "error: --duration is required (e.g. 8h, 20m)" >&2; exit 2; }
 
 : "${EVM_PERF_DATA:?set EVM_PERF_DATA (e.g. \$HOME/workspace/evm-perf-data)}"
-DEMO_DIR="$EVM_PERF_DATA/demo"
+
+# --label scopes every artifact of this run (logs, frames, videos) so a second
+# run cannot clobber the first's evidence or silently reuse its frames.
+export DEMO_LABEL="$LABEL"
+DEMO_DIR="$EVM_PERF_DATA/demo${LABEL:+/$LABEL}"
+TSDB_DIR="$EVM_PERF_DATA/demo/prometheus-data"
 REPLAY_LOG="$DEMO_DIR/replay.log"
 WATCHDOG_LOG="$DEMO_DIR/watchdog.log"
 SUMMARY="$DEMO_DIR/SUMMARY.txt"
@@ -65,6 +74,14 @@ go version >/dev/null || { echo "error: go not on PATH" >&2; exit 1; }
 # --------------------------------------------------------------------------- #
 log "bringing up a fresh stack (DEMO=1)"
 DEMO=1 make stop-full clean-x >/dev/null 2>&1 || true
+
+# Start from an empty TSDB. The bind mount survives `down -v` by design, so
+# without this a new run's opening frames would show the PREVIOUS run's tail
+# inside the 15-minute sliding window -- a throughput cliff that never happened.
+# Consequence: render a run before starting the next one (the orchestrator does).
+log "clearing the previous run's TSDB at $TSDB_DIR"
+rm -rf "$TSDB_DIR"
+
 DEMO=1 make clean-x init-x start-full
 
 log "waiting for Prometheus"
@@ -161,7 +178,7 @@ trap cleanup EXIT
 # The replay. Serial executor (default): -pipeline is unsolved and must never
 # appear in a client demo.
 # --------------------------------------------------------------------------- #
-log "starting replay: dataset=$DATASET duration=$DURATION outstanding=$OUTSTANDING batch=$BATCH_SIZE"
+log "starting replay: dataset=$DATASET duration=$DURATION outstanding=$OUTSTANDING batch=$BATCH_SIZE target-tps=$TARGET_TPS"
 set +e
 PERF_REPLAY_WINDOW_SIZE=0 \
 PERF_REPLAY_WRAP_COUNT=100000 \
@@ -173,6 +190,7 @@ go test -timeout 24h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
   -dataset "$DATASET" \
   -max-batch-size "$BATCH_SIZE" \
   -max-outstanding "$OUTSTANDING" \
+  -target-tps "$TARGET_TPS" \
   -enable-metrics 2>&1 | tee "$REPLAY_LOG"
 REPLAY_RC=${PIPESTATUS[0]}
 set -e
@@ -200,8 +218,15 @@ fi
   echo "EVM on Fabric-X -- client demo run"
   echo "generated: $(date -Is)"
   echo
+  echo "label:   ${LABEL:-(none)}"
   echo "config:  dataset=$DATASET duration=$DURATION max-outstanding=$OUTSTANDING"
   echo "         max-batch-size=$BATCH_SIZE executor=serial GOGC=500 GOMEMLIMIT=48GiB"
+  if [ "$TARGET_TPS" != "0" ]; then
+    echo "         target-tps=$TARGET_TPS  <-- THROTTLED on purpose to fit the disk"
+    echo "         budget; this is NOT the system's throughput ceiling."
+  else
+    echo "         target-tps=0 (unpaced -- this run measures the true ceiling)"
+  fi
   echo "exit:    replay=$REPLAY_RC render=$RENDER_RC"
   echo
   echo "--- headline ---"
