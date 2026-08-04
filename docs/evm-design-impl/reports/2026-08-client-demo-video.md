@@ -16,8 +16,8 @@ All under `$EVM_PERF_DATA/demo/<label>/video/` on the experiment host.
 |---|---|---|---|
 | **A — headline** | full rate, 30 min, `-orderers 64` | `demo-full.mp4` (1× real time, 30 min, 8.1 MB), `demo-highlight.mp4` (86 s) | **client-ready** |
 | **B — endurance (first attempt)** | 500 tx/s, `-orderers 64` | `demo-full.mp4` (85 min), `demo-highlight.mp4` | **not client-ready** — records the stall of §4; kept as evidence |
-| **D — endurance retry** | 500 tx/s, 2.5 h, `-orderers 1` | client + full-stack videos | see §3 |
-| **C — full-stack headline** | full rate, 30 min, both dashboards | client + full-stack videos | see §3 |
+| **D — endurance retry** | 500 tx/s, `-orderers 1` | none (stopped) | **failed** — collapsed at t+52 min, refuting §4's hypothesis |
+| **C — full-stack headline** | full rate, 30 min, both dashboards | `demo-full/-highlight`, `stack-full/-highlight` | **SHIPPED — show this one** |
 
 Both videos are 1920×1080 H.264 / yuv420p with an ffmpeg-drawn title card, timed
 captions and a closing totals card. The full video is **1× real time and unedited
@@ -89,22 +89,37 @@ climbing. It did **not** recover (Run B had recovered from its first burst).
 Stopped early rather than spend 90 minutes rendering a second stall. Evidence
 kept at `~/stall-evidence/` on the host. See §4.
 
-## 4. Finding — throttled runs violate the single-submitter invariant
+## 4. Finding — throttled runs wedge at ~110k committer txs (cause UNKNOWN)
 
-Full detail in [findings.md §11](../findings.md). Summary: the serial executor
-returns from `executeCycle` **without waiting for the commit** and executes each
-batch against the previous in-flight batch's *uncommitted* cache writes, so
-dependent committer txs must reach the orderer **in submission order**.
-`orderedOrdererSubmitterCount` enforces that only on the production path;
-`BuildGateway` (the perf harness) takes an explicit count and `-orderers` defaults
-to **64**. Big batches hide it (endorse ~200 ms ⇒ one batch in the channel at a
-time); throttling shrinks batches (~14 txs, ~30 ms endorse) so several queue at
-once and 64 workers can reorder them.
+Full detail in [findings.md §11](../findings.md).
 
-**Open decision for the owner:** either `BuildGateway` should clamp like
-`buildApp`, or `-orderers` should default to 1. Not changed here — every number in
-findings §2 was measured at 64, and at full rate the clamp is a no-op in practice,
-but that should be measured before changing a default all recorded results rest on.
+| Run | `-orderers` | Onset | EVM txs | **Committer txs at onset** |
+|---|---|---:|---:|---:|
+| B | 64 | t+48 min | ~1.44 M | ~102 000 |
+| D | **1** | t+52 min | ~1.56 M | ~111 800 |
+| A / C (full rate) | 64 | never | 10.4 M clean | ~10 150 *total* |
+
+**My first attribution was wrong and is recorded as such.** I proposed the §9
+single-submitter invariant (the serial executor endorses batch N+1 against N's
+uncommitted cache writes, and `orderedOrdererSubmitterCount` clamps submission to
+one worker only on the production path while the harness defaults `-orderers` to
+64). Run D tested it with `-orderers 1` and collapsed identically, so concurrent
+submission is **not** the cause. Don't re-run that experiment.
+
+Ruled out by evidence: read path (QS queueing flat at 2–3 ms through the
+collapse), crashes/resources (all 22 containers healthy, 16 GB free), observer CPU
+(renderer at 0.2 % when the first abort landed), submitter concurrency, and
+monotonic degradation (the failure is episodic — Run B had 8 clean minutes with a
+frozen rollback counter between bursts).
+
+Best remaining lead: onset tracks **cumulative committer-tx count** (~110 k), not
+elapsed time or tx count. Caveat: two data points, and batch count is confounded
+with the throttled small-batch regime, since no full-rate run has exceeded ~10 k
+batches. Abort class is `unclassified`.
+
+**Decisive next experiment (~45 min, queued):** 1000 tx/s, everything else
+identical. Batches accumulate ~2× faster, so a batch-count threshold predicts
+onset at ~t+25 min while a time-based cause predicts ~t+50 min.
 
 ## 5. Finding — run length is disk-bound, not time-bound
 
@@ -116,8 +131,12 @@ transaction budget per run**, so duration and throughput trade off directly:
 ~35 min at the 5.7k ceiling, ~3 h at 500 tx/s, 8 h only at ~460 tx/s.
 
 **A multi-hour run at full throughput is not possible on this host.** It needs a
-bigger volume, not tuning. This is why the deliverable is a *pair*: a full-rate
-headline and a throttled endurance run.
+bigger volume, not tuning. Combined with §4 — throttling to reach multi-hour hits
+the wedge — **no clean multi-hour run on the real dataset was achievable.** The
+shipped deliverable is therefore the full-rate 30-minute pair (client +
+full-stack). For a long *clean* video, `-dataset synthetic` (documented
+conflict-free) would work, but it is synthetic load and that trade is the owner's
+call.
 
 ## 6. Bugs found and fixed while building
 
