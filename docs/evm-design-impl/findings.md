@@ -359,3 +359,64 @@ For deliberately long runs, `-target-tps` paces submission below the ceiling
 
 Discovered while producing the client demo video
 ([demo-video.md](demo-video.md)); it is a property of the stack, not of the demo.
+
+---
+
+## 11. Throttled runs violate the single-submitter invariant (2026-08-04) ⚠️
+
+**Symptom.** A deliberately throttled run (`-target-tps 500`, historic dataset,
+serial executor) ran perfectly for **48 minutes** — 500 tx/s, ~14 EVM/batch, **0
+rolled-back batches** — then produced bursts of MVCC aborts, recovered once, and
+collapsed on the second burst: in-flight climbed to the 100 000 cap, commits went
+to zero, and every committer tx was aborting (`rollbacks/s == committer tx/s`).
+Final: 2 256 740/2 356 740 committed, **7 334 rolled-back batches**, 7 175
+`gateway_spec_abort_total{class="unclassified"}`. The same code at full rate
+(Run A: 1024 EVM/batch, 5 729 tx/s) committed **10.4 M txs with 0 rollbacks**, so
+this is not cumulative state or history volume.
+
+**What the evidence ruled out.**
+- *Read path:* `queryservice_database_batch_queueing_time` stayed flat at 2–3 ms
+  across the whole run, including through the collapse. Not QS/DB latency.
+- *Crash / resource:* all 22 containers healthy, 16 GB disk still free, no OOM.
+- *External CPU:* the Grafana renderer (running dashboard captures on the same
+  host) sat at 0.2–0.3 % when the first abort landed; its peak was 0.83 of 32
+  cores. Not observer interference.
+- *Monotonic degradation:* the failure is **episodic** — 8 clean minutes between
+  the first and second burst, with the rollback counter frozen — not a ramp.
+  `endorse` p99 rose *with* the aborts (0.03 s → 0.45 s) because retries inflate
+  batch size (QS batch query size 7.7 → 103 keys), so it is a consequence.
+
+**Root cause.** `executeCycle` returns **without waiting for the commit**, and
+each batch executes against the `VersionedCache` carrying the prior in-flight
+batch's writes — so on the **serial** path too, batch N+1 may read N's
+*uncommitted* writes, and the committer must therefore see dependent committer
+txs **in submission order**. That is exactly the single-submitter invariant of §9,
+but `orderedOrdererSubmitterCount` clamps submission to one worker only on the
+**production** path (`gateway/app.buildApp`). `BuildGateway` — which the perf
+harness uses (`integration/test_helpers.go`) — takes an explicit worker count, and
+the harness flag `-orderers` **defaults to 64**.
+
+Batch size is what hides or exposes it:
+
+| Regime | Endorse | Batches queued at once | Reordering | Result |
+|---|---|---|---|---|
+| Full rate, 1024 EVM/batch | ~200 ms | one | no opportunity | 10.4 M txs, 0 aborts |
+| Throttled, ~14 EVM/batch | ~30 ms | several | 64 workers race | abort → cascade |
+
+Throttling does not conflict *directly*; it shrinks batches, which shortens
+endorse, which lets several batches sit in `endorsementChan` simultaneously, which
+gives 64 concurrent submitter workers the chance to deliver a dependent committer
+tx ahead of its predecessor. `unclassified` is the expected abort class: this is a
+submission-order abort, not one of the classified stale-read hypotheses.
+
+**Mitigation for any throttled or small-batch run: `-orderers 1`.** The flag
+already exists; no code change needed. **Status: under test** (a 3 h run at
+500 tx/s with `-orderers 1`); confirmation is that it stays clean well past the
+48-minute mark. Do not treat the root cause as proven until that run reports.
+
+**Open question for the owner.** The harness default of 64 violates a documented
+invariant on the default execution path. Either `BuildGateway` should clamp like
+`buildApp` does, or `-orderers` should default to 1. At full rate the clamp is a
+no-op in practice (one batch in the channel at a time), so the §2 headline numbers
+are very likely unaffected — but that should be measured before changing a default
+every recorded number depends on.

@@ -21,6 +21,15 @@ OUTSTANDING=100000
 DATASET=historic
 BATCH_SIZE=1024
 TARGET_TPS=0
+# Orderer BatchSubmitter workers. The harness default is 64, which is safe ONLY
+# when batches are big: the serial executor endorses batch N+1 against N's
+# UNCOMMITTED cache writes, so dependent committer txs must reach the orderer in
+# submission order (findings.md section 9's single-submitter invariant). At
+# 1024 txs/batch endorse takes ~200ms, so one batch is in the channel at a time
+# and concurrent workers never get to reorder. Throttled runs make small batches
+# (~14 txs, ~30ms endorse), several queue at once, 64 workers race, a dependent
+# tx lands first -> MVCC abort -> cascade. Use 1 for any throttled run.
+ORDERERS=64
 LABEL=""
 DO_RENDER=1
 MIN_FREE_GB=10
@@ -32,6 +41,7 @@ while [ $# -gt 0 ]; do
     --dataset)     DATASET="$2"; shift 2 ;;
     --batch-size)  BATCH_SIZE="$2"; shift 2 ;;
     --target-tps)  TARGET_TPS="$2"; shift 2 ;;
+    --orderers)    ORDERERS="$2"; shift 2 ;;
     --label)       LABEL="$2"; shift 2 ;;
     --no-render)   DO_RENDER=0; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -185,7 +195,7 @@ trap cleanup EXIT
 # The replay. Serial executor (default): -pipeline is unsolved and must never
 # appear in a client demo.
 # --------------------------------------------------------------------------- #
-log "starting replay: dataset=$DATASET duration=$DURATION outstanding=$OUTSTANDING batch=$BATCH_SIZE target-tps=$TARGET_TPS"
+log "starting replay: dataset=$DATASET duration=$DURATION outstanding=$OUTSTANDING batch=$BATCH_SIZE target-tps=$TARGET_TPS orderers=$ORDERERS"
 set +e
 PERF_REPLAY_WINDOW_SIZE=0 \
 PERF_REPLAY_WRAP_COUNT=100000 \
@@ -198,6 +208,7 @@ go test -timeout 24h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
   -max-batch-size "$BATCH_SIZE" \
   -max-outstanding "$OUTSTANDING" \
   -target-tps "$TARGET_TPS" \
+  -orderers "$ORDERERS" \
   -enable-metrics 2>&1 | tee "$REPLAY_LOG"
 REPLAY_RC=${PIPESTATUS[0]}
 set -e
@@ -233,7 +244,7 @@ fi
   echo
   echo "label:   ${LABEL:-(none)}"
   echo "config:  dataset=$DATASET duration=$DURATION max-outstanding=$OUTSTANDING"
-  echo "         max-batch-size=$BATCH_SIZE executor=serial GOGC=500 GOMEMLIMIT=48GiB"
+  echo "         max-batch-size=$BATCH_SIZE orderers=$ORDERERS executor=serial GOGC=500 GOMEMLIMIT=48GiB"
   if [ "$TARGET_TPS" != "0" ]; then
     echo "         target-tps=$TARGET_TPS  <-- THROTTLED on purpose to fit the disk"
     echo "         budget; this is NOT the system's throughput ceiling."
