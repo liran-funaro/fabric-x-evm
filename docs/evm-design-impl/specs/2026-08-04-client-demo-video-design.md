@@ -16,7 +16,7 @@ Related: run-book [../experiments.md](../experiments.md) · host setup
 
 | Artifact | Content |
 |---|---|
-| `demo-full.mp4` | The whole overnight run as a time-lapse of the client dashboard. |
+| `demo-full.mp4` | The whole overnight run at **1× real time**, unedited in pace — the presenter speeds up or scrubs as needed. |
 | `demo-highlight.mp4` | ~90 s cut from the same frame pipeline: title card → slow opening → accelerated sweep → closing totals card. |
 | `docs/evm-design-impl/demo-video.md` | Operator run-book (pre-flight, smoke, overnight, render, teardown). |
 | `$EVM_PERF_DATA/demo/` | Frames, run log, watchdog log, and the run's `Replay complete:` / `Commit-path timing:` lines as evidence. |
@@ -24,26 +24,38 @@ Related: run-book [../experiments.md](../experiments.md) · host setup
 Both videos: 1920×1080, H.264, **no audio**, with an ffmpeg-drawn title card and
 timed on-screen captions.
 
-"Multi-hour" describes the **experiment**, not playback length: the full video
-represents ~8 hours in ~8 minutes.
+"Multi-hour" describes the experiment **and** the full video: an ~8-hour run
+produces an ~8-hour real-time recording, with the ~90 s highlight as the short
+artifact for anyone who won't sit through it.
 
 ### Video parameters
 
 | | `demo-full.mp4` | `demo-highlight.mp4` |
 |---|---|---|
-| Video length | 1 s per 1 min of run (8 h run → 8 min) | ~90 s |
-| **Content** frame rate | **5 fps** | 24 fps |
-| Output frame rate | 30 fps | 30 fps |
-| Frames rendered | ~2 400 | ~2 160 |
-| Time step per frame | uniform 12 s (≈60× speed) | ramp 1 s (≈24×) → ~25 s (≈600×) |
+| Playback speed | **1× — real time, no speed-up** | ramp ≈24× → ≈600× |
+| Video length | equals the run (8 h run → 8 h video) | ~90 s |
+| **Content** frame rate | **0.5 fps** (1 frame per 2 s of run) | 24 fps |
+| Output frame rate | 10 fps | 30 fps |
+| Frames rendered | ~14 400 (8 h) | ~2 160 |
+| Time step per frame | uniform 2 s | ramp 1 s → ~25 s |
 | Sliding window | 15 min | 15 min |
-| Estimated size | ~10–25 MB | ~15–30 MB |
+| Size | measured in the smoke run; expect ~100–400 MB | ~15–30 MB |
 
-The full video uses a deliberately low **content** frame rate because the
-dashboard changes slowly — 5 fps keeps both the file and the render time small.
-It is encoded at a 30 fps **output** rate with duplicated frames; x264 codes
-those as near-empty P-frames, so the file stays small while avoiding low-fps
-playback quirks in some players.
+**`demo-full.mp4` is real time and unedited in pace** — the presenter speeds up
+or scrubs in their own player as needed, and nothing about the timeline is
+massaged. Real time here means the time step between frames equals the time each
+frame is held on screen: a frame every 2 s of run, displayed for 2 s. It is
+encoded at a 10 fps **output** rate with each content frame duplicated 20×; x264
+codes duplicates as near-empty P-frames, so this costs almost nothing and avoids
+low-fps playback quirks in some players.
+
+The low content rate is what keeps an 8-hour 1080p file reasonable. If the smoke
+run's measured MB/hour projects past the acceptable size, the lever is the
+content rate — 1 frame per 5 s is still exactly real time, just choppier — or a
+higher CRF. **Never** speed the video up to shrink it.
+
+All speed-up lives in the highlight cut, which is where an edited pace is
+expected.
 
 ---
 
@@ -83,13 +95,17 @@ implementation without re-checking the code.
 6. **No ffmpeg on the Mac; `ec2` has only variable fonts** (`google-noto-vf`,
    `redhat-vf`), which `ffmpeg drawtext` handles badly. Everything runs in
    containers on `ec2`, with one static TTF shipped in.
-7. **Metric resolution bounds the slowest useful playback speed.** A literal 1×
-   real-time segment is impossible: consecutive frames closer together than the
-   scrape interval render identical data. The `loadgen` job drops to
-   `scrape_interval: 1s` (that job only — 1 s on the ~24 orderer/committer
-   targets would add measurement overhead), making ~24× the finest useful step.
-   The "live" feel comes from the smoothly scrolling window, not from 1× speed,
-   and is not labelled as real-time.
+7. **Metric resolution bounds the frame rate, not the playback speed.** Frames
+   spaced closer together than the scrape interval render identical data, so the
+   scrape interval sets the *maximum useful content frame rate* — it does not
+   prevent 1× playback. Real time at a low content rate is therefore fine: the
+   `loadgen` job drops to `scrape_interval: 1s` (that job only — 1 s on the ~24
+   orderer/committer targets would add measurement overhead), which supports up
+   to 1 fps of distinct frames; the full video's 0.5 fps sits comfortably inside
+   that with 2 samples per frame. Every metric the demo dashboard uses,
+   `gateway_*` included, is registered in the loadgen's own registry
+   ([metrics.go:166-187](../../../integration/perf/metrics.go#L166-L187)) and
+   scraped by that one job, so no other scrape config changes.
 
 ---
 
@@ -219,8 +235,12 @@ the experiment finishes, against the persisted TSDB.
 
 1. **Window discovery** — query Prometheus for the run's first and last sample.
 2. **Frame math** — for each frame *i*: `to = t₀ + step·i`, `from = to − 15 min`
-   (sliding window → the video reads as a live scrolling dashboard). The
-   highlight uses a non-uniform step ramp; see the parameter table in §1.
+   (sliding window → the video reads exactly like watching the dashboard live).
+   For the full video the step is uniform and equals the frame's on-screen
+   duration (`step = 1 / content_fps`), which is what makes playback 1×; the
+   render script derives one from the other rather than taking both as
+   independent inputs, so the two can't drift out of sync and silently produce a
+   sped-up "real time" video. The highlight uses a non-uniform step ramp; see §1.
 3. **Frame render** — `GET /render/d/evm-demo?from=<ms>&to=<ms>&width=1920&height=1080&kiosk&theme=dark&tz=UTC`,
    4–6 in parallel via `xargs -P`, to `frames/%06d.png`.
 4. **Assembly** — containerized ffmpeg on `ec2` (no host installs). Body video
@@ -305,6 +325,7 @@ not another night.
 | Dashboard queries | Script asserting every panel expression returns data from the live Prometheus — catches a typo'd metric name *before* the night, not after |
 | No regression | Re-run the standard 50k `historic` run with `-max-outstanding` unset; tx/s must match the recorded ~5617 ([findings.md](../findings.md) §2) |
 | Render pipeline | The smoke-run mp4 is the test: assert frame count equals the computed N and mp4 duration is within tolerance |
+| **Real-time invariant** | Assert the full video's duration equals the run's wall-clock duration within 1% — the one check that catches an accidentally sped-up "real time" video, which is otherwise easy to miss by eye |
 | Palette | Already validated — `validate_palette.js` PASS on `#181b1f` for both the categorical set and the ordinal latency ramp |
 
 ---
@@ -314,6 +335,9 @@ not another night.
 | Risk | Mitigation |
 |---|---|
 | Disk fills mid-run | Smoke run measures GB/hour; watchdog stops gracefully below 10 GB free |
+| Frames consume disk on top of the ledger | ~16.5k PNGs (~4 GB) for both videos; rendered *after* the run, and deleted once the mp4s verify. Budgeted against the same 89 GB |
+| Render wall-clock | ~16.5k frames at 6-way parallel ≈ 45–60 min, unattended. Real time raises frame count ~6× versus a time-lapse — a cost of the 1× requirement, not a problem |
+| Full video too large to share | Lower the content rate (1 frame / 5 s is still exactly real time) or raise CRF; never speed it up |
 | Run stalls or dies overnight | `tmux` + tee'd log + watchdog log make morning triage fast; the TSDB persists, so a partial run is still renderable — a 5 h run is still a good demo |
 | Render pipeline defect found in the morning | Frames come from stored metrics, so re-rendering is minutes; the smoke run should have caught it already |
 | `-max-outstanding` perturbs measurements | Default `0` = off; regression check re-runs the standard measured config |
