@@ -92,6 +92,14 @@ var maxBatchSize = flag.Int("max-batch-size", 128, "max EVM txs per merged commi
 // Start reads it once.
 var pipeline = flag.Bool("pipeline", false, "enable the warm(N+1)||auth(N) pipelined executor loop")
 
+// maxOutstanding bounds submitted-but-not-yet-committed EVM txs (see inflightLimiter).
+// 0 (the default) keeps the historical fire-everything feeder, so every measured
+// config in findings.md is unaffected. A positive value turns the replay into a
+// closed loop that self-paces to the sustainable rate, which is what makes a
+// multi-hour run possible: the fire-everything feeder outruns the drain rate
+// without bound and would exhaust the host's memory hours in.
+var maxOutstanding = flag.Int("max-outstanding", 0, "max submitted-but-uncommitted EVM txs (0 = unbounded, historical behavior)")
+
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.
 type TxCompletionTracker struct {
@@ -200,6 +208,29 @@ type replayConfig struct {
 	// totalDispatches is the total number of transfers to dispatch when
 	// wrapAround is true. Ignored when wrapAround is false.
 	totalDispatches int64
+
+	// duration, when > 0, stops the feeder after this much wall-clock time
+	// regardless of how many transfers remain. This is what makes an overnight
+	// run reliable: tx/s cannot be predicted closely enough to pick a wrap count
+	// that lands on a target time, but a stop time is exact. Used with
+	// windowSize 0 (whole dataset) and a large wrapCount, so the duration is
+	// what actually ends the run.
+	duration time.Duration
+}
+
+// effectiveTotal is the denominator for progress reporting and for deciding when
+// a run is complete. fedTotal is -1 while the feeder is still running and the
+// count of transfers actually fed once it stops.
+//
+// Under a duration stop the configured totalToSubmit (window x wrapCount) is
+// deliberately far larger than what will be fed, so both reporting and the
+// completion condition must switch to the fed count as soon as it is known --
+// otherwise a successful run never satisfies its own done condition and hangs.
+func effectiveTotal(fedTotal, totalToSubmit int64) int64 {
+	if fedTotal >= 0 {
+		return fedTotal
+	}
+	return totalToSubmit
 }
 
 func loadReplayConfigFromEnv(t *testing.T) replayConfig {
@@ -228,6 +259,13 @@ func loadReplayConfigFromEnv(t *testing.T) replayConfig {
 		if wrapCount > 1 {
 			cfg.wrapAround = true
 		}
+	}
+
+	if v := os.Getenv("PERF_REPLAY_DURATION"); v != "" {
+		d, err := time.ParseDuration(v)
+		assert.NoError(t, err, "PERF_REPLAY_DURATION must be a Go duration (e.g. 8h, 20m)")
+		assert.True(t, d > 0, "PERF_REPLAY_DURATION must be > 0")
+		cfg.duration = d
 	}
 
 	return cfg
@@ -559,15 +597,39 @@ func runReplayTest(
 	startTime := time.Now()
 
 	// Work channel: a bounded buffer that lets the feeder run ahead of the
-	// submitters without materializing every tx at once. There is deliberately
-	// no outstanding-completion cap -- the feeder pushes all totalToSubmit items
-	// and the gateway's pending pool absorbs whatever the executor hasn't yet
-	// drained (see the -outstanding removal note on the flags above).
+	// submitters without materializing every tx at once. By default there is no
+	// outstanding-completion cap -- the feeder pushes all totalToSubmit items and
+	// the gateway's pending pool absorbs whatever the executor hasn't yet drained
+	// (see the -outstanding removal note on the flags above). -max-outstanding
+	// re-introduces a cap for multi-hour runs only, where an unbounded pending
+	// pool would exhaust the host; see inflightLimiter.
 	type workItem struct {
 		index    int64
 		transfer TokenTransfer
 	}
 	workChan := make(chan workItem, 4096)
+
+	limiter := newInflightLimiter(*maxOutstanding)
+	if *maxOutstanding > 0 {
+		t.Logf("Closed-loop flow control: at most %d outstanding EVM txs", *maxOutstanding)
+	}
+
+	// fedTotal is -1 until the feeder stops, then the number of transfers it fed.
+	// Always read through effectiveTotal: under a duration stop, totalToSubmit is
+	// an unreachable ceiling and only the fed count is a real total.
+	fedTotal := int64(-1)
+	if cfg.duration > 0 {
+		t.Logf("Duration-bounded run: feeding for %s (wrap target %d is a ceiling, not a goal)",
+			cfg.duration, totalToSubmit)
+	}
+
+	// doneCh is closed once every fired tx has been accounted for (committed, or
+	// failed to even submit). Guarded by sync.Once so the completion goroutine,
+	// the feeder's final check, and the stall path can all request it safely.
+	// Declared before the feeder because the feeder signals it too (see below).
+	doneCh := make(chan struct{})
+	var doneOnce sync.Once
+	signalDone := func() { doneOnce.Do(func() { close(doneCh) }) }
 
 	// Submitters: fire every tx, never waiting for a completion.
 	var wg sync.WaitGroup
@@ -587,6 +649,10 @@ func runReplayTest(
 				if err := wrappedGateway.SendTransaction(ctx, tx); err != nil {
 					t.Logf("Transfer %d: SendTransaction error: %v", item.index, err)
 					atomic.AddInt64(&submitFailed, 1)
+					// Rejected outright, so it will never commit and never be
+					// credited -- return its slot or the closed loop leaks
+					// headroom and eventually wedges the feeder.
+					limiter.Release(1)
 					continue
 				}
 				atomic.AddInt64(&submitted, 1)
@@ -597,17 +663,77 @@ func runReplayTest(
 		})
 	}
 
-	// Feeder: push all totalToSubmit items (wrapping over the window as needed),
-	// then close workChan. No refill-on-completion.
+	// Feeder: push items (wrapping over the window as needed), then close
+	// workChan. Stops early on the configured duration, and -- when flow control
+	// is on -- waits for commit headroom before each push rather than
+	// refilling on completion.
 	var feederWg sync.WaitGroup
 	feederWg.Go(func() {
 		defer close(workChan)
 		cursor := 0
+		var fed int64
+		defer func() {
+			atomic.StoreInt64(&fedTotal, fed)
+			// The final completion may already have been processed before
+			// fedTotal became known, in which case nothing will re-evaluate the
+			// done condition -- so evaluate it here too, or a finished run hangs
+			// until the 60s stall detector rescues it with a misleading message.
+			if atomic.LoadInt64(&committedEVM)+atomic.LoadInt64(&submitFailed) >= fed {
+				signalDone()
+			}
+		}()
+
+		// feedCtx ends at the duration deadline, so a feeder blocked waiting for
+		// commit headroom still stops on time. Without this the deadline is only
+		// checked at the top of the loop, and a feeder parked in Acquire would
+		// never close workChan -- which wg.Wait() below is waiting on, so the
+		// drain and stall-detection path would never even be reached.
+		feedCtx := ctx
+		if cfg.duration > 0 {
+			var cancelFeed context.CancelFunc
+			feedCtx, cancelFeed = context.WithDeadline(ctx, startTime.Add(cfg.duration))
+			defer cancelFeed()
+		}
+
 		for i := int64(0); i < totalToSubmit; i++ {
+			if feedCtx.Err() != nil {
+				if cfg.duration > 0 {
+					t.Logf("Duration %s reached; feeder stopping after %d transfers", cfg.duration, fed)
+				}
+				return
+			}
+
+			// Closed loop: block until an earlier tx commits and frees headroom.
+			// No-op when flow control is off (nil limiter).
+			//
+			// Bounded, because a permanently wedged stack frees no headroom and an
+			// unbounded wait here would hang the whole test (see feedCtx above)
+			// rather than letting the drain/stall path report the failure. The
+			// bound is far above any legitimate commit gap -- commit latency is
+			// sub-second -- so reaching it always means something is broken.
+			const feederAcquireTimeout = 5 * time.Minute
+			acqCtx, cancelAcq := context.WithTimeout(feedCtx, feederAcquireTimeout)
+			err := limiter.Acquire(acqCtx)
+			cancelAcq()
+			if err != nil {
+				switch {
+				case ctx.Err() != nil:
+					// Whole test is shutting down.
+				case feedCtx.Err() != nil:
+					t.Logf("Duration %s reached while waiting for commit headroom; feeder stopping after %d transfers",
+						cfg.duration, fed)
+				default:
+					t.Logf("Feeder: no commit headroom for %s after %d transfers; stopping so the drain/stall path can report",
+						feederAcquireTimeout, fed)
+				}
+				return
+			}
+
 			select {
-			case <-ctx.Done():
+			case <-feedCtx.Done():
 				return
 			case workChan <- workItem{index: i, transfer: window[cursor]}:
+				fed++
 			}
 			cursor++
 			if cursor >= len(window) {
@@ -615,13 +741,6 @@ func runReplayTest(
 			}
 		}
 	})
-
-	// doneCh is closed once every fired tx has been accounted for (committed, or
-	// failed to even submit). Guarded by sync.Once so both the completion
-	// goroutine and the stall path can request it safely.
-	doneCh := make(chan struct{})
-	var doneOnce sync.Once
-	signalDone := func() { doneOnce.Do(func() { close(doneCh) }) }
 
 	// Completion goroutine: credit each committed batch with its committed
 	// sub-tx count so throughput is measured in EVM txs, not committer txs.
@@ -652,9 +771,14 @@ func runReplayTest(
 							metrics.RecordTransactionCommitted()
 						}
 					}
+					// These txs are done, so free their headroom for new work.
+					// The rollback branch below deliberately releases nothing:
+					// those EVM txs are still outstanding and get credited when a
+					// later batch commits them.
+					limiter.Release(n)
 					// Done when every fired tx is accounted for: committed, or
 					// failed to submit (those never commit).
-					if newTotal+atomic.LoadInt64(&submitFailed) >= totalToSubmit {
+					if newTotal+atomic.LoadInt64(&submitFailed) >= effectiveTotal(atomic.LoadInt64(&fedTotal), totalToSubmit) {
 						signalDone()
 					}
 				} else {
@@ -701,7 +825,8 @@ func runReplayTest(
 				}
 
 				t.Log(p.Sprintf("Progress: %d/%d EVM txs committed | submitted %d, in-flight %d | %d batches (avg %.1f EVM/batch), %d rolled back | %.0f EVM tx/s (recent), %.0f EVM tx/s (overall)",
-					committed, totalToSubmit, sub, inFlight, batches, avgBatch, rb, recent, overall))
+					committed, effectiveTotal(atomic.LoadInt64(&fedTotal), totalToSubmit),
+					sub, inFlight, batches, avgBatch, rb, recent, overall))
 
 				if metrics != nil {
 					metrics.SetOutstandingTransactions(inFlight)
@@ -721,11 +846,14 @@ func runReplayTest(
 	// Wait until all txs are fired (submission is local and fast under nonce
 	// bypass; the pending pool holds the backlog).
 	wg.Wait()
+	// The feeder has finished by now (workChan is closed and drained), so
+	// fedTotal is authoritative from here on.
+	targetTotal := effectiveTotal(atomic.LoadInt64(&fedTotal), totalToSubmit)
 	t.Logf("Submission complete: %d submitted, %d failed to submit (of %d)",
-		atomic.LoadInt64(&submitted), atomic.LoadInt64(&submitFailed), totalToSubmit)
+		atomic.LoadInt64(&submitted), atomic.LoadInt64(&submitFailed), targetTotal)
 
 	// If every fired tx already failed to submit, there is nothing to wait for.
-	if atomic.LoadInt64(&submitFailed) >= totalToSubmit {
+	if atomic.LoadInt64(&submitFailed) >= targetTotal {
 		signalDone()
 	}
 
@@ -750,7 +878,7 @@ wait:
 				lastProgress = time.Now()
 			} else if time.Since(lastProgress) > stallTimeout {
 				t.Logf("Stalled: no commit progress for %s (%d/%d EVM txs committed); giving up",
-					stallTimeout, cur, totalToSubmit)
+					stallTimeout, cur, targetTotal)
 				break wait
 			}
 		}
@@ -786,7 +914,7 @@ wait:
 	}
 
 	t.Logf("Replay complete: %d/%d EVM txs committed in %.1fs across %d committer txs (avg %.1f EVM/batch); %d rolled-back batches, %d submit failures | %.0f EVM tx/s",
-		finalCommitted, totalToSubmit, elapsed, finalBatches, avgBatch, finalRolledBack, finalSubmitFailed, evmThroughput)
+		finalCommitted, targetTotal, elapsed, finalBatches, avgBatch, finalRolledBack, finalSubmitFailed, evmThroughput)
 
 	// Commit-path timing: submit->commit-notification latency and how full the
 	// in-flight window got. If peak in-flight stays below the cap, the commit path
@@ -800,7 +928,10 @@ wait:
 	}
 
 	// Return (EVM tx/s, EVM txs that never committed, total EVM txs targeted).
-	return evmThroughput, totalToSubmit - finalCommitted, totalToSubmit
+	// Under a duration stop the target is what was actually fed, not the wrap
+	// ceiling -- otherwise the caller computes a ~100% failure rate on a
+	// perfectly healthy run.
+	return evmThroughput, targetTotal - finalCommitted, targetTotal
 }
 
 // TestReplayJSONDataset loads the USDC_dataset.json.gz file with pre-generated transactions
