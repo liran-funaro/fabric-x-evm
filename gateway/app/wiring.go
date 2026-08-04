@@ -95,7 +95,12 @@ func NewGatewaySynchronizer(protocol string, db network.BlockHeightReader, chann
 // exactly one *core.VersionedCache per gateway and pass the SAME pointer both here and to
 // the cacheWrap given to the endorser factory (see endorser/app.NewEndorserCore), or
 // pipelined reads silently diverge between the gateway's writes and the endorsers' reads.
-func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int, maxInflight int, notifyTimeout time.Duration, pipelined bool, cache *core.VersionedCache) (*core.Gateway, error) {
+// orderGate, when non-nil, installs the depth-1 ordered-submission gate on the
+// batch submitter (see core.OrderGate); orderTimeout bounds each per-batch wait.
+// The gate requires submitterCount == 1 (SetOrderGate no-ops with a warning
+// otherwise). Real backends pass a live gate wired to an ordered-delivery stream
+// when gateway.ordered-submit is enabled; test/other backends pass nil, 0.
+func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Signer, netCfg common.Network, chain core.Store, submitters []core.Submitter, submitterCount int, endorsementChanSize int, txPerSec int, maxBatchSize int, maxInflight int, notifyTimeout time.Duration, pipelined bool, cache *core.VersionedCache, orderGate *core.OrderGate, orderTimeout time.Duration) (*core.Gateway, error) {
 	ec, err := core.NewEndorsementClient(endorsers, gwSigner, netCfg.Channel, netCfg.Namespace, netCfg.NsVersion)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create endorsement client: %w", err)
@@ -106,6 +111,11 @@ func BuildGateway(ctx context.Context, endorsers []eapi.Service, gwSigner sdk.Si
 	}
 	endorsementChan := make(chan sdk.Endorsement, endorsementChanSize)
 	batchSubmitter := core.NewBatchSubmitter(submitters, endorsementChan, submitterCount, txPerSec)
+	// Install the ordered-submission gate before Start so the first submitted
+	// batch is gated (SetOrderGate no-ops if submitterCount != 1).
+	if orderGate != nil {
+		batchSubmitter.SetOrderGate(orderGate, orderTimeout)
+	}
 	batchSubmitter.Start(ctx)
 
 	gw, err := core.New(ec, batchSubmitter, chain, netCfg.ChainID, endorsementChan, cache)

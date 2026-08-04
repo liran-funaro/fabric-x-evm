@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -140,18 +142,23 @@ type Gateway struct {
 	// concurrently with the executor goroutine.
 	//
 	// IDENTICAL IN EFFECT TO SERIAL, at ANY prefetch depth. auth(N) does not read
-	// warm(N+1)'s pinned snapshot: it reopens onto a FRESH committed view (see
-	// AuthMergedBatch / ReopenableReadStore), and that view carries NO stale read
-	// cache of its own (query.View.Reopen opens an empty one). So the authoritative
-	// read path is exactly: the live cross-batch in-flight write cache (shadows
-	// hot keys still in flight), then the write-eviction-safe read-only MFU cache
-	// (VersionedCache.readOnlyGet, evicted on any write to a key), then the fresh
-	// committed view. Every one of those layers reflects state at or newer than
-	// the committed version an authoritative read must see, so recorded MVCC
-	// read-versions match committed and the old stale-read abort cascade cannot
-	// occur -- regardless of how many batches are in flight. This removes the
-	// former depth-1 correctness bound entirely; with no external (non-EVM)
-	// traffic the pipeline never livelocks at any batch size.
+	// warm(N+1)'s pinned snapshot: it reopens onto a view whose UNREAD keys reflect
+	// current committed state (see AuthMergedBatch / ReopenableReadStore). So the
+	// authoritative read path is exactly: the live cross-batch in-flight write cache
+	// (shadows hot keys still in flight), then the write-eviction-safe read-only MFU
+	// cache (VersionedCache.readOnlyGet, evicted on any write to a key), then the
+	// reopened committed view. That reopened view INHERITS the reads warm already
+	// fetched (so auth serves them as cache hits, not cold query-service
+	// round-trips) and resolves any key warm never fetched against a fresh viewID.
+	// Inheriting is safe because the write-cache layer above shadows every key an
+	// in-flight or just-committed batch wrote, so an inherited read is only ever a
+	// key whose committed version cannot advance before auth reads it. Every one of
+	// those layers therefore reflects state at or newer than the committed version
+	// an authoritative read must see, so recorded MVCC read-versions match committed
+	// and the old stale-read abort cascade cannot occur -- regardless of how many
+	// batches are in flight. This removes the former depth-1 correctness bound
+	// entirely; with no external (non-EVM) traffic the pipeline never livelocks at
+	// any batch size.
 	//
 	// VersionedCache.DrainEvictionsDeferred (holding a committed batch's writes one
 	// extra boundary) is kept purely as a read-locality optimization -- a committed
@@ -246,11 +253,14 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // The serial path is byte-identical either way at the submit boundary (both go
 // through submitBatch).
 //
-// auth reopens warm's stale snapshot onto a FRESH committed view (see
-// execution.AuthMergedBatch / ReopenableReadStore) that carries no stale read
-// cache, so authoritative reads resolve against the live in-flight write cache,
-// the write-eviction-safe read-only cache, and current committed state -- never
-// a pinned-stale version. The pipeline is therefore identical in effect to
+// auth reopens warm's stale snapshot so a key warm never fetched resolves against
+// a FRESH committed view, while INHERITING the reads warm already fetched as cache
+// hits (see execution.AuthMergedBatch / ReopenableReadStore). Authoritative reads
+// resolve against the live in-flight write cache, then the write-eviction-safe
+// read-only cache, then that reopened view -- never a pinned-stale version, since
+// the write-cache layer shadows every key an in-flight or just-committed batch
+// wrote (so an inherited read is only ever a key whose committed version cannot
+// advance before auth reads it). The pipeline is therefore identical in effect to
 // serial at ANY prefetch depth (not just depth-1): with no external (non-EVM)
 // traffic the stale-read MVCC abort cascade cannot occur and the pipeline never
 // livelocks, at any batch size. See the pipelined field comment. Default stays
@@ -258,6 +268,52 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // report/pipeline_report.html).
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p
+	// The pipelined auth pass inherits warm's write-cache resolutions across the
+	// snapshot reopen (see cachedView.Reopen); switch the shared cache into capture
+	// mode so warm views record them. The serial path leaves this off and pays no
+	// capture cost. Guard g.cache for the tests that build a Gateway without one.
+	if g.cache != nil {
+		// EXPERIMENT (bisect, remove before final fix): EVM_PIPE_NO_WRITE_INHERIT
+		// disables write-cache-resolution inheritance (warm views stop capturing;
+		// the reopened auth view inherits nothing), isolating whether the inherited
+		// map serves a stale spec version after the one-boundary hold expires.
+		capture := p && os.Getenv("EVM_PIPE_NO_WRITE_INHERIT") == ""
+		g.cache.SetCaptureForReopen(capture)
+		// EXPERIMENT (measure, remove before final fix): EVM_PIPE_INVALIDATE_DEPTH=D
+		// makes the auth-view reopen drop the keys committed over the last D pipeline
+		// boundaries from the inherited query-view clone (selective invalidation), so
+		// auth re-reads only those (possibly version-advanced) keys fresh. D=0
+		// (default) carries the whole clone forward -- the baseline that livelocks on
+		// hot-key traffic. Sweeping D measures the query-service visibility lag: the
+		// smallest D that reaches 0 rolled-back batches is the lag horizon in
+		// boundaries. Only meaningful under -pipeline.
+		depth := 0
+		if p {
+			if s := os.Getenv("EVM_PIPE_INVALIDATE_DEPTH"); s != "" {
+				if d, err := strconv.Atoi(s); err == nil {
+					depth = d
+				}
+			}
+		}
+		g.cache.SetInvalidateDepth(depth)
+		// EXPERIMENT (measure, remove before final fix): EVM_PIPE_EVICT_HOLD_DEPTH=D
+		// holds a committed batch's writes in the write cache for D pipeline
+		// boundaries before eviction (default 1 = the original one-boundary hold).
+		// A larger depth closes the eviction-vs-visibility skew when the
+		// query-service commit-visibility lag spans more than one fast boundary --
+		// the small-batch livelock, where a committed key is evicted and cold-fetched
+		// from the query view before the view reflects the commit (a stale warm read
+		// that MVCC-aborts). Sweeping D finds the lag horizon in boundaries: the
+		// smallest D that reaches 0 rolled-back batches. Only meaningful under
+		// -pipeline; see VersionedCache.SetEvictHoldDepth.
+		if p {
+			if s := os.Getenv("EVM_PIPE_EVICT_HOLD_DEPTH"); s != "" {
+				if d, err := strconv.Atoi(s); err == nil {
+					g.cache.SetEvictHoldDepth(d)
+				}
+			}
+		}
+	}
 }
 
 // SetNotifier wires per-TxID commit resolution. It builds the gateway's

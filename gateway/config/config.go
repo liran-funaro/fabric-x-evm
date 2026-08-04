@@ -62,6 +62,19 @@ type Gateway struct {
 	NotifyTimeout time.Duration `mapstructure:"notify-timeout" yaml:"notify-timeout"` // client-side backstop before the pipelined executor resolves an in-flight batch by fallback/rollback if no commit/abort notification arrives; <=0 defaults to 60s (see core.Gateway.SetCommitTimeout)
 
 	Pipelined bool `mapstructure:"pipelined" yaml:"pipelined"` // overlap the concurrent warm pass of batch N+1 with the serial authoritative pass of batch N; default false (serial). Auth reopens onto a FRESH committed view carrying no stale read cache, so authoritative reads resolve against the live in-flight write cache, the write-eviction-safe read-only cache, and current committed state -- never a pinned-stale version. Identical in effect to serial at ANY prefetch depth: with no external (non-EVM) traffic the stale-read MVCC abort cascade cannot occur and the pipeline never livelocks, at any batch size. Default stays false; throughput is being re-measured on ec2 after this read-path fix. See core.Gateway.SetPipelined and report/pipeline_report.html.
+
+	OrderedSubmit   bool                  `mapstructure:"ordered-submit"   yaml:"ordered-submit"`   // gate committer-tx k+1 until k appears in an ordered block delivered from the assembler (default false). Requires pipelined + a single serialized submitter. Enforces submission order == total order == commit order, eliminating the reorder-driven MVCC-abort livelock at every batch size; may throttle throughput below serial at very small batch sizes (depth-1 block-cut latency). See core.OrderGate.
+	OrderedDelivery OrderedDeliveryConfig `mapstructure:"ordered-delivery" yaml:"ordered-delivery"` // NoFT ordered-block delivery stream config; only used when ordered-submit is true.
+}
+
+// OrderedDeliveryConfig configures the NoFT ordered-block delivery stream used
+// by ordered-submit. TLS and MSP identity are reused from gateway.orderers and
+// gateway.identity; only the config-block path (orderer endpoints + channel ID)
+// is delivery-specific.
+type OrderedDeliveryConfig struct {
+	ConfigBlockPath string        `mapstructure:"config-block-path" yaml:"config-block-path"`
+	NextBlockNum    uint64        `mapstructure:"next-block-num"    yaml:"next-block-num"` // seek start; 0 = from genesis (safe: replays harmlessly, old TxIDs never match a future arm)
+	WaitTimeout     time.Duration `mapstructure:"wait-timeout"      yaml:"wait-timeout"`   // per-batch max wait for the ordered signal before proceeding unordered; <=0 defaults to 5s
 }
 
 // DB holds the database paths for the gateway.
@@ -103,6 +116,14 @@ func (cfg Config) Validate() error {
 	for i, o := range cfg.Gateway.Orderers {
 		if err := o.Validate(); err != nil {
 			errs = append(errs, fmt.Errorf("gateway.orderers[%d]: %w", i, err))
+		}
+	}
+	if cfg.Gateway.OrderedSubmit {
+		if !cfg.Gateway.Pipelined {
+			errs = append(errs, errors.New("gateway.ordered-submit requires gateway.pipelined"))
+		}
+		if cfg.Gateway.OrderedDelivery.ConfigBlockPath == "" {
+			errs = append(errs, errors.New("gateway.ordered-delivery.config-block-path is required when ordered-submit is enabled"))
 		}
 	}
 	if len(cfg.Endorsers) == 0 {

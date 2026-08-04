@@ -70,24 +70,48 @@ type ReadStore interface {
 	Close() error
 }
 
-// ReopenableReadStore is a ReadStore that can spawn a FRESH snapshot reflecting
-// the LATEST committed state, with NO reads carried over from the store it was
-// reopened from. The pipelined authoritative pass uses it: warm(N) primed its
-// snapshot one batch boundary ago, so by the time auth(N) runs, in-flight
-// predecessor batches have committed and advanced the ledger and that snapshot
-// is stale. Reopen gives auth a clean view so it re-resolves every read against
-// current committed state -- exactly what a serial cycle's post-boundary view
-// would see. It must NOT reuse warm's already-fetched reads: a key warm
-// cold-read at some version can be advanced by an in-flight commit before auth
-// records its MVCC read-version, and reusing the stale value would make the
-// committer abort the batch under exact-equality MVCC (the stale-read livelock).
-// Safe cross-batch reuse of hot reads is provided elsewhere -- by the live
-// in-flight write-cache (which shadows this store and is re-read live per tx) and
-// the write-eviction-safe read-only cache -- not by carrying this store's reads
-// across a reopen.
+// ReopenableReadStore is a ReadStore that can spawn a snapshot whose UNREAD keys
+// reflect the LATEST committed state. The pipelined authoritative pass uses it:
+// warm(N+1) primed its snapshot one batch boundary ago, so by the time auth(N+1)
+// runs, in-flight predecessor batches have committed and advanced the ledger and
+// that snapshot's pinned view is stale. Reopen gives auth a fresh view so a key
+// warm never fetched is re-resolved against current committed state -- exactly
+// what a serial cycle's post-boundary view would see.
+//
+// Reopen MAY carry the receiver's already-fetched reads forward (query.View
+// does, so pipelined auth serves them as cache hits instead of cold
+// query-service round-trips -- dropping them was a ~30x auth-phase slowdown on
+// hot-key traffic; lightkvs.Reader has no read cache, so there is nothing to
+// carry and its reopen is a pure fresh snapshot). Carrying a read forward is safe
+// ONLY under a caller that shadows any key mutated since it was first read. The
+// pipelined path's write-cache layer (cachedView / VersionedCache) does exactly
+// this -- it consults the live in-flight write cache before the reopened store,
+// so a reopened store only ever inherited reads for keys no in-flight batch
+// wrote, whose committed version cannot advance before auth reads them. See
+// query.View.Reopen for the full invariant.
 type ReopenableReadStore interface {
 	ReadStore
 	Reopen() (ReadStore, error)
+}
+
+// SelectiveReopenable is an optional refinement of ReopenableReadStore. It
+// reopens a fresh view like Reopen, but additionally DROPS the given raw keys
+// from any reads it would otherwise carry forward, forcing each to re-resolve
+// against the fresh view at current committed state. The pipelined path uses it
+// to close the one correctness gap a plain (carry-everything-forward) Reopen
+// leaves: a key whose committed version advanced between the warm fetch and the
+// auth re-read (the eviction-vs-visibility skew -- warm cold-fetches a key at its
+// pre-commit version in the window between the executor evicting a committed
+// batch's write and the query service reflecting that commit). Carrying that key
+// forward serves auth a stale read-version -> MVCC abort. Dropping exactly those
+// keys keeps every OTHER warm read as a cache hit (the pipeline's speed) while
+// re-reading only the possibly-advanced few at current state (correctness).
+//
+// invalidate holds RAW keys (namespace-less); the implementer applies its own
+// namespace. A nil/empty set makes ReopenInvalidating identical to Reopen.
+type SelectiveReopenable interface {
+	ReopenableReadStore
+	ReopenInvalidating(invalidate map[string]struct{}) (ReadStore, error)
 }
 
 // revision represents a snapshot point in the journal: the lengths of the

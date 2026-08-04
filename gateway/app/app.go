@@ -159,9 +159,19 @@ func buildApp(ctx context.Context, cfg config.Config, gwSigner sdk.Signer, logge
 		return nil, fmt.Errorf("failed to create chain: %w", err)
 	}
 
+	// Depth-1 ordered-submission gate (opt-in): when enabled, start the NoFT
+	// ordered-block delivery consumer BEFORE BuildGateway so the gate is already
+	// observing when the first batch arms it. submitterCount is already clamped to
+	// 1 on this path (orderedOrdererSubmitterCount), satisfying the gate's
+	// single-armed invariant. Returns nil when ordered-submit is disabled.
+	orderGate, err := StartOrderedSubmissionGate(ctx, cfg.Gateway, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	// Gateway owns the BatchSubmitter and will handle its lifecycle. Reuse the
 	// same clamped submitterCount computed above (see orderedOrdererSubmitterCount).
-	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, submitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache)
+	gateway, err := BuildGateway(ctx, endorsers, gwSigner, cfg.Network, chain, submitters, submitterCount, cfg.Gateway.EndorsementChanSize, 0, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache, orderGate, cfg.Gateway.OrderedDelivery.WaitTimeout)
 	if err != nil {
 		return nil, err
 	}

@@ -200,6 +200,16 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 		submitterCount = core.DefaultNumWorkers
 	}
 
+	// Depth-1 ordered submission (perf rig against a real backend): the gate's
+	// single-armed invariant requires exactly one serialized orderer submitter, so
+	// clamp here before building submitters (mirrors the production app path's
+	// orderedOrdererSubmitterCount). bypass mode has no real orderer/assembler to
+	// deliver ordered blocks from, so it never gates.
+	orderedSubmit := cfg.Gateway.OrderedSubmit && !bypass
+	if orderedSubmit {
+		submitterCount = 1
+	}
+
 	var submitters []core.Submitter
 	var sync *network.Synchronizer
 
@@ -230,7 +240,24 @@ func buildTestHarnessWithExtraHandler(t *testing.T, logger sdk.Logger, cfg confi
 	if cfg.Network.Namespace == "synthetic" {
 		txPerSec = 10000
 	}
-	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, cfg.Gateway.SubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache)
+	// Depth-1 ordered submission: when ordered-submit is on (real backend only),
+	// start the NoFT ordered-delivery consumer and install its gate on the batch
+	// submitter, with submission clamped to a single worker above. Otherwise the
+	// gate is nil and BuildGateway leaves the submitter ungated (serial and
+	// clean-pipeline paths unchanged). ordered-submit was validated real-backend
+	// only, so this is the sole path that exercises the gate in tests.
+	gwSubmitterCount := cfg.Gateway.SubmitterCount
+	var orderGate *core.OrderGate
+	var orderTimeout time.Duration
+	if orderedSubmit {
+		gwSubmitterCount = 1
+		orderTimeout = cfg.Gateway.OrderedDelivery.WaitTimeout
+		orderGate, err = app.StartOrderedSubmissionGate(t.Context(), cfg.Gateway, logger)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	gw, err := app.BuildGateway(t.Context(), ends, gwSigner, cfg.Network, chain, submitters, gwSubmitterCount, cfg.Gateway.EndorsementChanSize, txPerSec, cfg.Gateway.MaxBatchSize, cfg.Gateway.MaxInflight, cfg.Gateway.NotifyTimeout, cfg.Gateway.Pipelined, cache, orderGate, orderTimeout)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -124,8 +124,22 @@ func (c *GRPCClient) GetRows(ctx context.Context, viewID, ns string, keys [][]by
 		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)
 		defer cancel()
 	}
+	// An empty viewID selects the query service's non-consistent (nil-view) read
+	// path: each GetRows reads CURRENT committed state on a fresh pooled connection
+	// (sharedPool) instead of a snapshot pinned by BeginView and shared across the
+	// view-aggregation window (sharedLazyTx). The aggregation window makes a freshly
+	// begun view observe committed state as of up to ViewAggregationWindow ago, so a
+	// just-committed hot key reads back at its pre-commit version -- the stale read
+	// that drove the pipelined-auth MVCC abort cascade. Reading current committed
+	// state removes that skew at the source; cross-read snapshot consistency is
+	// instead provided by the endorser's read-cache (View) + write-cache
+	// (VersionedCache) layers. See Store.nilView.
+	var view *committerpb.View
+	if viewID != "" {
+		view = &committerpb.View{Id: viewID}
+	}
 	q := &committerpb.Query{
-		View:       &committerpb.View{Id: viewID},
+		View:       view,
 		Namespaces: []*committerpb.QueryNamespace{{NsId: ns, Keys: keys}},
 	}
 	res, err := c.pick().GetRows(ctx, q)
@@ -145,6 +159,9 @@ func (c *GRPCClient) GetRows(ctx context.Context, viewID, ns string, keys [][]by
 }
 
 func (c *GRPCClient) EndView(ctx context.Context, viewID string) error {
+	if viewID == "" {
+		return nil // nil-view mode never began a server-side view
+	}
 	if c.viewTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, c.viewTimeout)

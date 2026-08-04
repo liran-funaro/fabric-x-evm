@@ -37,8 +37,8 @@ type entry struct {
 // (executor goroutine only), so RLock holders never contend with each other and
 // the exclusive Lock is taken only briefly at the boundary. committed/invalidated
 // stay under the separate evictMu (queued asynchronously by notification
-// handlers); committedHeld and roEvictPending are touched only at the boundary on
-// the executor goroutine and need no lock.
+// handlers); committedHeldRing and roEvictPending are touched only at the boundary
+// on the executor goroutine and need no lock.
 type VersionedCache struct {
 	mu      sync.RWMutex // guards entries against concurrent RPC-validation reads
 	entries map[string]entry
@@ -51,10 +51,31 @@ type VersionedCache struct {
 	committed   []string
 	invalidated []string
 
-	// committedHeld is the one-boundary delay buffer for committed-write eviction
-	// on the pipelined path (see DrainEvictionsDeferred). Touched only at the
-	// boundary on the executor goroutine, so it needs no lock.
-	committedHeld []string
+	// committedHeldRing is the delay buffer for committed-write eviction on the
+	// pipelined path: a FIFO of one committed-TxID set per pipeline boundary, held
+	// so a committed batch's writes stay readable in THIS write cache for
+	// evictHoldDepth boundaries before eviction (see DrainEvictionsDeferred and
+	// SetEvictHoldDepth). Touched only at the boundary on the executor goroutine, so
+	// it needs no lock. evictHoldDepth defaults to 1 (the original one-boundary
+	// hold, so auth(N+1) reads N's writes from the cache); a larger depth keeps a
+	// just-committed key readable across more boundaries, covering a query-service
+	// commit-visibility lag that spans more than one fast boundary (the small-batch
+	// case). Set once before Start (EVM_PIPE_EVICT_HOLD_DEPTH via SetEvictHoldDepth).
+	committedHeldRing [][]string
+	evictHoldDepth    int
+
+	// recentCommittedKeys is a rolling window of the RAW keys whose committed
+	// version advanced over the last invalidateDepth pipeline boundaries (a ring
+	// of one key-slice per boundary, newest last). On an auth-view reopen the
+	// union of this window is invalidated from the inherited query-view clone so
+	// auth re-reads those keys at current committed state instead of the stale
+	// warm-time value (the eviction-vs-visibility skew). Pushed during the deferred
+	// drain and read at reopen -- both at the boundary on the executor goroutine --
+	// so it needs no lock. Empty (and never pushed) when invalidateDepth == 0, the
+	// clone-only baseline. invalidateDepth is a boot knob (EVM_PIPE_INVALIDATE_DEPTH
+	// via SetInvalidateDepth), set once before Start and only read thereafter.
+	recentCommittedKeys [][]string
+	invalidateDepth     int
 
 	// ro is the optional cross-batch read-only cache for hot, rarely-written
 	// committed records (nil unless EnableReadOnlyCache was called). It sits
@@ -67,10 +88,29 @@ type VersionedCache struct {
 	// roEvictPending needs no lock.
 	ro             *ReadOnlyCache
 	roEvictPending []string
+
+	// capturePipeline enables the pipelined auth read-layering fix: when true, a
+	// warm-pass cachedView records the keys it resolves from THIS in-flight write
+	// cache so the reopened authoritative view inherits them (see
+	// cachedView.Reopen). Off by default; the gateway flips it on with the
+	// pipelined executor (SetCaptureForReopen, called from Gateway.SetPipelined).
+	// Set once before Start and only read thereafter (like the gateway's pipelined
+	// flag), so the concurrent warm-pass readers that consult it never race a
+	// write. Gating on it keeps the serial default path free of any capture cost.
+	capturePipeline bool
 }
 
 func NewVersionedCache() *VersionedCache {
-	return &VersionedCache{entries: make(map[string]entry)}
+	return &VersionedCache{entries: make(map[string]entry), evictHoldDepth: 1}
+}
+
+// SetCaptureForReopen toggles capture of warm-pass write-cache resolutions for
+// the pipelined auth pass to inherit (see the capturePipeline field and
+// cachedView.Reopen). Call once before Start, on the same VersionedCache shared
+// by the cached snapshotter (read path) and the Gateway; the gateway wires it
+// from SetPipelined. No-op cost when disabled.
+func (c *VersionedCache) SetCaptureForReopen(enabled bool) {
+	c.capturePipeline = enabled
 }
 
 // EnableReadOnlyCache attaches a cross-batch read-only cache with the given
@@ -173,6 +213,92 @@ func (c *VersionedCache) apply(txID string, r blocks.ReadWriteSet) {
 	}
 }
 
+// SetInvalidateDepth sets how many recent pipeline boundaries of committed keys
+// the auth-view reopen invalidates from the inherited query-view clone (see
+// recentCommittedKeys and RecentlyCommittedKeys). 0 (default) disables
+// invalidation entirely -- the clone is carried forward whole, the baseline that
+// livelocks on hot-key traffic. Call once before Start, on the same VersionedCache
+// shared by the read path and the Gateway; the gateway wires it from
+// EVM_PIPE_INVALIDATE_DEPTH in SetPipelined.
+func (c *VersionedCache) SetInvalidateDepth(d int) {
+	if d < 0 {
+		d = 0
+	}
+	c.invalidateDepth = d
+}
+
+// SetEvictHoldDepth sets how many pipeline boundaries a committed batch's writes
+// are held in the write cache before eviction on the deferred (pipelined) drain
+// (see DrainEvictionsDeferred). The default and minimum is 1 -- the original
+// one-boundary hold, so auth(N+1) reads N's writes from the cache. A larger depth
+// keeps a just-committed key readable across more boundaries, closing the
+// eviction-vs-visibility skew when the query-service commit-visibility lag spans
+// more than one boundary (the small-batch case, where fast boundaries let a
+// committed key be evicted and cold-fetched from the query view before the view
+// reflects the commit -- a stale warm read that MVCC-aborts). Call once before
+// Start, on the same VersionedCache shared by the read path and the Gateway; the
+// gateway wires it from EVM_PIPE_EVICT_HOLD_DEPTH in SetPipelined.
+func (c *VersionedCache) SetEvictHoldDepth(d int) {
+	if d < 1 {
+		d = 1
+	}
+	c.evictHoldDepth = d
+}
+
+// RecentlyCommittedKeys returns the union of the raw keys committed over the last
+// invalidateDepth pipeline boundaries, for an auth-view reopen to invalidate from
+// its inherited clone. Returns nil when invalidateDepth == 0 (no invalidation) or
+// the window is empty. Call at the boundary on the executor goroutine (the same
+// goroutine that pushes the window during the deferred drain), so no lock.
+func (c *VersionedCache) RecentlyCommittedKeys() map[string]struct{} {
+	if c.invalidateDepth == 0 || len(c.recentCommittedKeys) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for _, keys := range c.recentCommittedKeys {
+		for _, k := range keys {
+			out[k] = struct{}{}
+		}
+	}
+	return out
+}
+
+// pushRecentCommitted records this boundary's committed raw keys into the rolling
+// invalidation window, evicting boundaries older than invalidateDepth. No-op when
+// invalidateDepth == 0. Called from the deferred drain on the executor goroutine.
+func (c *VersionedCache) pushRecentCommitted(keys []string) {
+	if c.invalidateDepth == 0 {
+		return
+	}
+	c.recentCommittedKeys = append(c.recentCommittedKeys, keys)
+	if len(c.recentCommittedKeys) > c.invalidateDepth {
+		c.recentCommittedKeys = c.recentCommittedKeys[len(c.recentCommittedKeys)-c.invalidateDepth:]
+	}
+}
+
+// keysForWriters returns the raw keys of every live entry whose writerTx is in
+// writers. The caller must NOT hold c.mu (this takes the read lock). Used by the
+// deferred drain to snapshot the keys whose committed version advanced this
+// boundary before their entries are (eventually) evicted.
+func (c *VersionedCache) keysForWriters(writers []string) []string {
+	if len(writers) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(writers))
+	for _, id := range writers {
+		want[id] = struct{}{}
+	}
+	var keys []string
+	c.mu.RLock()
+	for k, e := range c.entries {
+		if _, ok := want[e.writerTx]; ok {
+			keys = append(keys, k)
+		}
+	}
+	c.mu.RUnlock()
+	return keys
+}
+
 func (c *VersionedCache) NoteCommitted(txID string) {
 	c.evictMu.Lock()
 	c.committed = append(c.committed, txID)
@@ -200,17 +326,23 @@ func (c *VersionedCache) DrainEvictions() (committed, invalidated []string) {
 
 // DrainEvictionsDeferred is the pipelined-path variant of DrainEvictions. It
 // applies invalidations immediately (an aborted write must never be visible to
-// the authoritative pass), but holds each committed batch's writes for ONE extra
-// boundary before evicting them. This preserves the pipeline's read-layering
-// invariant: auth(N+1) runs one iteration after warm(N+1), which primed the
-// query-view read cache while N's writes were still served from THIS write cache
-// (so warm never fetched/primed them). Without the hold, the top-of-iteration
-// eviction would drop N's just-committed writes before auth(N+1) reads them,
-// forcing a fresh query-service fetch -- a new miss in the auth phase. Holding
-// them one boundary lets auth(N+1) read them here. Reading a committed batch's
-// entry is identical in effect to reading committed state: its spec version
-// equals the committed version, so the recorded MVCC read-version matches
-// committed and no abort results.
+// the authoritative pass), but holds each committed batch's writes for
+// evictHoldDepth extra boundaries before evicting them (a FIFO ring, one
+// committed-TxID set per boundary; see committedHeldRing and SetEvictHoldDepth).
+// This closes the eviction-vs-visibility skew: the executor evicts a committed
+// batch on its commit notification, but the query service reflects that commit
+// only after a lag. If a just-committed key is evicted from this write cache
+// before the query view catches up, a later warm pass cold-fetches it from the
+// view at its STALE pre-commit version, and the pipelined auth pass (which
+// inherits warm's read via the query-view clone) records that stale version --
+// MVCC-aborting once the committer sees the advanced committed version, the
+// historic small-batch livelock. Holding the write in the cache across the lag
+// window means warm serves it from HERE (fresh: a committed batch's spec version
+// equals its committed version) instead of cold-fetching stale; once it ages out
+// of the ring the query view is guaranteed to reflect the commit, so the eventual
+// cold-fetch is fresh too. depth 1 (the default) covers a lag under one boundary
+// -- enough at large batch sizes where boundaries are slow; small batch sizes
+// need a larger depth (their fast boundaries let the eviction outrun visibility).
 //
 // Returns the invalidated set only; committed evictions no longer drive a
 // rebuild. Call ONLY at a batch boundary on the executor goroutine.
@@ -227,10 +359,23 @@ func (c *VersionedCache) DrainEvictionsDeferred() (invalidated []string) {
 	invalidated = c.invalidated
 	c.committed, c.invalidated = nil, nil
 	c.evictMu.Unlock()
-	// Apply the committed set held from the PREVIOUS boundary plus all
-	// invalidations now; hold this boundary's committed set for the next call.
-	c.dropByWriter(c.committedHeld, invalidated)
-	c.committedHeld = committedNow
+	// Snapshot the keys whose committed version advances this boundary (the
+	// committedNow writers, still live in c.entries -- they are only evicted after
+	// the hold below) into the rolling invalidation window BEFORE any drop. These
+	// are the keys an auth-view reopen must re-read fresh rather than serve from the
+	// warm clone. No-op when invalidateDepth == 0.
+	c.pushRecentCommitted(c.keysForWriters(committedNow))
+	// Enqueue this boundary's committed set at the tail; the set that entered the
+	// ring evictHoldDepth boundaries ago now ages out and is dropped alongside all
+	// invalidations. A committed batch's writes therefore linger in the cache for
+	// exactly evictHoldDepth boundaries after their commit is drained.
+	c.committedHeldRing = append(c.committedHeldRing, committedNow)
+	var aged []string
+	if len(c.committedHeldRing) > c.evictHoldDepth {
+		aged = c.committedHeldRing[0]
+		c.committedHeldRing = c.committedHeldRing[1:]
+	}
+	c.dropByWriter(aged, invalidated)
 	return invalidated
 }
 

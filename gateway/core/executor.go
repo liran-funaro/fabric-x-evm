@@ -9,6 +9,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -17,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
 	"github.com/hyperledger/fabric-x-common/protoutil"
 	cmn "github.com/hyperledger/fabric-x-evm/common"
+	"github.com/hyperledger/fabric-x-evm/common/pipediag"
 	sdk "github.com/hyperledger/fabric-x-sdk"
 	"github.com/hyperledger/fabric-x-sdk/blocks"
 	"go.uber.org/zap/zapcore"
@@ -334,7 +336,15 @@ func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *W
 	// ago and therefore never primed those keys into the query-view read cache --
 	// still reads them from this write cache rather than re-fetching from the
 	// query service (see VersionedCache.DrainEvictionsDeferred).
-	if invalidated := g.cache.DrainEvictionsDeferred(); len(invalidated) > 0 {
+	// EXPERIMENT (bisect, remove before final fix): EVM_PIPE_NO_DEFER uses the
+	// serial immediate-eviction drain in the pipeline path, isolating whether the
+	// one-boundary hold (a committed batch's writes lingering in the write cache)
+	// is what corrupts an auth read-version.
+	if os.Getenv("EVM_PIPE_NO_DEFER") != "" {
+		if _, invalidated := g.cache.DrainEvictions(); len(invalidated) > 0 {
+			g.rebuildCacheFromInflight()
+		}
+	} else if invalidated := g.cache.DrainEvictionsDeferred(); len(invalidated) > 0 {
 		g.rebuildCacheFromInflight()
 	}
 	g.cache.MaintainReadOnly()
@@ -547,6 +557,17 @@ func (g *Gateway) resolveInflight(txID string, committed bool) {
 
 	g.cache.NoteCommitted(txID)
 
+	// DIAG (default OFF, EVM_PIPE_DIAG): record each key's committed version so a
+	// later cold fetch can be flagged as trailing an acked commit (H1) and the
+	// abort classifier can measure how far a stale read fell behind committed. Its
+	// spec version equals the committed version for a committed batch. No-op when
+	// disabled.
+	if pipediag.Enabled {
+		for k, v := range b.specVers {
+			pipediag.RecordCommit(k, v)
+		}
+	}
+
 	// Wake the executor if idle: a commit may unblock retryable-excluded txs
 	// whose predecessor just committed. Non-blocking, mirroring AddPending.
 	select {
@@ -597,6 +618,25 @@ func (g *Gateway) cascadeFrom(txID string) {
 	// are not counted.
 	g.cascadeCount.Add(1)
 	g.inflightMu.Unlock()
+
+	// DIAG (default OFF, EVM_PIPE_DIAG): classify the residual stale read that
+	// caused THIS abort. suffix[0] is the batch the committer actually rejected
+	// (txID); its read-set carries the versions auth recorded. Comparing each
+	// against the acked committed version tells us which reads went stale, and the
+	// per-key provenance sets say whether the stale value came from a lagging
+	// query service (H1), a stale view clone (H2), or the write cache (H3). Runs
+	// off the executor goroutine but only touches pipediag's own maps, never the
+	// cache. No-op when disabled.
+	if pipediag.Enabled && len(suffix) > 0 {
+		aborted := suffix[0]
+		reads := make(map[string]uint64, len(aborted.rws.Reads))
+		for _, r := range aborted.rws.Reads {
+			if r.Version != nil {
+				reads[r.Key] = r.Version.BlockNum
+			}
+		}
+		pipediag.ClassifyAbort(aborted.txID, reads)
+	}
 
 	for _, b := range suffix {
 		if b.timer != nil { // nil when the notifier owns the timeout (see trackInflight)

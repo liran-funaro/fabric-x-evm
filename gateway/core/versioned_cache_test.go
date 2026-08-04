@@ -173,6 +173,121 @@ func TestVersionedCache_DeferredInvalidationIsImmediate(t *testing.T) {
 	}
 }
 
+// SetEvictHoldDepth widens the committed-write hold beyond the default one
+// boundary: a committed batch's writes must stay readable in the write cache for
+// exactly evictHoldDepth boundaries so the pipelined auth pass keeps serving a
+// just-committed key from the cache while the query service's commit-visibility
+// lag spans more than one fast boundary (the small-batch case). At depth 2, k
+// survives the first TWO deferred drains after the commit and is evicted only on
+// the third. The default (depth 1) case is covered by
+// TestVersionedCache_DeferredCommittedEvictionHoldsOneBoundary.
+func TestVersionedCache_DeferredEvictionHoldsConfiguredDepth(t *testing.T) {
+	c := NewVersionedCache()
+	c.SetEvictHoldDepth(2)
+	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v1")}}))
+	c.NoteCommitted("tx1")
+
+	// Boundaries 1 and 2: tx1's write is HELD (depth 2), not yet evicted.
+	for i := 1; i <= 2; i++ {
+		if inv := c.DrainEvictionsDeferred(); len(inv) != 0 {
+			t.Fatalf("boundary %d: want no invalidations, got %v", i, inv)
+		}
+		if _, ok := c.Read("k"); !ok {
+			t.Fatalf("k evicted at boundary %d; depth-2 hold must keep it for 2 boundaries", i)
+		}
+		if got := c.Len(); got != 1 {
+			t.Fatalf("boundary %d: want Len()==1 (k held), got %d", i, got)
+		}
+	}
+
+	// Boundary 3: the depth-2 hold has elapsed -> k evicted.
+	if inv := c.DrainEvictionsDeferred(); len(inv) != 0 {
+		t.Fatalf("want no invalidations, got %v", inv)
+	}
+	if _, ok := c.Read("k"); ok {
+		t.Fatal("k not evicted at the boundary after the depth-2 hold elapsed")
+	}
+	if got := c.Len(); got != 0 {
+		t.Fatalf("want Len()==0 after deferred eviction, got %d", got)
+	}
+}
+
+// SetEvictHoldDepth clamps a depth below 1 up to 1: the deferred drain always
+// holds a committed batch at least one boundary (the read-layering floor), so
+// 0 or negative silently becomes the default one-boundary hold rather than the
+// serial immediate-eviction behavior (which is DrainEvictions, not this path).
+func TestVersionedCache_EvictHoldDepthClampsToOne(t *testing.T) {
+	c := NewVersionedCache()
+	c.SetEvictHoldDepth(0)
+	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "k", Value: []byte("v1")}}))
+	c.NoteCommitted("tx1")
+
+	// Boundary 1: held (clamped to 1, not evicted immediately).
+	c.DrainEvictionsDeferred()
+	if _, ok := c.Read("k"); !ok {
+		t.Fatal("depth 0 must clamp to 1 (hold one boundary), but k was evicted immediately")
+	}
+	// Boundary 2: evicted after the one-boundary hold.
+	c.DrainEvictionsDeferred()
+	if _, ok := c.Read("k"); ok {
+		t.Fatal("k not evicted at the boundary after the clamped one-boundary hold")
+	}
+}
+
+// The rolling invalidation window records the keys committed over the last
+// invalidateDepth pipeline boundaries, so an auth-view reopen can drop exactly
+// those from its inherited clone. Each deferred drain pushes that boundary's
+// committed keys; boundaries older than the depth fall out of the window. The
+// keys are snapshotted from the still-live (held) entries at drain time.
+func TestVersionedCache_RecentlyCommittedKeysWindow(t *testing.T) {
+	c := NewVersionedCache()
+	c.SetInvalidateDepth(2)
+
+	commitBoundary := func(txID, key string) {
+		c.ApplyWrites(txID, rws(nil, []blocks.KVWrite{{Key: key, Value: []byte("v")}}))
+		c.NoteCommitted(txID)
+		c.DrainEvictionsDeferred()
+	}
+	has := func(m map[string]struct{}, keys ...string) bool {
+		if len(m) != len(keys) {
+			return false
+		}
+		for _, k := range keys {
+			if _, ok := m[k]; !ok {
+				return false
+			}
+		}
+		return true
+	}
+
+	commitBoundary("tx1", "a")
+	if got := c.RecentlyCommittedKeys(); !has(got, "a") {
+		t.Fatalf("after tx1 window = %v, want {a}", got)
+	}
+	commitBoundary("tx2", "b")
+	if got := c.RecentlyCommittedKeys(); !has(got, "a", "b") {
+		t.Fatalf("after tx2 window = %v, want {a,b} (depth 2)", got)
+	}
+	// Third boundary evicts the oldest (a) -> window holds only the last 2.
+	commitBoundary("tx3", "c")
+	if got := c.RecentlyCommittedKeys(); !has(got, "b", "c") {
+		t.Fatalf("after tx3 window = %v, want {b,c} (a aged out at depth 2)", got)
+	}
+}
+
+// Depth 0 (the default, clone-only baseline) disables the window entirely: no
+// keys are ever recorded, so RecentlyCommittedKeys stays nil and the auth reopen
+// carries the whole clone forward.
+func TestVersionedCache_InvalidateDepthZeroDisablesWindow(t *testing.T) {
+	c := NewVersionedCache() // depth 0 by default
+	c.ApplyWrites("tx1", rws(nil, []blocks.KVWrite{{Key: "a", Value: []byte("v")}}))
+	c.NoteCommitted("tx1")
+	c.DrainEvictionsDeferred()
+	if got := c.RecentlyCommittedKeys(); got != nil {
+		t.Fatalf("depth 0 must record nothing, got %v", got)
+	}
+}
+
 // Deletes are recorded (IsDelete) and versioned like writes.
 func TestVersionedCache_Delete(t *testing.T) {
 	c := NewVersionedCache()

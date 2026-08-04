@@ -1,0 +1,117 @@
+# Test configuration for the ordered-submit ec2 sweep (config C).
+# Identical to fabx-full.yaml except it enables the depth-1 ordered-submission
+# gate: gateway.pipelined + gateway.ordered-submit + the NoFT ordered-delivery
+# stream config. The perf harness (integration.buildTestHarnessWithExtraHandler)
+# sees ordered-submit=true against the real orderer set, clamps orderer
+# submission to a single worker, and installs the OrderGate fed by the delivery
+# consumer. Paths are relative to the integration/ package directory (where the
+# harness chdirs before config.Load), so ../testdata resolves to repo-root/testdata.
+network:
+  protocol: fabric-x
+  channel: mychannel
+  namespace: basic
+  ns-version: "1.0"
+  chain-id: 4011
+
+logging:
+  spec: info
+
+gateway:
+  listen: "0.0.0.0:8545"
+
+  # Depth-1 ordered submission: submit committer tx k+1 only after k appears in an
+  # ordered block delivered from the assembler. Requires pipelined. The perf test
+  # also passes -pipeline (which sets Gateway.Pipelined via a config override), so
+  # both agree on true.
+  pipelined: true
+  ordered-submit: true
+  ordered-delivery:
+    config-block-path: ../testdata/crypto/config-block.pb.bin
+    next-block-num: 0        # from genesis; replays harmlessly, old TxIDs never match a future arm
+    wait-timeout: 5s         # per-batch max wait for the ordered signal before proceeding unordered
+
+  identity:
+    msp-id: Org1MSP
+    msp-dir: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/msp
+
+  database:
+    connection-string: "file:gateway.db?mode=memory&cache=shared"
+    # trie-path: "" # trie db is temporarily disabled
+
+  orderers:
+    - endpoint:
+        host: 127.0.0.1
+        port: 7050
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/ordererOrganizations/orderer-org-1/tlsca/tlsca.orderer-org-1-cert.pem
+    - endpoint:
+        host: 127.0.0.1
+        port: 7150
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/ordererOrganizations/orderer-org-2/tlsca/tlsca.orderer-org-2-cert.pem
+    - endpoint:
+        host: 127.0.0.1
+        port: 7250
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/ordererOrganizations/orderer-org-3/tlsca/tlsca.orderer-org-3-cert.pem
+    - endpoint:
+        host: 127.0.0.1
+        port: 7350
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/ordererOrganizations/orderer-org-4/tlsca/tlsca.orderer-org-4-cert.pem
+
+  committer:
+    endpoint:
+      host: 127.0.0.1
+      port: 4001
+    tls:
+      mode: mtls
+      cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+      key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+      ca-cert-paths:
+        - ../testdata/crypto/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem
+
+endorsers:
+  - name: org1
+    identity:
+      msp-id: Org1MSP
+      msp-dir: ../testdata/crypto/peerOrganizations/org1.example.com/peers/endorser.org1.example.com/msp
+    committer:
+      endpoint:
+        host: 127.0.0.1
+        port: 4001
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem
+    database:
+      database: query-service
+    query-service:
+      endpoint:
+        host: 127.0.0.1
+        port: 7001
+      tls:
+        mode: mtls
+        cert-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.crt
+        key-path: ../testdata/crypto/peerOrganizations/org1.example.com/users/User1@org1.example.com/tls/client.key
+        ca-cert-paths:
+          - ../testdata/crypto/peerOrganizations/org1.example.com/tlsca/tlsca.org1.example.com-cert.pem
+    view-timeout: 5s

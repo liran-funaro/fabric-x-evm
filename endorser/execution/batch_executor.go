@@ -439,16 +439,19 @@ func (e *EVMEngine) authBatch(wb *WarmedBatch) ([]endorsement.ExecutionResult, e
 func (e *EVMEngine) AuthMergedBatch(ctx context.Context, wb *WarmedBatch) (endorsement.ExecutionResult, []PerTxOutcome, error) {
 	// Pipelined authoritative pass: warm's snapshot was opened one batch boundary
 	// ago (WarmBatch(N) overlaps auth(N-1)), so by now commits have advanced the
-	// ledger and it is stale. Reopen it onto a FRESH view reflecting current
-	// committed state, carrying NONE of warm's already-fetched reads (see
-	// ReopenableReadStore), so auth re-resolves every read against current
-	// committed state -- exactly what a serial cycle's post-boundary view would --
-	// eliminating the stale-read MVCC aborts that livelock the pipeline on
-	// conflict-heavy traffic. This makes pipelined auth read-identical to serial
-	// auth at any prefetch depth. Safe reuse of warm's hot cold reads is provided
-	// separately, by the write-eviction-safe read-only cache below the view, not by
-	// carrying this view's stale reads across the reopen. Stores that cannot reopen
-	// (e.g. the in-memory test KVS) fall back to reusing warm's view.
+	// ledger and its pinned view is stale. Reopen it: a key warm never fetched is
+	// resolved against a FRESH view (current committed state) -- exactly what a
+	// serial cycle's post-boundary view would see, eliminating the stale-read MVCC
+	// aborts that livelock the pipeline on conflict-heavy traffic -- while the reads
+	// warm already fetched are INHERITED so auth serves them as cache hits instead
+	// of cold query-service round-trips (dropping them was a ~30x auth-phase
+	// slowdown on hot-key traffic). Inheriting is safe because the reopen happens
+	// under the write-cache layer (cachedView / VersionedCache), which shadows any
+	// key an in-flight or just-committed batch wrote, so warm only ever inherited
+	// reads for keys whose committed version cannot advance before auth reads them
+	// (see ReopenableReadStore and query.View.Reopen). Net: pipelined auth reads are
+	// identical to serial's at any prefetch depth. Stores that cannot reopen (e.g.
+	// the in-memory test KVS) fall back to reusing warm's view.
 	if r, ok := wb.reader.(ReopenableReadStore); ok {
 		fresh, err := r.Reopen()
 		if err != nil {

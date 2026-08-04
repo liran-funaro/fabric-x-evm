@@ -8,6 +8,7 @@ package app
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/hyperledger/fabric-x-evm/common"
 	"github.com/hyperledger/fabric-x-evm/endorser/config"
@@ -77,7 +78,17 @@ func NewEndorserCore(
 			}
 			conns = append(conns, conn)
 		}
-		store = query.NewStore(query.NewGRPCClientPool(conns, cfg.ViewTimeout), namespace)
+		qStore := query.NewStore(query.NewGRPCClientPool(conns, cfg.ViewTimeout), namespace)
+		// EXPERIMENT (default OFF): EVM_QS_NIL_VIEW makes state reads use the query
+		// service's non-consistent (nil-view) path -- current committed state per
+		// read on a fresh connection -- instead of a BeginView snapshot shared across
+		// the service's view-aggregation window. The pinned aggregation snapshot is
+		// the source of the pipelined-auth stale read; nil-view removes it, relying on
+		// the read-cache + write-cache for intra-pass consistency. See query.Store.nilView.
+		if os.Getenv("EVM_QS_NIL_VIEW") != "" {
+			qStore.SetNilView(true)
+		}
+		store = qStore
 	case "memory":
 		back = storage.NewRevertibleLightKVS(storage.NewLightKVS(cfg.Database.HistorySize))
 		store = query.NewStore(query.NewMemClient(back), namespace)

@@ -57,6 +57,13 @@ type BatchSubmitter struct {
 	doneChan    chan struct{}
 	numWorkers  int
 	rateLimiter *rate.Limiter // Shared rate limiter across all workers (nil if disabled)
+
+	// orderGate, when non-nil, enforces depth-1 ordered submission: the worker
+	// arms the gate with a committer TxID before broadcasting, then blocks until
+	// that TxID is observed in a delivered ordered block (or orderTimeout / ctx).
+	// Only valid with numWorkers == 1; installed via SetOrderGate. See OrderGate.
+	orderGate    *OrderGate
+	orderTimeout time.Duration
 }
 
 const DefaultNumWorkers = 16
@@ -95,6 +102,22 @@ func NewBatchSubmitter(
 		numWorkers:  numWorkers,
 		rateLimiter: rateLimiter,
 	}
+}
+
+// SetOrderGate installs the depth-1 ordered-submission gate. Call before Start.
+// Requires numWorkers == 1 (single-armed invariant); ignored with a warning
+// otherwise, leaving the submitter's behavior unchanged.
+func (bs *BatchSubmitter) SetOrderGate(g *OrderGate, timeout time.Duration) {
+	if bs.numWorkers != 1 {
+		batchLogger.Warnf("ordered-submit gate ignored: numWorkers=%d (must be 1)", bs.numWorkers)
+		return
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	bs.orderGate = g
+	bs.orderTimeout = timeout
+	batchLogger.Infof("ordered-submit gate installed (wait timeout %v)", timeout)
 }
 
 // Start begins the submission loop with multiple worker goroutines.
@@ -170,9 +193,41 @@ func (bs *BatchSubmitter) submitOne(ctx context.Context, workerID int, end sdk.E
 		}
 	}
 
-	var txid string
+	// Depth-1 ordered gate: arm with this tx's committer TxID BEFORE broadcasting,
+	// so the ordered-delivery drain goroutine cannot observe (and clear) it in the
+	// window between Submit and Arm. After a successful broadcast, block until the
+	// TxID appears in a delivered ordered block, guaranteeing tx k is sealed in an
+	// earlier block than k+1 (submission order == total order == commit order).
+	var ordered <-chan struct{}
+	if bs.orderGate != nil {
+		txID, err := committerTxID(end.Proposal)
+		if err != nil {
+			return fmt.Errorf("ordered-submit: committer txid: %w", err)
+		}
+		ordered = bs.orderGate.Arm(txID)
+	}
+
 	t0 := time.Now()
-	err := bs.submitters[workerID].Submit(ctx, end)
-	batchLogger.Debugf("[SUBMIT] worker=%d txid=%s submit_took=%v", workerID, txid, time.Since(t0))
-	return err
+	if err := bs.submitters[workerID].Submit(ctx, end); err != nil {
+		if bs.orderGate != nil {
+			bs.orderGate.Disarm() // never broadcast -> never observed; don't wait
+		}
+		return err
+	}
+	batchLogger.Debugf("[SUBMIT] worker=%d submit_took=%v", workerID, time.Since(t0))
+
+	if ordered == nil {
+		return nil
+	}
+	select {
+	case <-ordered:
+		return nil
+	case <-time.After(bs.orderTimeout):
+		bs.orderGate.Disarm()
+		batchLogger.Warnf("ordered-submit: batch not observed in an ordered block within %v; proceeding unordered (delivery lag?)", bs.orderTimeout)
+		return nil
+	case <-ctx.Done():
+		bs.orderGate.Disarm()
+		return ctx.Err()
+	}
 }

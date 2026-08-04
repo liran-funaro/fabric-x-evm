@@ -9,6 +9,7 @@ package query_test
 import (
 	"context"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,6 +177,79 @@ func TestGRPCClientPoolRoundRobin(t *testing.T) {
 		if got := fakes[i].getRows.Load(); got != callsPerConn {
 			t.Errorf("conn[%d] GetRows count = %d, want %d (round-robin)", i, got, callsPerConn)
 		}
+	}
+}
+
+// viewCapturingQS records the View field of every GetRows query it serves, so a
+// test can assert the client sends View:nil for an empty viewID and a concrete
+// View for a real one. Guarded by a mutex: GetRows runs on the server's handler
+// goroutine, the test reads on its own.
+type viewCapturingQS struct {
+	committerpb.UnimplementedQueryServiceServer
+	mu    sync.Mutex
+	views []*committerpb.View
+}
+
+func (f *viewCapturingQS) BeginView(context.Context, *committerpb.ViewParameters) (*committerpb.View, error) {
+	return &committerpb.View{Id: "v1"}, nil
+}
+func (f *viewCapturingQS) EndView(context.Context, *committerpb.View) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
+func (f *viewCapturingQS) GetRows(_ context.Context, q *committerpb.Query) (*committerpb.Rows, error) {
+	f.mu.Lock()
+	f.views = append(f.views, q.GetView())
+	f.mu.Unlock()
+	out := &committerpb.Rows{}
+	for _, ns := range q.GetNamespaces() {
+		out.Namespaces = append(out.Namespaces, &committerpb.RowsNamespace{NsId: ns.GetNsId()})
+	}
+	return out, nil
+}
+
+// GetRows sends View:nil on the wire when the viewID is empty -- the query
+// service's non-consistent (nil-view) read path, which reads current committed
+// state on a fresh connection rather than a snapshot pinned by BeginView and
+// shared across the view-aggregation window -- and a concrete View when the
+// viewID is set. See GRPCClient.GetRows and Store.nilView.
+func TestGRPCClientGetRowsNilViewForEmptyViewID(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := grpc.NewServer()
+	qs := &viewCapturingQS{}
+	committerpb.RegisterQueryServiceServer(srv, qs)
+	go srv.Serve(lis)
+	defer srv.Stop()
+
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := query.NewGRPCClient(conn, time.Second)
+	defer c.Close()
+
+	ctx := context.Background()
+	// Empty viewID -> View must be nil on the wire.
+	if _, err := c.GetRows(ctx, "", "evm", [][]byte{[]byte("k")}); err != nil {
+		t.Fatalf("GetRows (empty view): %v", err)
+	}
+	// Non-empty viewID -> View must carry the id.
+	if _, err := c.GetRows(ctx, "v1", "evm", [][]byte{[]byte("k")}); err != nil {
+		t.Fatalf("GetRows (view v1): %v", err)
+	}
+
+	qs.mu.Lock()
+	defer qs.mu.Unlock()
+	if len(qs.views) != 2 {
+		t.Fatalf("served %d GetRows, want 2", len(qs.views))
+	}
+	if qs.views[0] != nil {
+		t.Fatalf("empty viewID sent View=%+v, want nil (nil-view read path)", qs.views[0])
+	}
+	if qs.views[1] == nil || qs.views[1].GetId() != "v1" {
+		t.Fatalf("viewID v1 sent View=%+v, want {Id:v1}", qs.views[1])
 	}
 }
 
