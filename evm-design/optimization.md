@@ -157,14 +157,21 @@ The third case is why the status has to be asked for rather than inferred from t
 
 ## Rollback:
 
-Not designed yet. This records only what it has to handle.
+Stage 1 is stop-the-world: coarse, but simple, and it removes the hardest part of the problem outright (see the end of this section).
 
-The warmup cache needs nothing: it is refreshed only from committed notifications, so a rolled-back batch never entered it.
+Triggered by any abort - an abort notification, or an aborted status from the timeout adjudication.
 
-The auth cache does. The rolled-back writes must be dropped, and they are findable because they are still marked write - never demoted, since they never committed.
-Any later tx that was validated against one of those writes is void too.
-For the TXs we probably do not have to compute that set: the later tx's recorded read version never materialized, so the committer aborts it too and its own notification reports it - the cascade is discovered, not derived.
-For the CACHE we do have to. The cache holds one entry per key, so dropping a rolled-back write by key erases the key even when an earlier still-in-flight tx also wrote it, and the fast path then starts serving a committed value that the earlier write should still shadow. An entry therefore has to record WHICH tx wrote it, and rollback has to re-apply the surviving in-flight writes in order rather than only delete.
-Affected txs then re-enter the warmup input-queue and are re-warmed from scratch. Re-entry need not preserve any position: a same-sender successor drained ahead of them is excluded as nonce-too-high and stays pending, so the order self-corrects at the cost of a cycle.
+1. Stop submitting, immediately. The submit worker stops taking from the submit-queue and the warmup TXs worker stops forming batches. One abort usually means the txs behind it abort too - they were validated against its writes - so there is no point pushing any of them.
+2. Wait ONLY for the txs already submitted. Those cannot be cancelled, so their outcome has to be learned. The submitter holds one batch at a time and waits for ordered delivery, so this set is small and bounded; the wait ends when the submit map is empty. A tx whose notification does not arrive is adjudicated by the query service as usual.
+3. Keep the aborted txs - their original EVM txs, not their read-write sets.
+4. Abandon the rest of the pipeline where it stands - do NOT let it finish: warmup batches still executing and their read-write sets, the warmup-batch-queue, the auth batch being assembled, and the submit-queue. Keep only the EVM txs they carried.
+5. Reset. Every write-state entry still in the auth cache belongs to an aborted tx, because a committed one was demoted to read by its own notification during the wait in step 2 - so drop all remaining write entries and keep the read entries. Drain the notification-map, then reset the watermark bookkeeping (previous-batch-number and the done-batch set) to the current batch counter. The warmup cache needs nothing: it is only ever refreshed from committed notifications, so an aborted tx never entered it.
+6. Restart, with the txs from steps 3 and 4 placed on TOP of the input-queue.
+
+This explicitly does NOT preserve the original input order: a tx submitted after an aborted one may commit before it. That is fine under CFT, where the gateway owns the order and is free to re-order on retry. It is precisely what BFT cannot do - there the executors are bound to reproduce the ordered sequence - so this is one of several places the design needs revisiting for BFT.
+
+Waiting out the submitted set is what buys the simplicity. A partial rollback would have to drop the aborted tx's writes while keeping the writes of earlier txs that are still in flight, and since the cache holds one entry per key, dropping by key erases a key an earlier tx also wrote. That forces per-entry writer attribution plus re-applying the survivors in order. Because step 2 leaves nothing unresolved, every write entry is either committed-and-demoted or aborted-and-dropped, and neither mechanism is needed.
+
+The cost is the abandoned work: whatever was warmed or authed but not yet submitted is thrown away and redone. That is the intended trade - cheaper than pushing txs that are about to abort - but it means this holds up only while aborts are rare. Making rollback incremental is stage 2.
 
 Open: what to do with a tx that keeps aborting.
