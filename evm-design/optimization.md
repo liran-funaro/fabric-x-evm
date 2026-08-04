@@ -144,6 +144,17 @@ The value is there for the warmup refresh: a version without its value would att
 Then, we add this notification to the WARMUP phase notification-queue - not directly to the auth phase.
 It also removes the tx from the submit map.
 
+#### Notification Timeout:
+
+Every registered tx needs a timeout, because a notification that never arrives is not self-correcting: the tx stays in the submit map forever, its writes are never demoted so they can never be evicted from the auth cache, and every tx reading those keys re-executes forever.
+
+On timeout we do NOT assume the worst. We ask the query service for the txID status (GetTransactionStatus takes a list of txIDs, so one call can adjudicate every tx that timed out together):
+- COMMITTED: proceed exactly as if the notification had arrived. The keys/versions/values are still in the submit map, so the normal refresh/stamp/demote flow applies.
+- Any ABORTED/MALFORMED/REJECTED status: roll back.
+- STATUS_UNSPECIFIED means not validated yet, i.e. still in flight. Keep waiting and re-arm the timeout; do not roll back.
+
+The third case is why the status has to be asked for rather than inferred from the timeout alone: a slow commit and a lost notification are indistinguishable from our side, and rolling back a tx that is merely slow costs a re-execution and, if it then commits after all, a spurious rollback of everything that followed it.
+
 ## Rollback:
 
 Not designed yet. This records only what it has to handle.
@@ -151,7 +162,9 @@ Not designed yet. This records only what it has to handle.
 The warmup cache needs nothing: it is refreshed only from committed notifications, so a rolled-back batch never entered it.
 
 The auth cache does. The rolled-back writes must be dropped, and they are findable because they are still marked write - never demoted, since they never committed.
-Any later tx that was validated against one of those writes is void too, but we probably do not have to compute that set: its recorded read version never materialized, so the committer aborts it as well and its own notification reports it. The cascade is discovered, not derived.
-Affected txs then re-enter the warmup input-queue and are re-warmed from scratch.
+Any later tx that was validated against one of those writes is void too.
+For the TXs we probably do not have to compute that set: the later tx's recorded read version never materialized, so the committer aborts it too and its own notification reports it - the cascade is discovered, not derived.
+For the CACHE we do have to. The cache holds one entry per key, so dropping a rolled-back write by key erases the key even when an earlier still-in-flight tx also wrote it, and the fast path then starts serving a committed value that the earlier write should still shadow. An entry therefore has to record WHICH tx wrote it, and rollback has to re-apply the surviving in-flight writes in order rather than only delete.
+Affected txs then re-enter the warmup input-queue and are re-warmed from scratch. Re-entry need not preserve any position: a same-sender successor drained ahead of them is excluded as nonce-too-high and stays pending, so the order self-corrects at the cost of a cycle.
 
-Open: whether re-entry has to preserve any ordering, and what to do with a tx that keeps aborting.
+Open: what to do with a tx that keeps aborting.
