@@ -37,16 +37,56 @@ tmux new -s demo -d 'export EVM_PERF_DATA=$HOME/workspace/evm-perf-data; \
 render → `SUMMARY.txt` → `DONE` marker. It needs no attention overnight.
 
 **Always smoke it first.** A 20-minute run exercises the entire pipeline to a
-finished mp4 and tells you the ledger's GB/hour, which is what sizes the night:
+finished mp4 and re-measures the disk cost per transaction:
 
 ```bash
-bash scripts/demo/run_demo.sh --duration 20m
+bash scripts/demo/run_demo.sh --duration 20m --label smoke
 ```
 
-Then size the real run: `(89 GB free − 15 GB headroom) ÷ measured GB/hour`.
+Useful flags: `--label NAME` (scopes this run's artifacts), `--target-tps N`
+(throttle — see below), `--outstanding N` (in-flight bound, default 100000),
+`--dataset`, `--batch-size`, `--no-render`.
 
-Useful flags: `--outstanding N` (in-flight bound, default 100000), `--dataset`,
-`--batch-size`, `--no-render`.
+## Disk decides the run length — read this before choosing a duration
+
+**Measured on `ec2` (2026-08-04): ~6.3 KB of disk per committed EVM transaction,
+~2.1 GB/min at the ~5.6k tx/s ceiling.** The growth is 9 synchronized copies of
+the block data — 4 orderer batchers + 4 assemblers + the committer sidecar
+ledger. Postgres stays ~400 MB, because the trace touches a bounded ~151k
+accounts: *state* is bounded, *history* is not. That 9× replication is the
+4-party BFT property being demonstrated, and there is no ledger pruning setting,
+so it cannot be traded away.
+
+With ~81 GB free after `clean-x` and ~12 GB of headroom, the budget is a fixed
+**~12 million EVM transactions per run**. What is finite is the transaction
+count, not the wall-clock time, so **duration trades directly against rate**:
+
+| Target rate | Max duration | Use |
+|---|---|---|
+| unpaced (~5,600 tx/s) | **~35 min** | the throughput headline |
+| `--target-tps 1000` | ~3.5 h | balance |
+| `--target-tps 460` | ~8 h | endurance proof |
+
+**A multi-hour run at full throughput is not possible on this host.** Reaching
+8 hours means showing a client ~12× less throughput than the system delivers, so
+pick deliberately:
+
+```bash
+# Headline: full rate, as long as the disk allows
+bash scripts/demo/run_demo.sh --duration 30m --label headline
+
+# Endurance: multi-hour, deliberately throttled
+bash scripts/demo/run_demo.sh --duration 6h --target-tps 560 --label endurance
+```
+
+`SUMMARY.txt` states explicitly when a run was throttled, so a paced rate can
+never be mistaken for the ceiling. For a genuinely multi-hour full-rate run the
+host needs a bigger volume — an infrastructure change, not a workaround.
+
+**Each run clears the Prometheus TSDB first**, otherwise the new run's opening
+frames would show the previous run's tail inside the 15-minute sliding window (a
+throughput cliff that never happened). So render a run before starting the next
+one; the orchestrator already does.
 
 ## What the run actually does
 

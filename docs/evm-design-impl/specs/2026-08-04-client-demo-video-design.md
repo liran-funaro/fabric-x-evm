@@ -89,9 +89,34 @@ implementation without re-checking the code.
 4. **No run-uptime metric.** The loadgen uses a custom `prometheus.NewRegistry()`
    with no default collectors ([metrics.go:67](../../../integration/perf/metrics.go#L67)),
    so `process_start_time_seconds` does not exist.
-5. **Disk is finite.** `ec2` has 89 GB free on `/` (Docker root included), 32
-   vCPU, 61 GB RAM. ~157k merged committer txs overnight is feasible but not
-   unbounded — the smoke run measures actual GB/hour and sizes the night.
+5. **Disk caps the run, and it binds hard.** *Measured in the smoke run
+   (2026-08-04), not estimated:* a full-stack run consumes **~5.4 KB of disk per
+   committed EVM transaction** — **~1.8 GB/min (~108 GB/h) at ~5.6k tx/s**.
+   `ec2` has a single 100 GB disk (~81 GB free after `clean-x`), so the budget is
+   **~13 million EVM transactions per run**. What is finite is the transaction
+   count, not the wall-clock time, so **duration and throughput trade off
+   directly**:
+
+   | Rate | Max duration |
+   |---|---|
+   | ~5,600 tx/s (full) | ~35–40 min |
+   | ~1,000 tx/s | ~3.7 h |
+   | ~460 tx/s | 8 h |
+
+   The growth is 9 synchronized copies of the block data (4 orderer batchers + 4
+   assemblers + the committer sidecar ledger, each ~1.3 GB and climbing in
+   lockstep). Postgres stays ~400 MB because the trace touches a bounded ~151k
+   accounts — *state* is bounded, *history* is not. That 9× replication is the
+   4-party BFT property being demonstrated, so it is not reducible, and there is
+   no ledger pruning/retention setting to trade against it.
+
+   **Consequence for this design: a multi-hour run at full throughput is not
+   possible on this host.** An 8-hour run would require throttling to ~460 tx/s,
+   showing a client ~12× less throughput than the system delivers — which defeats
+   the demo's purpose more than a shorter run does. The run is therefore sized to
+   **full throughput for as long as the disk allows**, and a genuinely multi-hour
+   full-rate run needs a bigger volume (an infrastructure decision, not a
+   workaround). See [[evm-ec2-disk-caps-run-length]].
 6. **No ffmpeg on the Mac; `ec2` has only variable fonts** (`google-noto-vf`,
    `redhat-vf`), which `ffmpeg drawtext` handles badly. Everything runs in
    containers on `ec2`, with one static TTF shipped in.
