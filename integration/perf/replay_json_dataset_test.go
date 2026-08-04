@@ -345,6 +345,21 @@ func runReplayTest(
 
 		// Wire up queue size metrics callbacks
 		gwcore.SetBatchSubmitterQueueSizeMetric = metrics.SetBatchSubmitterInputQueueSize
+
+		// Wire up the two-phase executor phase/abort/commit hooks (nil-guarded in
+		// core; zero overhead when metrics are disabled). The rollback-batch count
+		// is fed from the completion goroutine below (it already discriminates
+		// COMMITTED vs invalidated notifications), not via a core hook.
+		gwcore.RecordWarmPhaseDuration = metrics.RecordWarmPhase
+		gwcore.RecordAuthPhaseDuration = metrics.RecordAuthPhase
+		gwcore.RecordCommitLatency = metrics.RecordCommitLatency
+		gwcore.RecordSpecAbort = metrics.RecordSpecAbort
+		defer func() {
+			gwcore.RecordWarmPhaseDuration = nil
+			gwcore.RecordAuthPhaseDuration = nil
+			gwcore.RecordCommitLatency = nil
+			gwcore.RecordSpecAbort = nil
+		}()
 	}
 
 	// USDC contract address
@@ -630,6 +645,7 @@ func runReplayTest(
 					newTotal := atomic.AddInt64(&committedEVM, int64(n))
 					atomic.AddInt64(&committedBatches, 1)
 					if metrics != nil {
+						metrics.RecordBatchCommitted() // one committer tx per merged batch
 						for range n {
 							metrics.RecordTransactionCommitted()
 						}
@@ -647,6 +663,7 @@ func runReplayTest(
 					atomic.AddInt64(&rolledBackBatches, 1)
 					if metrics != nil {
 						metrics.RecordTransactionAborted()
+						metrics.RecordBatchRolledBack(1)
 					}
 				}
 			}

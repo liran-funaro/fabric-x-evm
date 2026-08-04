@@ -136,7 +136,11 @@ func (g *Gateway) executeCycle(ctx context.Context) {
 		return
 	}
 
+	authStart := time.Now()
 	end, included, terminal, rws, err := g.endorsers.ExecuteBatch(ctx, batch)
+	if RecordAuthPhaseDuration != nil {
+		RecordAuthPhaseDuration(time.Since(authStart))
+	}
 	if err != nil {
 		logger.Errorf("batch endorse failed (%d txs): %v", len(batch), err)
 		g.backoff(ctx) // txs stay pending; re-drained next cycle
@@ -302,7 +306,11 @@ func (g *Gateway) drainAndWarm(ctx context.Context) *WarmedBatch {
 		g.waitForWork(ctx)
 		return nil
 	}
+	warmStart := time.Now()
 	warmed, err := g.endorsers.WarmBatch(ctx, txs)
+	if RecordWarmPhaseDuration != nil {
+		RecordWarmPhaseDuration(time.Since(warmStart))
+	}
 	if err != nil {
 		logger.Errorf("pipelined warm failed (%d txs): %v", len(txs), err)
 		g.pending.Release(hashesOf(txs)) // un-reserve so the txs are re-drawable
@@ -361,7 +369,11 @@ func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *W
 	if len(txsNext) > 0 {
 		warmFut = make(chan warmResult, 1)
 		go func() {
+			warmStart := time.Now()
 			wb, err := g.endorsers.WarmBatch(ctx, txsNext)
+			if RecordWarmPhaseDuration != nil {
+				RecordWarmPhaseDuration(time.Since(warmStart))
+			}
 			warmFut <- warmResult{wb: wb, err: err}
 		}()
 	}
@@ -370,7 +382,11 @@ func (g *Gateway) pipelineIteration(ctx context.Context, warmed *WarmedBatch) *W
 	// concurrent with warm(N+1). It reads the LIVE caches read-only and writes
 	// only its own batch overlay; AuthBatch consumes and closes batch N's
 	// snapshot. This is the serial CPU floor the warm pass hides behind.
+	authStart := time.Now()
 	end, included, terminal, rws, authErr := g.endorsers.AuthBatch(ctx, warmed)
+	if RecordAuthPhaseDuration != nil {
+		RecordAuthPhaseDuration(time.Since(authStart))
+	}
 
 	// (d) BARRIER: join warm(N+1). After this receive no warm reads are in flight,
 	// so the boundary mutations below (step e's ApplyWrites, next iteration's
@@ -544,6 +560,9 @@ func (g *Gateway) resolveInflight(txID string, committed bool) {
 	lat := time.Since(b.submittedAt)
 	g.commitCount.Add(1)
 	g.commitLatencyNanos.Add(int64(lat))
+	if RecordCommitLatency != nil {
+		RecordCommitLatency(lat)
+	}
 	for { // maintain the max lock-free (CAS retry loop; contention is negligible)
 		cur := g.commitLatencyMax.Load()
 		if int64(lat) <= cur || g.commitLatencyMax.CompareAndSwap(cur, int64(lat)) {
@@ -627,15 +646,23 @@ func (g *Gateway) cascadeFrom(txID string) {
 	// query service (H1), a stale view clone (H2), or the write cache (H3). Runs
 	// off the executor goroutine but only touches pipediag's own maps, never the
 	// cache. No-op when disabled.
-	if pipediag.Enabled && len(suffix) > 0 {
+	if len(suffix) > 0 {
 		aborted := suffix[0]
-		reads := make(map[string]uint64, len(aborted.rws.Reads))
-		for _, r := range aborted.rws.Reads {
-			if r.Version != nil {
-				reads[r.Key] = r.Version.BlockNum
+		class := "unclassified"
+		if pipediag.Enabled {
+			reads := make(map[string]uint64, len(aborted.rws.Reads))
+			for _, r := range aborted.rws.Reads {
+				if r.Version != nil {
+					reads[r.Key] = r.Version.BlockNum
+				}
 			}
+			class = specAbortClass(pipediag.ClassifyAbort(aborted.txID, reads))
 		}
-		pipediag.ClassifyAbort(aborted.txID, reads)
+		// Always-on rollback counter (nil-guarded); pipediag only enriches the
+		// class label when its detailed diagnostics are turned on.
+		if RecordSpecAbort != nil {
+			RecordSpecAbort(class)
+		}
 	}
 
 	for _, b := range suffix {

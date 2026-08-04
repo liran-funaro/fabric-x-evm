@@ -652,6 +652,7 @@ services:
       - ./config/monitoring/grafana/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboard.yml:ro,Z
       - ./config/monitoring/grafana/committer.json:/var/lib/grafana/dashboards/committer.json:ro,Z
       - ./config/monitoring/grafana/orderer.json:/var/lib/grafana/dashboards/orderer.json:ro,Z
+      - ./config/monitoring/grafana/evm-loadgen.json:/var/lib/grafana/dashboards/evm-loadgen.json:ro,Z
     ports:
       - "3000:3000"
     depends_on:

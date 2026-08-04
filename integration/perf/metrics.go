@@ -22,6 +22,11 @@ type LoadgenMetrics struct {
 	transactionCommitted prometheus.Counter
 	transactionAborted   prometheus.Counter
 
+	// Committer (Fabric) tx counter: one merged batch == one committer tx, so
+	// rate(batchCommitted) is committer tx/s alongside the EVM tx/s derived from
+	// transactionCommitted (which credits every EVM sub-tx of the batch).
+	batchCommitted prometheus.Counter
+
 	// Latency breakdown histograms
 	totalLatency      prometheus.Histogram // T4 - T1: end-to-end latency
 	queueLatency      prometheus.Histogram // T2 - T1: queueing time
@@ -40,6 +45,15 @@ type LoadgenMetrics struct {
 	batchSubmitterInputQueueSize prometheus.Gauge
 	txQueueReadyListSize         prometheus.Gauge
 	txQueueWaitingListSize       prometheus.Gauge
+
+	// Gateway two-phase executor metrics (fed by the nil-guarded core hooks:
+	// RecordWarmPhaseDuration / RecordAuthPhaseDuration / RecordSpecAbort, plus
+	// the commit-path timing + rollback count surfaced from the replay test).
+	warmPhaseLatency   prometheus.Histogram    // concurrent WARM pass wall-clock (pipelined only)
+	authPhaseLatency   prometheus.Histogram    // AUTHORITATIVE pass wall-clock (serial ExecuteBatch / pipelined AuthBatch)
+	commitLatency      prometheus.Histogram    // committer round-trip per batch
+	batchesRolledBack  prometheus.Counter      // MVCC rollback cascades (batches rolled back + re-batched)
+	specAbort          *prometheus.CounterVec  // spec-version aborts by dominant stale-read class
 
 	registry *prometheus.Registry
 	server   *http.Server
@@ -62,6 +76,10 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		transactionAborted: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "loadgen_transaction_aborted_total",
 			Help: "Total number of transactions aborted or failed",
+		}),
+		batchCommitted: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "loadgen_batch_committed_total",
+			Help: "Total number of committer (Fabric) txs committed; one merged batch == one committer tx (rate = committer tx/s)",
 		}),
 		totalLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "loadgen_total_latency_seconds",
@@ -111,6 +129,29 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 			Name: "gateway_txqueue_waiting_list_size",
 			Help: "Current size of the transaction queue waiting list",
 		}),
+		warmPhaseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gateway_warm_phase_seconds",
+			Help:    "Duration of the concurrent WARM pass per batch (pipelined executor only) in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20), // 1ms to ~524s
+		}),
+		authPhaseLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gateway_auth_phase_seconds",
+			Help:    "Duration of the AUTHORITATIVE pass per batch (serial ExecuteBatch or pipelined AuthBatch) in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20), // 1ms to ~524s
+		}),
+		commitLatency: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "gateway_commit_latency_seconds",
+			Help:    "Committer round-trip latency per batch (submit to commit notification) in seconds",
+			Buckets: prometheus.ExponentialBuckets(0.001, 2, 20), // 1ms to ~524s
+		}),
+		batchesRolledBack: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "gateway_batches_rolled_back_total",
+			Help: "Total number of batches rolled back and re-batched due to MVCC spec-version aborts",
+		}),
+		specAbort: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "gateway_spec_abort_total",
+			Help: "Spec-version abort cascades by dominant stale-read class (H1-qs-lag / H2-stale-clone / H3-write-cache / over-read / unclassified)",
+		}, []string{"class"}),
 		registry: registry,
 	}
 
@@ -119,6 +160,7 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		m.transactionSent,
 		m.transactionCommitted,
 		m.transactionAborted,
+		m.batchCommitted,
 		m.totalLatency,
 		m.queueLatency,
 		m.processingLatency,
@@ -130,6 +172,11 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		m.batchSubmitterInputQueueSize,
 		m.txQueueReadyListSize,
 		m.txQueueWaitingListSize,
+		m.warmPhaseLatency,
+		m.authPhaseLatency,
+		m.commitLatency,
+		m.batchesRolledBack,
+		m.specAbort,
 	)
 
 	return m
@@ -189,6 +236,12 @@ func (m *LoadgenMetrics) RecordTransactionAborted() {
 	m.transactionAborted.Inc()
 }
 
+// RecordBatchCommitted increments the committer-tx counter (one per merged batch
+// that commits); rate(loadgen_batch_committed_total) is committer tx/s.
+func (m *LoadgenMetrics) RecordBatchCommitted() {
+	m.batchCommitted.Inc()
+}
+
 // RecordLatencies records the four latency measurements
 func (m *LoadgenMetrics) RecordLatencies(total, queue, processing, backend time.Duration) {
 	m.totalLatency.Observe(total.Seconds())
@@ -230,4 +283,35 @@ func (m *LoadgenMetrics) SetTxQueueReadyListSize(size int) {
 // SetTxQueueWaitingListSize sets the current size of the transaction queue waiting list
 func (m *LoadgenMetrics) SetTxQueueWaitingListSize(size int) {
 	m.txQueueWaitingListSize.Set(float64(size))
+}
+
+// RecordWarmPhase observes the duration of one concurrent WARM pass. Assigned to
+// core.RecordWarmPhaseDuration; fires only on the pipelined executor.
+func (m *LoadgenMetrics) RecordWarmPhase(d time.Duration) {
+	m.warmPhaseLatency.Observe(d.Seconds())
+}
+
+// RecordAuthPhase observes the duration of one AUTHORITATIVE pass. Assigned to
+// core.RecordAuthPhaseDuration; fires on both the serial (ExecuteBatch) and
+// pipelined (AuthBatch) executors.
+func (m *LoadgenMetrics) RecordAuthPhase(d time.Duration) {
+	m.authPhaseLatency.Observe(d.Seconds())
+}
+
+// RecordCommitLatency observes the committer round-trip latency for one batch.
+// Fed from the replay test's commit-path timing (no core hook needed).
+func (m *LoadgenMetrics) RecordCommitLatency(d time.Duration) {
+	m.commitLatency.Observe(d.Seconds())
+}
+
+// RecordBatchRolledBack increments the rolled-back-batches counter by n. Fed from
+// the replay test's rollback tracking (no core hook needed).
+func (m *LoadgenMetrics) RecordBatchRolledBack(n int) {
+	m.batchesRolledBack.Add(float64(n))
+}
+
+// RecordSpecAbort increments the spec-abort counter for the given stale-read
+// class. Assigned to core.RecordSpecAbort; fires once per MVCC rollback cascade.
+func (m *LoadgenMetrics) RecordSpecAbort(class string) {
+	m.specAbort.WithLabelValues(class).Inc()
 }
