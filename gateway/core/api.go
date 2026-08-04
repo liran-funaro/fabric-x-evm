@@ -169,7 +169,7 @@ type Gateway struct {
 	//
 	// Default stays false (serial) as the conservative baseline. Throughput is
 	// being re-measured on ec2 after this read-path fix; see SetPipelined and
-	// report/pipeline_report.html for the current numbers.
+	// scripts/report/pipeline_report.html for the current numbers.
 	pipelined bool
 }
 
@@ -265,7 +265,7 @@ func (g *Gateway) SetMaxBatchSize(n int) {
 // traffic the stale-read MVCC abort cascade cannot occur and the pipeline never
 // livelocks, at any batch size. See the pipelined field comment. Default stays
 // false; throughput is being re-measured on ec2 after this read-path fix (see
-// report/pipeline_report.html).
+// scripts/report/pipeline_report.html).
 func (g *Gateway) SetPipelined(p bool) {
 	g.pipelined = p
 	// The pipelined auth pass inherits warm's write-cache resolutions across the
