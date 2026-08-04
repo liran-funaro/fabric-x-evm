@@ -10,9 +10,11 @@
 #   demo-highlight.mp4  ~90s cut, ramping from the finest honest step to a sweep
 #
 # Usage:
-#   scripts/demo/render_video.sh                    # both videos
+#   scripts/demo/render_video.sh                    # both videos, client dashboard
 #   scripts/demo/render_video.sh --mode full        # one
 #   scripts/demo/render_video.sh --keep-frames      # don't delete PNGs afterwards
+#   scripts/demo/render_video.sh --dashboard evm-demo-stack --prefix stack
+#                                                   # the committer/orderer view
 #
 # Env: EVM_PERF_DATA (required), PROM, GRAFANA, FFMPEG_IMAGE, PARALLEL
 set -euo pipefail
@@ -41,13 +43,27 @@ FONT="${FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
 
 MODES=(full highlight)
 KEEP_FRAMES=0
+# Which dashboard to film. The client view (evm-demo) is the default; the
+# full-stack committer/orderer view (evm-demo-stack) renders from the SAME stored
+# run, so covering it costs a re-render rather than another experiment.
+DASHBOARD="evm-demo"
+PREFIX=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --mode) MODES=("$2"); shift 2 ;;
     --keep-frames) KEEP_FRAMES=1; shift ;;
+    --dashboard) DASHBOARD="$2"; shift 2 ;;
+    --prefix) PREFIX="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+# Default prefix keeps the original filenames for the client dashboard.
+if [ -z "$PREFIX" ]; then
+  case "$DASHBOARD" in
+    evm-demo) PREFIX=demo ;;
+    *) PREFIX="${DASHBOARD#evm-demo-}" ;;
+  esac
+fi
 
 mkdir -p "$OUT_DIR"
 export PROM
@@ -89,7 +105,7 @@ preflight() {
   curl -fsS --max-time 10 "$PROM/-/ready" >/dev/null || {
     echo "error: Prometheus not ready at $PROM" >&2; exit 1; }
   curl -fsS --max-time 20 -o /dev/null \
-    "$GRAFANA/render/d/evm-demo/demo?width=400&height=300&kiosk" || {
+    "$GRAFANA/render/d/$DASHBOARD/x?width=400&height=300&kiosk" || {
       echo "error: Grafana /render failed -- is the renderer container up (DEMO=1)?" >&2; exit 1; }
   log "preflight ok"
 }
@@ -98,14 +114,14 @@ preflight() {
 # Frames
 # --------------------------------------------------------------------------- #
 render_frames() {
-  local mode="$1" start="$2" end="$3" dir="$DEMO_DIR/frames/$mode"
+  local mode="$1" start="$2" end="$3" dir="$DEMO_DIR/frames/$PREFIX-$mode"
   mkdir -p "$dir"
 
   python3 "$HERE/demo_lib.py" frames --mode "$mode" --start "$start" --end "$end" \
     > "$dir/schedule.txt"
   local n
   n=$(wc -l < "$dir/schedule.txt" | tr -d ' ')
-  log "$mode: $n frames -> $dir"
+  log "$PREFIX/$mode: $n frames -> $dir"
 
   # A 100-minute frame render with no output is indistinguishable from a hang.
   ( while :; do
@@ -122,7 +138,7 @@ render_frames() {
         idx=$0; from=$1; to=$2
         out=$(printf "%s/%06d.png" "'"$dir"'" "$idx")
         [ -s "$out" ] && exit 0
-        url="'"$GRAFANA"'/render/d/evm-demo/demo?orgId=1&from=${from}&to=${to}&width=1920&height=1080&scale=1&kiosk&theme=dark&tz=UTC"
+        url="'"$GRAFANA"'/render/d/'"$DASHBOARD"'/x?orgId=1&from=${from}&to=${to}&width=1920&height=1080&scale=1&kiosk&theme=dark&tz=UTC"
         for attempt in 1 2 3; do
           if curl -fsS --max-time 180 -o "$out" "$url" && [ "$(stat -c%s "$out" 2>/dev/null || stat -f%z "$out")" -gt 5000 ]; then
             exit 0
@@ -189,7 +205,7 @@ make_card() {
 encode_body() {
   # encode_body <mode> <content_fps> <out_fps> <out.mp4>
   local mode="$1" content_fps="$2" out_fps="$3" out="$4"
-  local dir="$DEMO_DIR/frames/$mode" cdir="$DEMO_DIR/captions"
+  local dir="$DEMO_DIR/frames/$PREFIX-$mode" cdir="$DEMO_DIR/captions"
   mkdir -p "$cdir"
 
   printf '%s' "Real mainnet transaction trace — not synthetic load" > "$cdir/c0.txt"
@@ -316,29 +332,35 @@ for mode in "${MODES[@]}"; do
 
   render_frames "$mode" "$START" "$END" >/dev/null   # progress goes to stderr
 
-  body="$DEMO_DIR/body-$mode.mp4"
+  body="$DEMO_DIR/body-$PREFIX-$mode.mp4"
   encode_body "$mode" "$content_fps" "$out_fps" "$body"
 
-  tdir="$DEMO_DIR/cards/title-$mode"
+  # Subtitle follows the dashboard being filmed, so the stack video is not
+  # mislabelled with the client view's framing.
+  case "$PREFIX" in
+    stack) subtitle="Full stack under load — BFT ordering and the committer pipeline" ;;
+    *)     subtitle="Sustained throughput on a real Ethereum workload" ;;
+  esac
+  tdir="$DEMO_DIR/cards/title-$PREFIX-$mode"
   n=$(write_card_text "$tdir" \
     "EVM on Fabric-X" \
-    "Sustained throughput on a real Ethereum workload" \
+    "$subtitle" \
     "Jan-2020 USDC transfer trace — 151,045 transactions replayed continuously" \
     "4-party BFT ordering — 32 vCPU / 61 GB" \
     "${DUR_ADJ} continuous run$([ "$mode" = highlight ] && echo ' — highlights' || echo ' — real time, unedited')")
-  make_card "$DEMO_DIR/title-$mode.mp4" "$out_fps" 4 "$tdir" "$n"
+  make_card "$DEMO_DIR/title-$PREFIX-$mode.mp4" "$out_fps" 4 "$tdir" "$n"
 
-  cdir="$DEMO_DIR/cards/close-$mode"
+  cdir="$DEMO_DIR/cards/close-$PREFIX-$mode"
   n=$(write_card_text "$cdir" \
     "$(group "${T[COMMITTED]}") transactions" \
     "committed over ${DUR_NOUN}" \
     "$(group "${T[TX_PER_SECOND]}") EVM transactions / second sustained" \
     "$(group "${T[BATCHES]}") BFT-ordered committer transactions" \
     "${T[ROLLED_BACK]} rolled-back batches — ${T[ABORTED]} aborted transactions")
-  make_card "$DEMO_DIR/close-$mode.mp4" "$out_fps" 6 "$cdir" "$n"
+  make_card "$DEMO_DIR/close-$PREFIX-$mode.mp4" "$out_fps" 6 "$cdir" "$n"
 
-  final="$OUT_DIR/demo-$mode.mp4"
-  concat_parts "$final" "$DEMO_DIR/title-$mode.mp4" "$body" "$DEMO_DIR/close-$mode.mp4"
+  final="$OUT_DIR/$PREFIX-$mode.mp4"
+  concat_parts "$final" "$DEMO_DIR/title-$PREFIX-$mode.mp4" "$body" "$DEMO_DIR/close-$PREFIX-$mode.mp4"
 
   dur=$(duration_of "$final")
   size=$(du -h "$final" | cut -f1)
@@ -361,10 +383,10 @@ PY
   fi
 
   if [ "$KEEP_FRAMES" -eq 0 ]; then
-    rm -rf "$DEMO_DIR/frames/$mode"
+    rm -rf "$DEMO_DIR/frames/$PREFIX-$mode"
     log "$mode: frames deleted (--keep-frames to retain)"
   fi
-  rm -f "$body" "$DEMO_DIR/title-$mode.mp4" "$DEMO_DIR/close-$mode.mp4"
+  rm -f "$body" "$DEMO_DIR/title-$PREFIX-$mode.mp4" "$DEMO_DIR/close-$PREFIX-$mode.mp4"
 done
 
 log "done: $OUT_DIR"

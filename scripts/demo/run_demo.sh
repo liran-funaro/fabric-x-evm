@@ -211,8 +211,14 @@ kill "$WATCHDOG_PID" "$GATE_PID" 2>/dev/null || true
 # --------------------------------------------------------------------------- #
 RENDER_RC=0
 if [ "$DO_RENDER" -eq 1 ]; then
-  log "rendering videos"
+  # Two dashboards from the SAME stored run: the client view, and the
+  # committer/orderer full-stack view. Covering the stack costs a re-render, not
+  # another experiment, because Prometheus already scrapes all 21 orderer and
+  # committer targets throughout.
+  log "rendering videos (client dashboard)"
   bash "$HERE/render_video.sh" || RENDER_RC=$?
+  log "rendering videos (full-stack dashboard)"
+  bash "$HERE/render_video.sh" --dashboard evm-demo-stack --prefix stack || RENDER_RC=$?
   log "render exited rc=$RENDER_RC"
 else
   log "skipping render (--no-render)"

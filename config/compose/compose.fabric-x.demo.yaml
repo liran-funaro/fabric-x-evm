@@ -59,6 +59,7 @@ services:
       - ./config/monitoring/grafana/orderer.json:/var/lib/grafana/dashboards/orderer.json:ro,Z
       - ./config/monitoring/grafana/evm-loadgen.json:/var/lib/grafana/dashboards/evm-loadgen.json:ro,Z
       - ./config/monitoring/grafana/evm-demo.json:/var/lib/grafana/dashboards/evm-demo.json:ro,Z
+      - ./config/monitoring/grafana/evm-demo-stack.json:/var/lib/grafana/dashboards/evm-demo-stack.json:ro,Z
 
   renderer:
     image: grafana/grafana-image-renderer:3.12.6
