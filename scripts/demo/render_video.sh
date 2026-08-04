@@ -27,8 +27,13 @@ PARALLEL="${PARALLEL:-6}"
 
 DEMO_DIR="$EVM_PERF_DATA/demo"
 OUT_DIR="$DEMO_DIR/video"
-ASSETS="$DEMO_DIR/assets"
-FONT="$ASSETS/DejaVuSans.ttf"
+
+# Font path INSIDE the ffmpeg container. The image already ships DejaVu, so the
+# font travels with the tool that draws with it: no host install, no download,
+# and no network dependency at render time. This matters because the experiment
+# host has only variable fonts (google-noto-vf), which drawtext renders badly,
+# and no host ffmpeg at all.
+FONT="${FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}"
 
 MODES=(full highlight)
 KEEP_FRAMES=0
@@ -40,7 +45,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-mkdir -p "$OUT_DIR" "$ASSETS"
+mkdir -p "$OUT_DIR"
 export PROM
 
 log() { printf '[render %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -63,12 +68,6 @@ ffprobe_() {
 
 preflight() {
   log "preflight"
-  if [ ! -f "$FONT" ]; then
-    log "fetching DejaVuSans.ttf (ec2 has only variable fonts, which drawtext handles badly)"
-    curl -fsSL -o "$FONT" \
-      "https://github.com/dejavu-fonts/dejavu-fonts/raw/version_2_37/ttf/DejaVuSans.ttf" \
-      || { echo "error: could not fetch a static TTF; place one at $FONT" >&2; exit 1; }
-  fi
   docker image inspect "$FFMPEG_IMAGE" >/dev/null 2>&1 || {
     log "pulling $FFMPEG_IMAGE"
     docker pull -q "$FFMPEG_IMAGE"
@@ -78,6 +77,9 @@ preflight() {
   docker run --rm --entrypoint ffmpeg "$FFMPEG_IMAGE" -hide_banner -filters 2>/dev/null \
     | grep -q ' drawtext ' || {
       echo "error: $FFMPEG_IMAGE has no drawtext filter (needs libfreetype)" >&2; exit 1; }
+  docker run --rm --entrypoint sh "$FFMPEG_IMAGE" -c "test -f '$FONT'" || {
+    echo "error: no font at $FONT inside $FFMPEG_IMAGE; set FONT= to a path that exists there" >&2
+    exit 1; }
   curl -fsS --max-time 10 "$PROM/-/ready" >/dev/null || {
     echo "error: Prometheus not ready at $PROM" >&2; exit 1; }
   curl -fsS --max-time 20 -o /dev/null \

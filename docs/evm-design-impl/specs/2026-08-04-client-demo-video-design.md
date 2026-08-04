@@ -246,8 +246,10 @@ the experiment finishes, against the persisted TSDB.
 4. **Assembly** — containerized ffmpeg on `ec2` (no host installs). Body video
    from the frame sequence, then title card, timed `drawtext` captions gated
    with `enable='between(t,a,b)'`, and a closing totals card, joined with
-   `concat`. Fonts: one static `DejaVuSans.ttf` shipped once to
-   `$EVM_PERF_DATA/demo/assets/` (constraint 6).
+   `concat`. Fonts: the ffmpeg image already ships
+   `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf`, so the font travels with
+   the tool that draws with it — no host install, no download, no network
+   dependency at render time (constraint 6).
 5. **Delivery** — rsync only the two mp4s back to the Mac.
 
 ### Card and caption text
