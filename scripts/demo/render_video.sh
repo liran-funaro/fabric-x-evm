@@ -239,6 +239,11 @@ duration_of() {
   ffprobe_ -v error -show_entries format=duration -of csv=p=0 "$1" | tr -d '\r'
 }
 
+# Thousands separators for the closing card. bash's printf "%'d" depends on the
+# locale and the host runs C.UTF-8, which groups nothing -- "12345678" instead of
+# "12,345,678". Python groups regardless of locale.
+group() { python3 -c "print(f'{int(\"$1\"):,}')"; }
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -254,6 +259,35 @@ declare -A T
 while IFS='=' read -r k v; do T["$k"]="$v"; done < <(
   python3 "$HERE/demo_lib.py" totals --start "$START" --end "$END")
 log "totals: ${T[COMMITTED]} committed, ${T[BATCHES]} batches, ${T[ROLLED_BACK]} rolled back, ${T[TX_PER_SECOND]} tx/s avg"
+
+# Cross-check the closing card's numbers against the replay log, so a video can
+# never ship a headline that disagrees with the run's own output -- e.g. if the
+# wrong run's window were discovered in the TSDB. A small gap is expected and
+# fine: the final commits land after the last scrape, so the counter trails the
+# log by a fraction of a percent. Only a gross mismatch is a bug.
+REPLAY_LOG_PATH="$DEMO_DIR/replay.log"
+if [ -f "$REPLAY_LOG_PATH" ]; then
+  logged=$(grep -oE 'Replay complete: [0-9]+' "$REPLAY_LOG_PATH" | tail -1 | grep -oE '[0-9]+$' || true)
+  if [ -n "$logged" ]; then
+    python3 - "${T[COMMITTED]}" "$logged" <<'PY' || exit 1
+import sys
+prom, logged = int(sys.argv[1]), int(sys.argv[2])
+if logged == 0:
+    sys.exit("FAIL: replay log reports 0 committed transactions")
+drift = abs(prom - logged) / logged
+if drift > 0.01:
+    sys.exit(f"FAIL: Prometheus says {prom:,} committed but the replay log says "
+             f"{logged:,} ({drift*100:.2f}% apart) -- refusing to ship a video "
+             f"whose headline disagrees with the run")
+print(f"ok: totals agree with the replay log ({prom:,} vs {logged:,}, "
+      f"{drift*100:.3f}% apart -- commits after the last scrape)")
+PY
+  else
+    log "WARNING: no 'Replay complete:' line in $REPLAY_LOG_PATH; skipping the cross-check"
+  fi
+else
+  log "WARNING: no replay log at $REPLAY_LOG_PATH; skipping the totals cross-check"
+fi
 
 HOURS=$(python3 -c "print(f'{$RUN_SECONDS/3600:.1f}')")
 
@@ -280,10 +314,10 @@ for mode in "${MODES[@]}"; do
 
   cdir="$DEMO_DIR/cards/close-$mode"
   n=$(write_card_text "$cdir" \
-    "$(printf "%'d" "${T[COMMITTED]}") transactions" \
+    "$(group "${T[COMMITTED]}") transactions" \
     "committed over ${HOURS} hours" \
-    "$(printf "%'d" "${T[TX_PER_SECOND]}") EVM transactions / second sustained" \
-    "$(printf "%'d" "${T[BATCHES]}") BFT-ordered committer transactions" \
+    "$(group "${T[TX_PER_SECOND]}") EVM transactions / second sustained" \
+    "$(group "${T[BATCHES]}") BFT-ordered committer transactions" \
     "${T[ROLLED_BACK]} rolled-back batches — ${T[ABORTED]} aborted transactions")
   make_card "$DEMO_DIR/close-$mode.mp4" "$out_fps" 6 "$cdir" "$n"
 

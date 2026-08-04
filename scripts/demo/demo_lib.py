@@ -166,6 +166,18 @@ def _query_range(expr, start, end, step):
     return body["data"]["result"]
 
 
+def server_time():
+    """Prometheus' own clock. `time()` comes back as resultType "scalar", whose
+    result is [timestamp, "value"] rather than the list-of-series an instant
+    vector returns -- indexing it like a vector raises TypeError."""
+    url = f"{PROM}/api/v1/query?" + urllib.parse.urlencode({"query": "time()"})
+    with urllib.request.urlopen(url, timeout=30) as r:
+        data = json.load(r)["data"]
+    if data.get("resultType") == "scalar":
+        return float(data["result"][1])
+    return float(data["result"][0]["value"][1])
+
+
 def _scalar(expr, at=None, default=0.0):
     res = _query(expr, at)
     if not res:
@@ -181,22 +193,40 @@ def window():
     counter, which is where the data actually stops -- using "now" instead would
     tack dead air onto the end of the video.
     """
-    res = _query("loadgen_run_start_timestamp_seconds")
+    # last_over_time, NOT a bare instant query. The loadgen process is gone by
+    # the time we render, and Prometheus writes a stale marker for its series
+    # within one scrape interval of the target going down -- after which an
+    # instant query at `now` returns nothing at all. A range-vector selector
+    # ignores stale markers, so it still finds the run.
+    res = _query("last_over_time(loadgen_run_start_timestamp_seconds[30d])")
     if not res:
         raise RuntimeError(
-            "loadgen_run_start_timestamp_seconds not found -- was the replay run "
-            "with -enable-metrics, and is the loadgen scrape target UP?")
+            "loadgen_run_start_timestamp_seconds not found in the last 30d -- was "
+            "the replay run with -enable-metrics, and did the loadgen scrape "
+            "target come UP? (check $EVM_PERF_DATA/demo*/panel-gate.log)")
     start = float(res[0]["value"][1])
 
-    now = float(_query("time()")[0]["value"][1]) if _query("time()") else None
-    if now is None:
-        now = start
+    now = server_time()
     span = max(now - start, 1.0)
-    step = max(15.0, span / 10000.0)  # stay under Prometheus' 11k-point cap
+    step = max(1.0, span / 10000.0)  # stay under Prometheus' 11k-point cap
+
+    # A range query is unaffected by staleness at `now`: it returns the real
+    # samples, so its last point is where the run's data actually stops.
     series = _query_range("loadgen_transaction_committed_total", start, now, step)
     if not series or not series[0]["values"]:
         raise RuntimeError("no loadgen_transaction_committed_total samples in the TSDB")
     end = float(series[0]["values"][-1][0])
+
+    # The coarse pass only locates the end to within one step, and that error
+    # propagates straight into the video's length: 15s short on a 20-minute run
+    # is 1.2%, which trips the render's own 1x real-time assertion. Refine to
+    # 1-second resolution (the loadgen scrape interval) around the coarse answer.
+    if step > 1.0:
+        lo = max(start, end - 2 * step)
+        hi = min(now, end + 2 * step)
+        fine = _query_range("loadgen_transaction_committed_total", lo, hi, 1.0)
+        if fine and fine[0]["values"]:
+            end = float(fine[0]["values"][-1][0])
 
     if end <= start:
         raise RuntimeError(f"degenerate run window: start={start} end={end}")
