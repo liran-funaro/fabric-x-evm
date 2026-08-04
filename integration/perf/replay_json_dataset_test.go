@@ -43,7 +43,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-var gatewayConfig = flag.String("gateway-config", "fabx.yaml", "gateway config file for the Fabric-X network")
+var gatewayConfig = flag.String("gateway-config", "../config/gateway/fabx.yaml", "gateway config file for the Fabric-X network (resolved from the integration/ dir the harness chdirs to)")
 var metricsAddr = flag.String("metrics-addr", "0.0.0.0:2112", "address for Prometheus metrics endpoint")
 var enableMetrics = flag.Bool("enable-metrics", false, "enable Prometheus metrics export")
 var namespace = flag.String("namespace", "real", "namespace to commit transactions to")

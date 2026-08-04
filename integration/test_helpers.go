@@ -740,7 +740,7 @@ func NewLocalTestHarnessWithNotifier(t *testing.T, logger sdk.Logger, evmConfig 
 	return th, ctl, nil
 }
 
-// newFileConfigHarness loads configFile (e.g. "fablo.yaml" for Fablo, "fabx.yaml" for
+// newFileConfigHarness loads configFile (e.g. "../config/gateway/fablo.yaml" for Fablo, "../config/gateway/fabx.yaml" for
 // fabric-x — both connect to a real, already-running network), builds a harness against it,
 // and waits for the gateway synchronizer to catch up before returning.
 func newFileConfigHarness(t *testing.T, logger sdk.Logger, evmConfig execution.EVMConfig, primeDbPath, configFile string, configOverrides map[string]any) (*TestHarness, error) {

@@ -19,9 +19,12 @@ COMPOSE ?= docker compose
 #   HOST_DATA=1: overlay compose.fabric-x.hostdata.yaml to bind those same volumes
 #     to ./data on the host, so a developer/agent can inspect persisted state.
 HOST_DATA ?=
-COMPOSE_FULL_FILES := -f compose.fabric-x.full.yaml
+# --project-directory $(CURDIR) keeps every ./-relative volume mount in the
+# compose files resolving from the repo root, even though the compose files now
+# live under config/compose/.
+COMPOSE_FULL_FILES := --project-directory $(CURDIR) -f config/compose/compose.fabric-x.full.yaml
 ifeq ($(HOST_DATA),1)
-COMPOSE_FULL_FILES += -f compose.fabric-x.hostdata.yaml
+COMPOSE_FULL_FILES += -f config/compose/compose.fabric-x.hostdata.yaml
 export DATA_ROOT := $(CURDIR)/data
 endif
 
@@ -133,7 +136,7 @@ clean-x:
 .PHONY: start-x
 start-x:
 	@if nc -z localhost 7050 2>/dev/null; then echo "Error: port 7050 is already in use — stop any running Fabric orderer before starting."; exit 1; fi
-	@$(COMPOSE) -f compose.fabric-x.yml up -d
+	@$(COMPOSE) --project-directory $(CURDIR) -f config/compose/compose.fabric-x.yml up -d
 	@echo "Waiting for test committer to be ready..."
 	@while ! nc -z localhost 7001 2>/dev/null; do sleep 1; done
 	@echo "Creating namespace (retrying until the committer is ready)..."
@@ -164,7 +167,7 @@ test-x:
 
 .PHONY: stop-x
 stop-x:
-	@$(COMPOSE) -f compose.fabric-x.yml down
+	@$(COMPOSE) --project-directory $(CURDIR) -f config/compose/compose.fabric-x.yml down
 
 .PHONY: start-fablo
 start-fablo:
