@@ -80,7 +80,14 @@ DEMO=1 make stop-full clean-x >/dev/null 2>&1 || true
 # inside the 15-minute sliding window -- a throughput cliff that never happened.
 # Consequence: render a run before starting the next one (the orchestrator does).
 log "clearing the previous run's TSDB at $TSDB_DIR"
-rm -rf "$TSDB_DIR"
+if [ -d "$TSDB_DIR" ]; then
+  # Prometheus writes as nobody (65534), so the host user cannot delete these
+  # files -- a plain `rm -rf` fails with EPERM and, under `set -e`, kills the
+  # whole run. Delete from a container running as root, the same trick
+  # `make start-full` uses to chown this directory.
+  docker run --rm -v "$EVM_PERF_DATA/demo":/d busybox sh -c 'rm -rf /d/prometheus-data' \
+    || { echo "error: could not clear $TSDB_DIR" >&2; exit 1; }
+fi
 
 DEMO=1 make clean-x init-x start-full
 
