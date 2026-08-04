@@ -41,6 +41,11 @@ type LoadgenMetrics struct {
 	outstandingTxGauge prometheus.Gauge
 	throughputGauge    prometheus.Gauge
 
+	// runStart is the measurement window's start as a unix timestamp, so a
+	// dashboard can show elapsed runtime. This registry is a custom one with no
+	// default collectors, so process_start_time_seconds does not exist.
+	runStart prometheus.Gauge
+
 	// Queue size gauges
 	batchSubmitterInputQueueSize prometheus.Gauge
 	txQueueReadyListSize         prometheus.Gauge
@@ -119,6 +124,10 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 			Name: "loadgen_throughput_tx_per_second",
 			Help: "Current throughput in transactions per second",
 		}),
+		runStart: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "loadgen_run_start_timestamp_seconds",
+			Help: "Unix timestamp when the replay's measurement window started (elapsed runtime = time() - this)",
+		}),
 		batchSubmitterInputQueueSize: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "gateway_batch_submitter_input_queue_size",
 			Help: "Current size of the batch submitter input channel queue",
@@ -176,6 +185,7 @@ func NewLoadgenMetrics() *LoadgenMetrics {
 		m.blockReceived,
 		m.outstandingTxGauge,
 		m.throughputGauge,
+		m.runStart,
 		m.batchSubmitterInputQueueSize,
 		m.txQueueReadyListSize,
 		m.txQueueWaitingListSize,
@@ -276,6 +286,14 @@ func (m *LoadgenMetrics) SetOutstandingTransactions(count int64) {
 // SetThroughput sets the current throughput in tx/s
 func (m *LoadgenMetrics) SetThroughput(txPerSecond float64) {
 	m.throughputGauge.Set(txPerSecond)
+}
+
+// SetRunStart records when the measurement window began, so a dashboard can show
+// elapsed runtime as time() - loadgen_run_start_timestamp_seconds. Needed because
+// this is a custom registry with no default collectors, so the usual
+// process_start_time_seconds is not exported.
+func (m *LoadgenMetrics) SetRunStart(t time.Time) {
+	m.runStart.Set(float64(t.UnixNano()) / float64(time.Second))
 }
 
 // SetBatchSubmitterInputQueueSize sets the current size of the batch submitter input queue

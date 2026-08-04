@@ -595,6 +595,9 @@ func runReplayTest(
 	stopProfiling := startProfiling()
 
 	startTime := time.Now()
+	if metrics != nil {
+		metrics.SetRunStart(startTime)
+	}
 
 	// Work channel: a bounded buffer that lets the feeder run ahead of the
 	// submitters without materializing every tx at once. By default there is no
