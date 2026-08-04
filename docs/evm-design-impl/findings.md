@@ -362,7 +362,7 @@ Discovered while producing the client demo video
 
 ---
 
-## 11. Throttled runs violate the single-submitter invariant (2026-08-04) ⚠️
+## 11. Throttled runs collapse at ~110k committer txs — cause NOT yet found (2026-08-04) ⚠️
 
 **Symptom.** A deliberately throttled run (`-target-tps 500`, historic dataset,
 serial executor) ran perfectly for **48 minutes** — 500 tx/s, ~14 EVM/batch, **0
@@ -409,14 +409,43 @@ gives 64 concurrent submitter workers the chance to deliver a dependent committe
 tx ahead of its predecessor. `unclassified` is the expected abort class: this is a
 submission-order abort, not one of the classified stale-read hypotheses.
 
-**Mitigation for any throttled or small-batch run: `-orderers 1`.** The flag
-already exists; no code change needed. **Status: under test** (a 3 h run at
-500 tx/s with `-orderers 1`); confirmation is that it stays clean well past the
-48-minute mark. Do not treat the root cause as proven until that run reports.
+### The submission-order hypothesis was TESTED AND REFUTED
 
-**Open question for the owner.** The harness default of 64 violates a documented
-invariant on the default execution path. Either `BuildGateway` should clamp like
-`buildApp` does, or `-orderers` should default to 1. At full rate the clamp is a
-no-op in practice (one batch in the channel at a time), so the §2 headline numbers
-are very likely unaffected — but that should be measured before changing a default
-every recorded number depends on.
+`-orderers 1` (single submitter, verified on the process command line) did **not**
+prevent it. The retry collapsed the same way:
+
+| Run | `-orderers` | Onset | EVM txs at onset | **Committer txs at onset** |
+|---|---|---:|---:|---:|
+| B | 64 | t+48 min | ~1.44 M | ~102 000 |
+| D | **1** | t+52 min | ~1.56 M | ~111 800 |
+| A | 64 | never (10.4 M txs) | — | 10 166 *total* |
+
+So concurrent submission is **not** the cause. What both throttled runs share is
+the **committer-tx (batch) count at onset: ~102 000–112 000** — and Run A, which
+was clean, never exceeded ~10 000 batches in its whole life. Run D's ledger height
+at onset was 112 699, i.e. one block per committer tx.
+
+The collapse shape is identical in both: in-flight sits flat at ~50 until the
+cliff, then commits stop dead (Run D: frozen at 1 561 113 with in-flight climbing
+past 72 000 and the batch counter frozen at 111 829). Run B recovered from its
+first burst and ran 8 clean minutes before a second, terminal one; Run D did not
+recover at all.
+
+### What is still unknown
+
+The trigger correlates with **cumulative committer-tx count**, not with elapsed
+time, tx count, submitter concurrency, read-path latency, or host resources — but
+that rests on only **two** data points, and "batch count" is confounded with "the
+throttled small-batch regime" because no full-rate run has ever reached 100 k
+batches. Do not treat ~110 k as a real constant yet.
+
+**The decisive next experiment** (cheap, ~30 min): run at **1000 tx/s** with
+everything else identical. Batches then accumulate twice as fast, so a
+batch-count threshold predicts onset at ~t+25 min, while a time-based cause
+predicts ~t+50 min. That one run separates the two.
+
+Other candidates not yet excluded: a per-batch resource leak in the gateway
+(goroutines/fds/cache entries), committer-side per-block state, or DB/orderer
+degradation at a size threshold. `-orderers` was left at its default of 64 —
+the invariant concern in §9 is real for the pipelined path, but it is **not**
+what causes this.
