@@ -18,7 +18,7 @@ the work followed.
 | [server-setup.md](server-setup.md) | Provision a native experiment host (ask which server; install docker + go; the RHEL reboot gotcha) and sync local → remote. |
 | [specs/](specs/) | Brainstormed designs: drop-internal-state-DB, two-phase execution, perf harness, pipelined-cache, warm/auth pipelining. |
 | [plans/](plans/) | Task-by-task implementation plans those specs became. |
-| [reports/](reports/) | SDD outcome reports: [exec-hotpath optimization](reports/2026-07-exec-hotpath-optimization.md), [stage-2.1 final fix](reports/2026-07-stage2.1-final-fix-report.md). |
+| [reports/](reports/) | SDD outcome reports: [exec-hotpath optimization](reports/2026-07-exec-hotpath-optimization.md), [stage-2.1 final fix](reports/2026-07-stage2.1-final-fix-report.md), [pipelined-cache slice](reports/2026-07-pipelined-cache-slice.md) (single-submitter invariant, MVCC cascade, receipt fix). |
 
 ## Repository layout (post-reorg, for a new agent)
 
@@ -37,16 +37,22 @@ the work followed.
 - **`docs/evm-design-impl/`** — this folder.
 - **`evm-design/`** — the user's read-only design doc. Do not modify.
 
-## Current status (as of 2026-08-03)
+## Current status (as of 2026-08-04)
 
-- **Serial two-phase executor: healthy and shipped (default).** ~3.8k EVM tx/s
-  on native ec2 at bs 512–1024 (~4.2k with the GC env knob), 0 rolled back on
-  both datasets. This is the production path.
+- **Serial two-phase executor: healthy and shipped (default).** **~4.9k–6.0k
+  EVM tx/s** on native ec2 at bs 512–1024 (latest verified run: synthetic 4872 /
+  historic 5617 @ 50k window, GC knob), 0 rolled back on both datasets. This is
+  the production path. (The earlier ~3.8k/~4.2k figure was superseded by the
+  warm-workers-restore + QS-batching lift, `54faa4f` — see findings.md §2.)
 - **Committed optimizations** (branch `bft-redesign`, **not pushed**):
   endorser→QS connection pool (`6221599`), code-hash cache (`58a0df8`),
   read-only MFU cache (`1ec2cd7`), `RequestMaxBytes` liveness fix (`92d9ba8`),
-  QS rate-limit disabled (`3ca917a`), plus the repo reorg + monitoring
-  extensions.
+  QS rate-limit disabled (`3ca917a`), warm-concurrency + QS low-latency batching
+  (`54faa4f`), plus the repo reorg + monitoring extensions.
+- **Pipelined-cache slice** (`Gateway.Pipelined`, opt-in): the
+  execution-ahead-of-commit path — single-submitter invariant, MVCC-abort
+  cascade + cache rebuild, receipt-index fix. See findings.md §9 and the
+  [pipelined-cache report](reports/2026-07-pipelined-cache-slice.md).
 - **Warm/auth pipeline (`-pipeline`, default OFF): UNSOLVED.** A trilemma; five
   fixes failed the same bistable livelock. The decisive v2 diagnostic
   (`common/pipediag`) **refuted** the stale-read mechanism all five targeted —

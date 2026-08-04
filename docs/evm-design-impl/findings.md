@@ -49,10 +49,21 @@ transfers); one merged batch == one committer (Fabric) tx.
 | Code-hash cache (`58a0df8`) | ~2588–2662 | Cache immutable `keccak256(code)` per engine; cuts GC pressure globally |
 | Read-only (MFU) cache (`1ec2cd7`) | **~3665–3815** | Serve the ~9 globally-hot immutable keys from memory; collapse warm-pass gRPC |
 | + GC env knob (GOGC=400–800 + GOMEMLIMIT) | ~4085–4210 | Deployment knob, **zero code change** |
+| Warm-workers restore + QS low-latency batching (`54faa4f`) | **~4.9k–6.0k** | `WarmWorkers=len(txs)` re-applied (a GOMAXPROCS cap, added as a scheduler-churn optimization in the fast in-memory regime, had regressed it in the real-QS I/O regime); QS `min-batch-keys` 1024→256, `max-batch-wait` 100ms→5ms so a single gateway's read wave flushes immediately instead of eating the 100ms window |
 
 Cumulative code-side gain over the two-phase ceiling: **~2161 → ~3815 tx/s
 (+77%)**, then a further **~+10%** from the GC env knob (deployment-time, no
-code). See [[evm-perf-stall-findings]] for the full run log.
+code), then the warm-workers restore + QS batching (`54faa4f`) lifted the
+native ec2 headline to **~4.9k–6.0k EVM tx/s** (the current serial headline).
+Latest verified run (2026-08-04, ec2, `PERF_REPLAY_WINDOW_SIZE=50000`,
+bs=1024, `GOGC=500 GOMEMLIMIT=48GiB`, 0 rolled back both datasets): **synthetic
+4872 tx/s** (50000/50000 in 10.3s) / **historic 5617 tx/s** (50000/50000 in
+8.9s); a prior same-week run hit 5.2k / 6.0k (normal shared-box variance —
+prefer reporting a range). The synthetic (conflict-free) lift is `54faa4f`'s
+warm/QS change; the `73bed3d`/`9ea5470`/`5f5adf1`/`2d51b2d` commits are
+correctness for the pipelined/high-conflict path (§9), not raw-throughput
+levers. See [[evm-perf-stall-findings]] for the full run log and
+[[evm-current-serial-headline]].
 
 ---
 
@@ -106,6 +117,7 @@ warm/auth — the gateway cannot split a single fused RPC.
 | `1ec2cd7` | **read-only MFU cache** (serve globally-hot immutable keys; evict-on-write, re-admit; boundary-only mutation) | +~42%; zero new MVCC aborts |
 | `92d9ba8` | arma `RequestMaxBytes` 1 MB → 16 MB (+ Preferred/Absolute bumps) | **Real liveness fix**: unblocks batches >~1024 EVM txs from a total stack stall |
 | `3ca917a` | query-service rate-limit disabled (`requests-per-second: 0`) | Benchmark config; warm burst approaches the 5000 rps DoS default |
+| `54faa4f` | warm-pass concurrency = batch size (`WarmWorkers=len(txs)`) + QS `min-batch-keys` 1024→256 / `max-batch-wait` 100ms→5ms | Current serial headline lift to **~4.9k–6.0k** tx/s; restores RQ1 ("phase-1 concurrency = batch size") after a GOMAXPROCS cap had regressed it in the real-QS regime |
 
 The GC setting is **not** hardcoded — Go reads `GOGC`/`GOMEMLIMIT` from the
 env, so it is a deploy-time knob (recommended `GOGC=400–800` + `GOMEMLIMIT`
@@ -254,3 +266,60 @@ bound), and awaits user go-ahead.
 - **`overlayReader.Get` delete-then-read version** ([[evm-bft-redesign-project]]):
   an in-batch delete of a pre-existing key drops `under.Version`; dormant
   while EOV uses N==1, to be fixed when the OEV/BFT slice exercises N>1.
+
+---
+
+## 9. The pipelined-cache slice — single-submitter invariant, MVCC-abort cascade, receipt fix
+
+> The `-pipeline` executor of §6 overlaps **warm(N+1)‖auth(N)** and is unsolved.
+> This section is a *different* piece of work: the **pipelined-cache** slice
+> (`Gateway.Pipelined`), which removes the per-cycle commit barrier so batch N is
+> endorsed against N−1's *uncommitted* speculative writes — the concrete
+> **execution-ahead-of-commit** lever §7 names. It is opt-in; the serial default
+> is unaffected. Commits `54faa4f` (perf), `73bed3d`, `9ea5470`, `5f5adf1`,
+> `2d51b2d` on `bft-redesign`. Full detail (notifier fallback, spec-version
+> backfill, harness traps, concurrency rules) in
+> [reports/2026-07-pipelined-cache-slice.md](reports/2026-07-pipelined-cache-slice.md);
+> design in [specs/2026-07-27-pipelined-cache-execution-design.md](specs/2026-07-27-pipelined-cache-execution-design.md).
+
+**Single-submitter invariant — the likely root cause of the old ~80 tx/s stall.**
+Because N is endorsed against N−1's uncommitted cache writes, the committer must
+validate/commit committer txs **in submission order**. The default
+`BatchSubmitter` drains its endorsement channel with 16 concurrent workers, which
+lets a dependent tx reach the orderer before the predecessor whose writes it read
+→ MVCC abort → cascade storm → collapse. Fix: on the pipelined path, orderer
+submission is clamped to a **single** worker regardless of `Gateway.SubmitterCount`
+(`orderedOrdererSubmitterCount`, warn-once if >1; documented on the config field).
+`73bed3d` records that the controllable-submitter test wrap likewise requires
+`SubmitterCount==1`.
+
+**MVCC abort → cascade → cache rebuild.** `cascadeFrom` detaches the contiguous
+in-flight suffix `[idx..end]`, re-queues each departed batch's included txs, and
+releases one slot each. Because `VersionedCache` keeps only the **latest** writer
+per key, dropping an invalidated later batch would erase a key a surviving earlier
+batch also wrote — so after an invalidation the cache is **rebuilt** from the
+surviving in-flight batches, re-applying their writes in submission order. Rebuild
+is needed only on invalidation, never on commit (commits resolve FIFO; the
+committing batch is the earliest in-flight). The cascade is deliberately
+conservative: it re-queues the whole suffix; an already-committed re-queued tx
+re-executes as nonce-too-low and is terminally excluded (never double-committed).
+
+**Receipt-index / txIndex fix (`2d51b2d`, `5f5adf1`).** When a batch aborts and
+re-executes later, the same `tx_hash` arrives twice — once `tx.Valid==false`
+(aborted, `status=0`) and once at re-commit. Previously `ConvertToDomain` wrote a
+receipt for every Fabric tx and `InsertTransaction`/`InsertLog` used `ON CONFLICT
+DO NOTHING`, so the aborted attempt permanently **shadowed** the real receipt.
+Fix: `ConvertToDomain` skips committer-invalid txs (no receipt/log rows; block row
+still inserted), and the inserts became last-write-wins (`DO UPDATE`; `InsertBlock`
+stays `DO NOTHING`). A skipped invalid tx must **not** advance the flat
+block-global `txIndex` (guard `5f5adf1`; proven non-vacuous). This gates on the
+committer verdict, not on EVM revert (a revert has `tx.Valid==true` → `status=0`
+receipt).
+
+**Genuine-abort test (`9ea5470`).** `NewLocalTestHarnessWithSubmitterControl`
+(`SubmitterCount=1`) buffers submits and `ReleaseReversed` sends them out of order,
+so N+1 lands in an earlier block than N; block-sync delivers N+1 first, the
+committer MVCC-aborts it, the cascade re-executes and re-commits it. **Key
+insight:** even with the receipt bug present, the ledger state was always correct
+(final nonce and balance right) — it was a receipt/query-layer bug, not a
+double-spend.
