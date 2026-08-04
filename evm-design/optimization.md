@@ -5,10 +5,9 @@ Warmup
 Auth
 Submit
 
-
 ## Warmup:
 
-#### config:
+#### Config:
 
 batch size and timeout,
 Input queue size.
@@ -18,7 +17,7 @@ Max in flight txs should be very large in the begining to allow maximal parallel
 But can be reduced if resources are exhausted.
 Batch size and timeout should be decided using parameters sweep.
 
-#### ache:
+#### Cache:
 
 Most frequently used (MFU) eviction policy.
 Use sync.Map to maintain the index to allow parallel access from all active warmup workers.
@@ -68,13 +67,17 @@ Consumes two inputs (loop over select of two queues)
 warmup-batch-queue and notification-queue (explained later).
 The notification-queue is first to give it priority to avoid starving it and since it is quick to process and sparse.
 At each loop iteration it acts on whatever it got.
-On batch: it exexutre the txs one by one.
+
+**On batch**: it exexutre the txs one by one.
 For each tx, it first check if the read set contains keys from the write cache, meaning, they are marked as write in the cache.
 If all of its read keys are not in the write cache, then the read-write set is accepted as is. The cache is updated using the existing read-write set, marking the cache entry accordingly (read or write).
+
 Otherwise, it is re executed using the auth phase cache, using the query service as a fallback, just like in the warmup phase using a dedicated connection (not shared).
+If there are read-keys of the TX that are not exist in the cache, we add them before executing the TX to avoid fetcing them for the query service.
 The cache is updated during the execution with reads and write and mark them accordingly in the cache.
 When the tx processing is done, we move on to the next tx, and eventually batching them accordingly to the batching rule and adding them to the submit-queue.
-On notification event, process the notification.
+
+**On notification event**: process the notification.
 Notification is a list of committed keys/versions, and a batch number.
 We have a separate notification receive worker. It process the notification stream, and validate all the txs are committed (issuing rollback otherwise).
 When a txs are committed, it collect all the keys/versions of these txs (stored by the submitter) and register the current value of the batch-number atomic counter.
@@ -83,12 +86,16 @@ It also removes the tx from the submit map.
 The auth worker process put this notification in a notification-map (batch-number → list of keys/versions).
 Then, after each batch processing, we maintain the previous-batch-number that all previous batches were processed (included).
 If a batch is more than one increment over the previous maximum (can be inserted out of order), then we keep it in a done-batch set.
+
 When a new batch is finish and it is one increment over the previous, we increment as normal, and look for the next batch in the done set, and the next ones and so on until the next can't be found.
-Once we finelized the previous-batch-number, we go over all notofication items from notification-map starting from the previous-batch-number we started with before the update, up to the one we landed on.
+
+Once we finelized the previous-batch-number, we go over all notification items from notification-map starting from the previous-batch-number we started with before the update, up to the one we landed on.
 And take all the keys/versions and demote them to read if the version matches the cache.
 If it doesn't match, it was overwritten by an active tx.
 Removing the notification from the map when it was processed.
-At the end of each batch processing, we initate cache eviction. Never during execution for optimal performance.
+
+At the end of each batch processing, we initate cache eviction.
+Never during execution for optimal performance.
 
 ## Submitter:
 
