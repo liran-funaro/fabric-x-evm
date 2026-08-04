@@ -55,11 +55,39 @@ Commit-path timing: submit->commit avg 129ms max 413ms | peak in-flight 2/16
 - Verified: body 1816 s == run 1817 s (1× real time); closing-card totals agree
   with the replay log to 0.036% (the gap is commits landing after the last scrape).
 
-## 3. Runs D and C
+## 3. Run C — the shipped deliverable (client + full-stack, verified)
 
-*To be completed when the runs report. Run D is the root-cause test of §4 as well
-as the multi-hour deliverable: 2.5 h at 500 tx/s with `-orderers 1`. Confirmation
-is staying clean well past the 48-minute mark where Run B first aborted.*
+```
+Replay complete: 10394318/10394318 EVM txs committed in 1817.8s across
+10152 committer txs (avg 1023.9 EVM/batch); 0 rolled-back batches,
+0 submit failures | 5718 EVM tx/s
+Commit-path timing: submit->commit avg 128ms max 450ms | peak in-flight 2/16
+```
+
+Four videos, all 1× real time verified (body 1818 s == run 1818 s) with totals
+cross-checked to 0.026%: `demo-full` / `demo-highlight` (client dashboard) and
+`stack-full` / `stack-highlight` (committer + orderer). **This is the set to show
+clients.**
+
+**It reproduces Run A to within 0.2%** (5,718 vs 5,729 tx/s; 10.39 M vs 10.41 M
+txs; zero rollbacks both times) — two independent runs of the same config, which
+is worth more than one.
+
+The full-stack video shows ledger height climbing, invalid transactions pinned at
+zero, committer pipeline queues flat, and all four BFT parties tracking in
+lockstep. One honest detail it surfaces: batcher mempools drift up to ~25 entries
+over 30 minutes (party2, the leader, stays at 0) — negligible in absolute terms
+but a real upward trend worth watching on a longer run.
+
+## 3b. Run D — the endurance retry FAILED (and refuted the hypothesis)
+
+2.5 h at 500 tx/s with `-orderers 1`, verified on the process command line. It
+collapsed at t+52 min exactly like Run B: commits froze at 1 561 113, in-flight
+climbed past 72 000, batch counter stuck at 111 829, 877 rolled-back batches and
+climbing. It did **not** recover (Run B had recovered from its first burst).
+
+Stopped early rather than spend 90 minutes rendering a second stall. Evidence
+kept at `~/stall-evidence/` on the host. See §4.
 
 ## 4. Finding — throttled runs violate the single-submitter invariant
 
