@@ -100,6 +100,18 @@ var pipeline = flag.Bool("pipeline", false, "enable the warm(N+1)||auth(N) pipel
 // without bound and would exhaust the host's memory hours in.
 var maxOutstanding = flag.Int("max-outstanding", 0, "max submitted-but-uncommitted EVM txs (0 = unbounded, historical behavior)")
 
+// targetTPS paces submission to a fixed rate (0 = unpaced, full speed). This is
+// additive to -max-outstanding, not an alternative: the in-flight bound still
+// applies as a safety net so a dip below the target cannot grow the backlog
+// without limit.
+//
+// It exists because DISK, not time, bounds a run on the experiment host (~6.3 KB
+// per committed EVM tx across 9 replicated ledger copies => a fixed ~12M-tx
+// budget), so a multi-hour run must submit below the system's ceiling to fit.
+// Default off, so ordinary runs still measure the true ceiling and every number
+// in findings.md stays comparable.
+var targetTPS = flag.Float64("target-tps", 0, "pace submission to this many EVM txs/s (0 = unpaced, full speed)")
+
 // TxCompletionTracker forwards all transaction completion notifications to a single channel.
 // It implements common.TxHandler to receive notifications from the notification system.
 type TxCompletionTracker struct {
@@ -616,6 +628,10 @@ func runReplayTest(
 	if *maxOutstanding > 0 {
 		t.Logf("Closed-loop flow control: at most %d outstanding EVM txs", *maxOutstanding)
 	}
+	if *targetTPS > 0 {
+		t.Logf("Paced submission: %.0f EVM tx/s target (NOT the system ceiling -- this run is "+
+			"deliberately throttled to fit a disk budget)", *targetTPS)
+	}
 
 	// fedTotal is -1 until the feeder stops, then the number of transfers it fed.
 	// Always read through effectiveTotal: under a duration stop, totalToSubmit is
@@ -704,6 +720,21 @@ func runReplayTest(
 					t.Logf("Duration %s reached; feeder stopping after %d transfers", cfg.duration, fed)
 				}
 				return
+			}
+
+			// Open-loop pacing, when a target rate is set: hold this tx until its
+			// slot in the schedule. Absolute deadlines from startTime, so the
+			// schedule cannot drift over a multi-hour run.
+			if *targetTPS > 0 {
+				if d := time.Until(paceDeadline(startTime, fed, *targetTPS)); d > 0 {
+					timer := time.NewTimer(d)
+					select {
+					case <-timer.C:
+					case <-feedCtx.Done():
+						timer.Stop()
+						return
+					}
+				}
 			}
 
 			// Closed loop: block until an earlier tx commits and frees headroom.
