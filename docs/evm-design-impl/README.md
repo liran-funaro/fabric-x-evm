@@ -16,6 +16,7 @@ the work followed.
 | [findings.md](findings.md) | **Start here.** Where the throughput went, what moved it, and the one unsolved problem (the warm/auth pipeline trilemma). |
 | [experiments.md](experiments.md) | Run-book: how to reproduce the numbers and collect evidence — **both datasets, always**. |
 | [server-setup.md](server-setup.md) | Provision a native experiment host (ask which server; install docker + go; the RHEL reboot gotcha) and sync local → remote. |
+| [demo-video.md](demo-video.md) | Run-book for the client demo video: one unattended command produces a 1× real-time recording of a long real-dataset run plus a ~90 s highlight cut. |
 | [specs/](specs/) | Brainstormed designs: drop-internal-state-DB, two-phase execution, perf harness, pipelined-cache, warm/auth pipelining. |
 | [plans/](plans/) | Task-by-task implementation plans those specs became. |
 | [reports/](reports/) | SDD outcome reports: [exec-hotpath optimization](reports/2026-07-exec-hotpath-optimization.md), [stage-2.1 final fix](reports/2026-07-stage2.1-final-fix-report.md), [pipelined-cache slice](reports/2026-07-pipelined-cache-slice.md) (single-submitter invariant, MVCC cascade, receipt fix). |
