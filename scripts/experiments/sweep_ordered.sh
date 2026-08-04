@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Depth-1 ordered-submitter go/no-go sweep (plan Task 7).
 #
 # Grid: batch-size x dataset x config, each cell on a FRESH network. For each cell
@@ -25,8 +26,9 @@ cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experi
 # Everything is overridable via env so a cheap smoke cell can run first:
 #   CONFIGS='C' BS_LIST='128' DATASETS='historic' ./sweep_ordered.sh
 #
-# Dataset inputs live OUTSIDE the repo tree (DATA_DIR, default ~/experiment-data)
-# so a repo sync never touches them; ds_path_for maps the short dataset label to
+# Dataset inputs live OUTSIDE the repo tree (DATA_DIR, default
+# ${EVM_PERF_DATA:-~/workspace/evm-perf-data}) so a repo sync never touches
+# them; ds_path_for maps the short dataset label to
 # an absolute .json.gz path, which the perf test opens directly (replay test
 # accepts an absolute path with a .gz extension, bypassing the testdata/ join).
 #
@@ -54,9 +56,9 @@ DATASETS="${DATASETS:-historic synthetic}"
 CONFIGS="${CONFIGS:-A B C}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-25m}"
 GO_TIMEOUT="${GO_TIMEOUT:-30m}"
-DATA_DIR="${DATA_DIR:-$HOME/experiment-data}"
+DATA_DIR="${DATA_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}}"
 
-LOG="$HOME/sweep_ordered.log"
+LOG="$RESULTS_DIR/sweep_ordered.log"
 : > "$LOG"
 echo "=========== SWEEP_ORDERED window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC bs='$BS_LIST' ds='$DATASETS' cfg='$CONFIGS' cell_to=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -103,7 +105,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/sweep_ordered_${cfg}_${ds}_bs${bs}.out"
+  local OUT="$RESULTS_DIR/sweep_ordered_${cfg}_${ds}_bs${bs}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" \
     go test -timeout "$GO_TIMEOUT" -tags=perf -run '^TestReplayJSONDataset$' -v \

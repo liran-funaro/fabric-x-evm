@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Sweep ExecuteBatch warm-pass concurrency (PERF_WARM_WORKERS) to quantify the
 # reuse-vs-IO-saturation tradeoff behind the "serial auth CPU" target.
 #
@@ -29,7 +30,7 @@ BS="${BS:-1024}"
 # WW list: 0 = baseline (len txs). Override with: WWS="0 256 64" ./sweep_warm.sh
 WWS="${WWS:-0 512 256 128 64 32}"
 
-LOG="$HOME/sweep_warm.log"
+LOG="$RESULTS_DIR/sweep_warm.log"
 : > "$LOG"
 echo "=========== WARM-WORKERS SWEEP bs=$BS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC $(date +%H:%M:%S) ===========" | tee -a "$LOG"
 echo "WWS=[$WWS]" | tee -a "$LOG"
@@ -43,7 +44,7 @@ for WW in $WWS; do
   make clean-x init-x start-full >/dev/null 2>&1
   echo "[stack up WW=$WW] $(date +%H:%M:%S)" | tee -a "$LOG"
 
-  OUT="$HOME/sweep_ww_${WW}.out"
+  OUT="$RESULTS_DIR/sweep_ww_${WW}.out"
   go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \
     -max-batch-size "$BS" >"$OUT" 2>&1

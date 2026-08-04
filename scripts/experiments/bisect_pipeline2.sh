@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Second bisect: the first run localized the historic bs=128 pipeline livelock
 # to the read-cost INHERITANCE layers (no_inherit cell: 4000/4000, rb=0, 117 t/s
 # vs baseline 896/4000, rb=2713, 15 t/s). Now isolate WHICH inheritance is unsafe
@@ -23,7 +24,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-4000}"
 BS="${BS:-128}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-10m}"
 
-LOG="$HOME/bisect_pipeline2.log"
+LOG="$RESULTS_DIR/bisect_pipeline2.log"
 : > "$LOG"
 echo "=========== BISECT2 bs=$BS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -35,7 +36,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/bisect2_${label}.out"
+  local OUT="$RESULTS_DIR/bisect2_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" env $extra go test -timeout 15m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

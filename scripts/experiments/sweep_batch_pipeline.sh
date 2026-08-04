@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Post-fix batch-size sweep for the warm(N+1)‖auth(N) pipeline, BOTH datasets,
 # serial vs pipeline, to regenerate report/results.json's batch_scan after the
 # auth read-layering fix (reopen fresh committed view + frozen per-batch warm-
@@ -21,7 +22,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-20000}"
 SIZES="${SIZES:-128 256 512 1024 2048 4096}"
 DATASETS="${DATASETS:-synthetic historic}"
 
-LOG="$HOME/sweep_batch.log"
+LOG="$RESULTS_DIR/sweep_batch.log"
 : > "$LOG"
 echo "=========== BATCH-SWEEP (post-fix) window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -33,7 +34,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/sweep_${label}.out"
+  local OUT="$RESULTS_DIR/sweep_${label}.out"
   # shellcheck disable=SC2086
   go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

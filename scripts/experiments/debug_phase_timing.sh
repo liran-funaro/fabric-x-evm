@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Capture per-phase (warm vs authoritative) timing for historic at bs=1024, to
 # quantify WHY the pipeline loses on hot-key-serial traffic: auth is cheap
 # (hot keys served from the in-memory write-cache) so there is little I/O to
@@ -19,7 +20,7 @@ export GOMEMLIMIT="${GOMEMLIMIT:-48GiB}"
 export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-20000}"
 BS="${BS:-1024}"
 
-LOG="$HOME/debug_phase.log"
+LOG="$RESULTS_DIR/debug_phase.log"
 : > "$LOG"
 echo "=========== PHASE-TIMING (historic, bs=$BS) $(date +%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -30,7 +31,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/debug_${label}.out"
+  local OUT="$RESULTS_DIR/debug_${label}.out"
   # shellcheck disable=SC2086
   go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

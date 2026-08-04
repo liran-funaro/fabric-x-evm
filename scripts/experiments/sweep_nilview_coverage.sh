@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Nil-view COVERAGE sweep across batch sizes, gated on sweep_nilview.sh having
 # shown pipe_nilview clean+reproducible at the hard bs=128 regime. Confirms the
 # nil-view pipeline stays correct AND >= serial at the larger batch sizes too
@@ -21,7 +22,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-8000}"
 
 CELL_TIMEOUT="${CELL_TIMEOUT:-12m}"
 
-LOG="$HOME/sweep_nilview_coverage.log"
+LOG="$RESULTS_DIR/sweep_nilview_coverage.log"
 : > "$LOG"
 echo "=========== SWEEP_NILVIEW_COVERAGE window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -33,7 +34,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/sweep_nvcov_bs${bs}_${label}.out"
+  local OUT="$RESULTS_DIR/sweep_nvcov_bs${bs}_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" env $extra go test -timeout 18m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

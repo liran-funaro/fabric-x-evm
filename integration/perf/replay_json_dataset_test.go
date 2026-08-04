@@ -49,12 +49,14 @@ var enableMetrics = flag.Bool("enable-metrics", false, "enable Prometheus metric
 var namespace = flag.String("namespace", "real", "namespace to commit transactions to")
 
 // dataset selects the replay workload. A bare name ("synthetic", "historic")
-// resolves to testdata/USDC_dataset.<name>.json.gz (both downloaded by setup.sh);
-// any value with a file extension (e.g. "testdata/foo.json.gz", "/abs/bar.json.gz")
-// is used as a literal path. The two named workloads are complementary and BOTH
-// should be measured: "synthetic" is conflict-free (raw throughput ceiling), while
-// "historic" is the real Jan-2020 USDC trace with an extremely high MVCC-conflict
-// rate that stresses the rollback / re-batch path.
+// resolves to $EVM_PERF_DATA/USDC_dataset.<name>.json.gz when EVM_PERF_DATA is
+// set (the out-of-tree data dir populated by scripts/setup.sh), else to the
+// in-tree testdata/USDC_dataset.<name>.json.gz; any value with a file extension
+// (e.g. "testdata/foo.json.gz", "/abs/bar.json.gz") is used as a literal path.
+// The two named workloads are complementary and BOTH should be measured:
+// "synthetic" is conflict-free (raw throughput ceiling), while "historic" is the
+// real Jan-2020 USDC trace with an extremely high MVCC-conflict rate that
+// stresses the rollback / re-batch path.
 var dataset = flag.String("dataset", "synthetic", "replay workload: 'synthetic', 'historic', or a path to a .json.gz dataset")
 
 // submitters sets how many goroutines call the gateway's SendTransaction concurrently.
@@ -390,11 +392,20 @@ func runReplayTest(
 	// - Fabric: Traditional block-based synchronization
 	// - Fabric-X: Notification-based (MemoryStore + NotificationDispatcher)
 	fmt.Printf("using namespace %s", *namespace)
+	// The USDC contract (prime DB) lives alongside the datasets: in EVM_PERF_DATA
+	// when set, else the in-tree testdata/ copy. The harness makes a relative path
+	// absolute against integration/perf/ (its CWD before it chdirs to integration/),
+	// so both the testdata/ default and an absolute EVM_PERF_DATA path resolve
+	// correctly.
+	contractPath := "testdata/USDC_contract.json"
+	if dir := os.Getenv("EVM_PERF_DATA"); dir != "" {
+		contractPath = filepath.Join(dir, "USDC_contract.json")
+	}
 	th, err := integration.NewFabricXTestHarnessWithNotifications(
 		t,
 		integration.TestLogger{T: t, Disable: true}, // Disable test harness logging to avoid overwhelming output
 		evmConfig,
-		"testdata/USDC_contract.json",
+		contractPath,
 		map[string]any{
 			"Gateway.SubmitterCount": ordererSubmitterCount,
 			"Network.Namespace":      *namespace,
@@ -432,10 +443,17 @@ func runReplayTest(
 	// When running `go test ./integration/perf/...` from repo root, the test's
 	// working directory becomes integration/perf/, so we try both cwd and repo root.
 	datasetPath := *dataset
-	// A bare workload name (no file extension) selects one of setup.sh's two
-	// downloads; a value with an extension is treated as a literal path.
+	// A bare workload name (no file extension) selects one of the workloads
+	// scripts/setup.sh downloads; a value with an extension is treated as a
+	// literal path. When EVM_PERF_DATA is set (the out-of-tree data dir), bare
+	// names resolve there; otherwise they fall back to the in-tree testdata/.
 	if filepath.Ext(datasetPath) == "" {
-		datasetPath = filepath.Join("testdata", fmt.Sprintf("USDC_dataset.%s.json.gz", datasetPath))
+		name := fmt.Sprintf("USDC_dataset.%s.json.gz", datasetPath)
+		if dir := os.Getenv("EVM_PERF_DATA"); dir != "" {
+			datasetPath = filepath.Join(dir, name)
+		} else {
+			datasetPath = filepath.Join("testdata", name)
+		}
 	}
 
 	var file *os.File

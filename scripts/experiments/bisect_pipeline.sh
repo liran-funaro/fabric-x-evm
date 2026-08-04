@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Bisect the pipeline auth-read-cost layers at the historically LIVELOCKING
 # point (historic hot-key USDC, bs=128, pipeline ON). Analysis kept concluding
 # the current code is correct while the smoke shows it still livelocks at
@@ -25,7 +26,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-4000}"
 BS="${BS:-128}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-10m}"
 
-LOG="$HOME/bisect_pipeline.log"
+LOG="$RESULTS_DIR/bisect_pipeline.log"
 : > "$LOG"
 echo "=========== BISECT bs=$BS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -37,7 +38,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/bisect_${label}.out"
+  local OUT="$RESULTS_DIR/bisect_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" env $extra go test -timeout 15m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

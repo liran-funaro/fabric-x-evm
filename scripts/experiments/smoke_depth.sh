@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Fast depth-independence smoke for the warm(N+1)‖auth(N) pipeline after the
 # 87080f7 correctness fix (remove stale warmWrites snapshot; View.Reopen begins
 # a FRESH committed view) + the uncommitted inherited-write-cache read-cost fix.
@@ -22,7 +23,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-8000}"
 SIZES="${SIZES:-128 256}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-15m}"
 
-LOG="$HOME/smoke_depth.log"
+LOG="$RESULTS_DIR/smoke_depth.log"
 : > "$LOG"
 echo "=========== DEPTH SMOKE window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -34,7 +35,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/smoke_${label}.out"
+  local OUT="$RESULTS_DIR/smoke_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" go test -timeout 20m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # DB / query-service resource discovery during a replay. Answers: is the read
 # path CPU-bound, disk-IO-bound, or connection/concurrency-bound?
 #
@@ -23,7 +24,7 @@ export GOMEMLIMIT="${GOMEMLIMIT:-48GiB}"
 export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-30000}"
 BS="${BS:-1024}"
 DOCKER="${DOCKER:-docker}"
-LOG="$HOME/measure_qs.log"; : > "$LOG"
+LOG="$RESULTS_DIR/measure_qs.log"; : > "$LOG"
 
 log() { echo "$@" | tee -a "$LOG"; }
 
@@ -50,10 +51,10 @@ done
 pg "SELECT pg_stat_reset();" >/dev/null
 
 # Background samplers: PG active-connection count (fast) + docker stats snapshots.
-ACT="$HOME/pg_active.samples"; : > "$ACT"
+ACT="$RESULTS_DIR/pg_active.samples"; : > "$ACT"
 ( while :; do pg "SELECT count(*) FROM pg_stat_activity WHERE datname='sc_db' AND state='active';" >> "$ACT"; sleep 0.25; done ) &
 SAMP_PG=$!
-STATS="$HOME/dockerstats.samples"; : > "$STATS"
+STATS="$RESULTS_DIR/dockerstats.samples"; : > "$STATS"
 ( while :; do $DOCKER stats --no-stream --format '{{.Name}} cpu={{.CPUPerc}} mem={{.MemUsage}} blkio={{.BlockIO}}' "$QS" "$DB" 2>/dev/null >> "$STATS"; done ) &
 SAMP_ST=$!
 
@@ -61,7 +62,7 @@ qs0=$(cpuusec "$QS"); db0=$(cpuusec "$DB"); t0=$(date +%s.%N)
 
 go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v -count=1 \
   ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml -max-batch-size "$BS" \
-  > "$HOME/measure_run.out" 2>&1
+  > "$RESULTS_DIR/measure_run.out" 2>&1
 rc=$?
 
 t1=$(date +%s.%N); qs1=$(cpuusec "$QS"); db1=$(cpuusec "$DB")
@@ -74,7 +75,7 @@ maxact=$(sort -n "$ACT" 2>/dev/null | tail -1)
 avgact=$(awk '{s+=$1;n++}END{if(n)printf "%.1f",s/n}' "$ACT" 2>/dev/null)
 
 log "--- RESULT ---"
-grep -E 'Replay complete:|TestReplayJSONDataset: [0-9]' "$HOME/measure_run.out" | tail -2 | tee -a "$LOG"
+grep -E 'Replay complete:|TestReplayJSONDataset: [0-9]' "$RESULTS_DIR/measure_run.out" | tail -2 | tee -a "$LOG"
 log "wall=${wall}s  QS_avg_cores=${qscores}  DB_avg_cores=${dbcores}   (host = 32 vCPU)"
 log "PG active conns during run: max=${maxact} avg=${avgact}   (QS->DB pool cap = 10)"
 log "PG cache: $(pg "SELECT 'blks_hit='||blks_hit||' blks_read='||blks_read||' hit_ratio='||round(100.0*blks_hit/nullif(blks_hit+blks_read,0),4)||'%'||' tup_returned='||tup_returned||' tup_fetched='||tup_fetched FROM pg_stat_database WHERE datname='sc_db';")"

@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Residual-diagnosis sweep (Phase-1: CONFIRM the residual before any fix).
 #
 # Reproduces the EXACT config that livelocked in sweep_nilview.sh run r3
@@ -36,7 +37,7 @@ BS="${BS:-128}"
 RUNS="${RUNS:-6}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-12m}"
 
-LOG="$HOME/sweep_diag.log"
+LOG="$RESULTS_DIR/sweep_diag.log"
 : > "$LOG"
 echo "=========== SWEEP_DIAG bs=$BS runs=$RUNS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -48,7 +49,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/sweep_diag_bs${BS}_r${i}.out"
+  local OUT="$RESULTS_DIR/sweep_diag_bs${BS}_r${i}.out"
   timeout "$CELL_TIMEOUT" env EVM_QS_NIL_VIEW=1 EVM_PIPE_DIAG=1 \
     go test -timeout 18m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

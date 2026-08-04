@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Goal-2 comparison for the pipeline fix. Root cause (bisect1+2): the COLD
 # query-view clone inheritance (query.View.Reopen's maps.Clone, consulted first
 # in View.Get) serves auth a stale warm-time committed read -> MVCC abort cascade
@@ -27,7 +28,7 @@ SIZES="${SIZES:-128 1024}"
 DATASETS="${DATASETS:-historic synthetic}"
 CELL_TIMEOUT="${CELL_TIMEOUT:-12m}"
 
-LOG="$HOME/compare_fix.log"
+LOG="$RESULTS_DIR/compare_fix.log"
 : > "$LOG"
 echo "=========== COMPARE_FIX window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -39,7 +40,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/compare_${ds}_bs${bs}_${label}.out"
+  local OUT="$RESULTS_DIR/compare_${ds}_bs${bs}_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" env $extra go test -timeout 18m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Validate the pipelined-executor auth-reopen fix across BOTH datasets.
 #
 # The pipelined loop (warm(N+1) || auth(N)) must be IDENTICAL IN EFFECT to the
@@ -24,7 +25,7 @@ export GOMEMLIMIT="${GOMEMLIMIT:-48GiB}"
 export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-20000}"
 BS="${BS:-1024}"
 
-LOG="$HOME/validate_pipeline.log"
+LOG="$RESULTS_DIR/validate_pipeline.log"
 : > "$LOG"
 echo "=========== PIPELINE-FIX VALIDATION bs=$BS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -39,7 +40,7 @@ run_cell() {
   make clean-x init-x start-full >/dev/null 2>&1
   echo "[stack up $label] $(date +%H:%M:%S)" | tee -a "$LOG"
 
-  local OUT="$HOME/validate_${label}.out"
+  local OUT="$RESULTS_DIR/validate_${label}.out"
   # shellcheck disable=SC2086
   go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \

@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Sweep the endorser->query-service connection-pool size (PERF_QS_CONNS) to find
 # the throughput knee. The DB-resource discovery proved nothing downstream of the
 # endorser is saturated (99.995% PG cache hit, 2/10 DB conns, QS 1-2/32 cores), so
@@ -25,7 +26,7 @@ BS="${BS:-1024}"
 # Connection counts. Override with: NS="1 8 64" ./sweep_qsconns.sh
 NS="${NS:-1 2 4 8 16 32}"
 
-LOG="$HOME/sweep_qsconns.log"
+LOG="$RESULTS_DIR/sweep_qsconns.log"
 : > "$LOG"
 echo "=========== QS-CONNS SWEEP bs=$BS window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC $(date +%H:%M:%S) ===========" | tee -a "$LOG"
 echo "NS=[$NS]" | tee -a "$LOG"
@@ -39,7 +40,7 @@ for N in $NS; do
   make clean-x init-x start-full >/dev/null 2>&1
   echo "[stack up N=$N] $(date +%H:%M:%S)" | tee -a "$LOG"
 
-  OUT="$HOME/sweep_qsconns_${N}.out"
+  OUT="$RESULTS_DIR/sweep_qsconns_${N}.out"
   go test -timeout 4h -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \
     -max-batch-size "$BS" >"$OUT" 2>&1

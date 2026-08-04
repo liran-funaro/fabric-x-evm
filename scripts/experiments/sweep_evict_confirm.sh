@@ -1,5 +1,6 @@
 #!/bin/bash
 cd "$(cd "$(dirname "$0")" && pwd)/../.." || exit 1  # repo root (scripts/experiments -> ../../)
+RESULTS_DIR="${RESULTS_DIR:-${EVM_PERF_DATA:-$HOME/workspace/evm-perf-data}/results}"; mkdir -p "$RESULTS_DIR"
 # Confirmation sweep for fix B (eviction-hold depth), after the first sweep found
 # hold>=16 gives a CLEAN WIN at historic bs=128 (8000/8000, rb=0, 1.44x serial)
 # while h1/h2/h8 livelock and h4 was a partial (7808/8000). That non-monotonicity
@@ -36,7 +37,7 @@ export PERF_REPLAY_WINDOW_SIZE="${WINDOW:-8000}"
 
 CELL_TIMEOUT="${CELL_TIMEOUT:-12m}"
 
-LOG="$HOME/sweep_evict_confirm.log"
+LOG="$RESULTS_DIR/sweep_evict_confirm.log"
 : > "$LOG"
 echo "=========== SWEEP_EVICT_CONFIRM window=$PERF_REPLAY_WINDOW_SIZE gogc=$GOGC timeout=$CELL_TIMEOUT $(date +%Y-%m-%dT%H:%M:%S) ===========" | tee -a "$LOG"
 
@@ -48,7 +49,7 @@ run_cell() {
   make stop-full clean-x >/dev/null 2>&1 || true
   make clean-x init-x start-full >/dev/null 2>&1
 
-  local OUT="$HOME/sweep_confirm_bs${bs}_${label}.out"
+  local OUT="$RESULTS_DIR/sweep_confirm_bs${bs}_${label}.out"
   # shellcheck disable=SC2086
   timeout "$CELL_TIMEOUT" env $extra go test -timeout 18m -tags=perf -run '^TestReplayJSONDataset$' -v \
     -count=1 ./integration/perf/... -gateway-config ../config/gateway/fabx-full.yaml \
