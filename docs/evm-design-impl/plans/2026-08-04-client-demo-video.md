@@ -770,14 +770,33 @@ ledger GB/hour so the overnight duration is sized against the 89 GB free.
 
 ---
 
-### Task 10: overnight run
+### Task 10: the demo runs
 
-- [ ] **Step 1: Launch** `scripts/demo/run_demo.sh --duration <sized>` detached
-  under tmux so an SSH drop cannot kill it.
-- [ ] **Step 2: Confirm** the dashboard shows a flat in-flight line (closed loop
-  working) and non-zero throughput before leaving it.
-- [ ] **Step 3: In the morning** — read `SUMMARY.txt`, verify both mp4s, rsync
-  them to the Mac, and report the headline numbers.
+**Revised after the smoke run measured the disk cost.** At ~6.5 KB of disk per
+committed EVM tx (9 replicated ledger copies), the budget is ~12M transactions
+per run, so duration and throughput trade off directly and a multi-hour run at
+full throughput is impossible on this host. Rather than silently pick one, run
+both and let the user choose:
+
+- [ ] **Run A — headline (full rate, ~30 min).** The throughput claim.
+  `run_demo.sh --duration 30m --label headline`. Unpaced, so the dashboard shows
+  the true ceiling (~5.7k tx/s) and ~10M transactions.
+- [ ] **Run B — endurance (multi-hour, throttled).** The duration claim.
+  `run_demo.sh --duration 6h --target-tps 500 --label endurance`. Deliberately
+  paced; `SUMMARY.txt` says so explicitly, so a paced rate can never be read as
+  the ceiling.
+  - Sizing is deliberately left to the watchdog rather than calculated: disk cost
+    has a per-transaction and a per-batch term, and at ~500 tx/s batches are
+    ~80 txs instead of 1024, so the per-batch term per transaction rises ~13×.
+    One data point cannot separate the two terms, so ask for 6h and let the
+    watchdog stop the run if disk runs short — that yields the longest run the
+    disk actually supports instead of an estimate of it. A truncated run still
+    renders (render-on-failure), so a 4h result is a 4h video, not a lost night.
+- [ ] **Verify each** — `SUMMARY.txt`, both mp4s play, the full video's body
+  duration equals its run duration within 1%, closing-card totals agree with the
+  replay log.
+- [ ] **Report** both, with the disk trade-off stated plainly so the choice of
+  which to show a client is the user's, not mine.
 
 ---
 
