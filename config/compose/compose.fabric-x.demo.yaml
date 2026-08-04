@@ -59,6 +59,12 @@ services:
       # A full 1920x1080 dashboard with 9 panels can take a few seconds; the
       # default 30s is tight when frames render 6-way parallel.
       - RENDERING_TIMEOUT=120
-      - RENDERING_MODE=default
+      # Clustered so frame renders actually run in parallel. An 8h run at 1x is
+      # ~14 400 frames; serialized at ~1.5s each that is 6 hours, which would
+      # dominate the whole pipeline.
+      - RENDERING_MODE=clustered
+      - RENDERING_CLUSTERING_MODE=browser
+      - RENDERING_CLUSTERING_MAX_CONCURRENCY=6
+      - RENDERING_CLUSTERING_TIMEOUT=120
     networks:
       - fabric-x
