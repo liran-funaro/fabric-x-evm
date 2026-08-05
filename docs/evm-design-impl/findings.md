@@ -439,10 +439,50 @@ that rests on only **two** data points, and "batch count" is confounded with "th
 throttled small-batch regime" because no full-rate run has ever reached 100 k
 batches. Do not treat ~110 k as a real constant yet.
 
-**The decisive next experiment** (cheap, ~30 min): run at **1000 tx/s** with
-everything else identical. Batches then accumulate twice as fast, so a
-batch-count threshold predicts onset at ~t+25 min, while a time-based cause
-predicts ~t+50 min. That one run separates the two.
+### The batch-count lead is ALSO unsupported (1000 tx/s run, 2026-08-04)
+
+Ran it. It refutes the batch-count reading too:
+
+| Run | Rate | Onset | EVM txs at onset | Committer txs at onset | Avg batch |
+|---|---:|---:|---:|---:|---:|
+| B | 500 | t+48 min | ~1.44 M | ~102 000 | 14.0 |
+| D | 500 (`-orderers 1`) | t+52 min | ~1.56 M | ~111 800 | 14.0 |
+| Diag | **1000** | **t+36 min** | **2.08 M** | **71 379** | **29.2** |
+
+At 1000 tx/s the executor produced **bigger** batches (29.2 vs 14.0 EVM/batch),
+so the committer-tx *rate* was unchanged (~34/s vs ~36/s) — and onset arrived
+**earlier in both time and batch count**. So no candidate is constant across the
+three runs: elapsed time (48/52/36 min), EVM txs (1.44/1.56/2.08 M), and
+committer txs (102/112/71 k) all differ. The collapse shape is identical every
+time: in-flight flat, then commits stop dead and never resume.
+
+`Replay complete: 2084305/2184305 EVM txs committed in 2544.3s across 71379
+committer txs (avg 29.2 EVM/batch); 2568 rolled-back batches, 0 submit failures`
+
+### Status: cause UNKNOWN. Two hypotheses tested, both refuted.
+
+**Important confound to resolve first.** Every clean run (A, C, `final`) is a
+**30-minute, full-rate** run, and every collapsing run is longer than 35 minutes.
+Run length at full rate is capped near 30 min by the §10 disk ceiling, so no
+full-rate run has ever been *given the chance* to reach t+36 min. The simplest
+explanation consistent with all five runs is therefore **not** "throttling breaks
+it" but "runs past ~35–50 minutes break it, and full-rate runs are too short to
+show it." That would make this a general endurance defect rather than a
+throttled-mode one — and it is untested, because testing it needs a bigger disk.
+
+Ruled out by evidence: read path (QS queueing flat at 2–3 ms through the
+collapse), crashes/resource exhaustion (all 22 containers healthy, ≥16 GB free),
+observer CPU (renderer at 0.2 % at the first abort), submitter concurrency
+(`-orderers 1`), and monotonic degradation (episodic — Run B ran 8 clean minutes
+between bursts). Abort class is `unclassified`.
+
+Next steps, in order: (1) attach a larger volume and run **full rate for 60+
+minutes** to settle the confound above — this is the one experiment that
+distinguishes "endurance defect" from "throttled-mode defect"; (2) capture the
+gateway's `evm.batch=debug` ENDORSE-TIMING and the stale-read key classes across
+the collapse, since `unclassified` means the existing classifier does not
+recognize the pattern; (3) sample goroutine/heap profiles either side of the
+onset for a per-batch leak.
 
 Other candidates not yet excluded: a per-batch resource leak in the gateway
 (goroutines/fds/cache entries), committer-side per-block state, or DB/orderer
