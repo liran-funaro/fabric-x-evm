@@ -17,7 +17,8 @@ All under `$EVM_PERF_DATA/demo/<label>/video/` on the experiment host.
 | **A — headline** | full rate, 30 min, `-orderers 64` | `demo-full.mp4` (1× real time, 30 min, 8.1 MB), `demo-highlight.mp4` (86 s) | **client-ready** |
 | **B — endurance (first attempt)** | 500 tx/s, `-orderers 64` | `demo-full.mp4` (85 min), `demo-highlight.mp4` | **not client-ready** — records the stall of §4; kept as evidence |
 | **D — endurance retry** | 500 tx/s, `-orderers 1` | none (stopped) | **failed** — collapsed at t+52 min, refuting §4's hypothesis |
-| **C — full-stack headline** | full rate, 30 min, both dashboards | `demo-full/-highlight`, `stack-full/-highlight` | **SHIPPED — show this one** |
+| **C — full-stack headline** | full rate, 30 min, both dashboards | `demo-full/-highlight`, `stack-full/-highlight` | superseded by `final` |
+| **`final` — re-render** | full rate, 30 min, both dashboards, **no in-flight panel** | `demo-full/-highlight`, `stack-full/-highlight` | **SHIPPED — show this one** |
 
 Both videos are 1920×1080 H.264 / yuv420p with an ffmpeg-drawn title card, timed
 captions and a closing totals card. The full video is **1× real time and unedited
@@ -120,6 +121,46 @@ batches. Abort class is `unclassified`.
 **Decisive next experiment (~45 min, queued):** 1000 tx/s, everything else
 identical. Batches accumulate ~2× faster, so a batch-count threshold predicts
 onset at ~t+25 min while a time-based cause predicts ~t+50 min.
+
+## 4b. Run `final` — the shipped re-render (2026-08-05)
+
+The "Transactions in flight" panel was dropped at the owner's request: it sat flat
+at exactly 100,000 for the whole run, which is the `-max-outstanding` cap rather
+than any property of the system, so it carried no information. The two survivors
+in that row widened to 12 columns so the grid has no hole.
+
+```
+Replay complete: 10338188/10338188 EVM txs committed in 1817.7s across
+10097 committer txs (avg 1023.9 EVM/batch); 0 rolled-back batches,
+0 submit failures | 5687 EVM tx/s
+Commit-path timing: submit->commit avg 129ms max 439ms | peak in-flight 2/16
+```
+
+**Three independent runs of this config now measure 5,729 / 5,718 / 5,687 EVM
+tx/s** with zero rollbacks every time — a 0.7% spread. The headline does not rest
+on one lucky run. Run A's folder was removed from the delivery set because its
+videos still show the withdrawn panel; its numbers survive here and its videos
+remain on the host under the `headline` label.
+
+All four videos verified: 1828.0 s container (4 s card + 1818 s body + 6 s close),
+body == run to 1×, totals cross-checked to 0.016%.
+
+**Pipeline flaw fixed in the same change.** Every run had shared one TSDB
+directory, which `run_demo.sh` wiped at startup — so a later run destroyed an
+earlier one's metrics and its videos could never be re-rendered. That defeated the
+entire purpose of persisting the TSDB, and it is why this cosmetic panel change
+required a fresh 30-minute run instead of a 40-minute re-render. The directory is
+now per label (`DEMO_TSDB_DIR`, honoured by the compose overlay and the Makefile
+chown, verified on the live container mount), so any past run stays re-renderable
+at ~100 MB per 30 minutes.
+
+**Known cosmetic issue, not changed.** In "EVM transaction throughput" the legend
+lists Committed and Submitted, but only one line is visible: at steady state they
+coincide exactly, so Committed is drawn underneath Submitted. The coincidence *is*
+the message (nothing is dropped), but it cannot be seen. The fix is a dash pattern
+on Submitted, as already done for the 4-party series on the stack dashboard. Left
+alone because it was not requested, and a re-render now costs ~40 min with no new
+run.
 
 ## 5. Finding — run length is disk-bound, not time-bound
 
