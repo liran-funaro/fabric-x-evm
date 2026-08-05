@@ -28,7 +28,10 @@ services:
       - ./testdata/crypto:/tls:ro,Z
       # Prometheus runs as nobody (65534); `make start-full` chowns this path
       # before `up`, or the container fails to open its TSDB.
-      - ${EVM_PERF_DATA}/demo/prometheus-data:/prometheus:Z
+      # DEMO_TSDB_DIR is set per run label by scripts/demo/run_demo.sh so each
+      # run keeps its own metrics and stays re-renderable. Falls back to the
+      # shared path for a manual `DEMO=1 make start-full`.
+      - ${DEMO_TSDB_DIR:-${EVM_PERF_DATA}/demo/prometheus-data}:/prometheus:Z
 
   grafana:
     environment:

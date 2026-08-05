@@ -20,7 +20,8 @@ COMPOSE ?= docker compose
 #     to ./data on the host, so a developer/agent can inspect persisted state.
 HOST_DATA ?=
 # DEMO=1: overlay compose.fabric-x.demo.yaml for the client demo video run --
-#   persists the Prometheus TSDB to $EVM_PERF_DATA/demo/prometheus-data (so the
+#   persists the Prometheus TSDB to $DEMO_TSDB_DIR, defaulting to
+#   $EVM_PERF_DATA/demo/prometheus-data (so the
 #   video is re-renderable after teardown), raises retention to 30d, and adds
 #   grafana-image-renderer. See docs/evm-design-impl/demo-video.md.
 DEMO ?=
@@ -213,9 +214,10 @@ start-full:
 	@# so create and chown it before `up`.
 	@if [ "$(DEMO)" = "1" ]; then \
 		test -n "$$EVM_PERF_DATA" || { echo "Error: DEMO=1 requires EVM_PERF_DATA to be set"; exit 1; }; \
-		echo "Preparing demo TSDB at $$EVM_PERF_DATA/demo/prometheus-data (chown 65534)..."; \
-		mkdir -p "$$EVM_PERF_DATA/demo/prometheus-data"; \
-		$(DOCKER) run --rm -v "$$EVM_PERF_DATA/demo/prometheus-data":/v busybox chown -R 65534:65534 /v; \
+		TSDB="$${DEMO_TSDB_DIR:-$$EVM_PERF_DATA/demo/prometheus-data}"; \
+		echo "Preparing demo TSDB at $$TSDB (chown 65534)..."; \
+		mkdir -p "$$TSDB"; \
+		$(DOCKER) run --rm -v "$$TSDB":/v busybox chown -R 65534:65534 /v; \
 	fi
 	@# Container-local mode: docker creates named volumes owned by root, but every
 	@# service runs as $(UID):$(GID) (see `user:` in compose), so pre-create the

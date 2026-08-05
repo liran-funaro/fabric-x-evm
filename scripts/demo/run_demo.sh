@@ -55,7 +55,13 @@ done
 # run cannot clobber the first's evidence or silently reuse its frames.
 export DEMO_LABEL="$LABEL"
 DEMO_DIR="$EVM_PERF_DATA/demo${LABEL:+/$LABEL}"
-TSDB_DIR="$EVM_PERF_DATA/demo/prometheus-data"
+# Per-label TSDB, exported so the compose overlay binds THIS run's directory.
+# One shared directory meant a later run overwrote an earlier run's metrics and
+# its videos could never be re-rendered -- which defeats the whole point of
+# persisting the TSDB. Scoping it by label makes any past run re-renderable
+# indefinitely, at ~100 MB per 30 minutes of 1s-scrape data.
+TSDB_DIR="$DEMO_DIR/prometheus-data"
+export DEMO_TSDB_DIR="$TSDB_DIR"
 REPLAY_LOG="$DEMO_DIR/replay.log"
 WATCHDOG_LOG="$DEMO_DIR/watchdog.log"
 SUMMARY="$DEMO_DIR/SUMMARY.txt"
@@ -83,17 +89,20 @@ go version >/dev/null || { echo "error: go not on PATH" >&2; exit 1; }
 log "bringing up a fresh stack (DEMO=1)"
 DEMO=1 make stop-full clean-x >/dev/null 2>&1 || true
 
-# Start from an empty TSDB. The bind mount survives `down -v` by design, so
-# without this a new run's opening frames would show the PREVIOUS run's tail
-# inside the 15-minute sliding window -- a throughput cliff that never happened.
-# Consequence: render a run before starting the next one (the orchestrator does).
-log "clearing the previous run's TSDB at $TSDB_DIR"
+# Start this label from an empty TSDB. The bind mount survives `down -v` by
+# design, so re-running the SAME label must not leave the previous attempt's tail
+# inside the opening 15-minute sliding window -- that would render as a
+# throughput cliff which never happened. Other labels are untouched, so their
+# videos stay re-renderable.
+log "clearing this label's TSDB at $TSDB_DIR"
 if [ -d "$TSDB_DIR" ]; then
   # Prometheus writes as nobody (65534), so the host user cannot delete these
   # files -- a plain `rm -rf` fails with EPERM and, under `set -e`, kills the
   # whole run. Delete from a container running as root, the same trick
   # `make start-full` uses to chown this directory.
-  docker run --rm -v "$EVM_PERF_DATA/demo":/d busybox sh -c 'rm -rf /d/prometheus-data' \
+  # Prometheus writes as nobody (65534), so the host user cannot delete these
+  # files; delete from a container running as root instead.
+  docker run --rm -v "$TSDB_DIR":/d busybox sh -c 'rm -rf /d/* /d/.[!.]* 2>/dev/null; true' \
     || { echo "error: could not clear $TSDB_DIR" >&2; exit 1; }
 fi
 
